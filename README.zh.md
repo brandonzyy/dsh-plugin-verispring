@@ -21,7 +21,7 @@ Verispring 三角色会话架构 + 本地知识图谱 manon，大幅度优化主
 ## 安装
 
 ```bash
-# 安装 / 更新（跟随仓库 main；固定版本用 #v1.3.1 这类 tag）
+# 安装 / 更新（跟随仓库 main；固定版本用 #v1.3.2 这类 tag）
 dsh plugin --profile <你的profile> add github:brandonzyy/dsh-plugin-verispring
 
 # 桌面版：设置 → 插件 → 安装，粘贴同一条 spec
@@ -56,6 +56,8 @@ tree-sitter 语言包按需动态加载，缺包只降级该语言不崩。密�
   不用 manon 时包内其余门禁不受影响。
 
 ## 配置面板（v1.3+）
+
+主会话默认使用 `verispring/claude-opus-5-5` 时，历史上下文达到约 40k token 会自动压缩，保留最近历史并生成摘要；执行智能体和 Manon Deep Query 不采用这条主会话策略。
 
 安装后组合包详情页直接显示配置。面板使用 DSH 共用表单控件并读取实时模型目录，渠道和模型选项与模型设置保持一致，保存即生效：
 

@@ -21,7 +21,7 @@ executor persona, and default route `verispring`/`deepseek-flash`.
 ## Install
 
 ```bash
-# Install / update (tracks main; pin a release with a tag like #v1.3.1)
+# Install / update (tracks main; pin a release with a tag like #v1.3.2)
 dsh plugin --profile <your-profile> add github:brandonzyy/dsh-plugin-verispring
 
 # Desktop app: Settings → Plugins → install, paste the same spec
@@ -64,6 +64,8 @@ injected invocation.
   apply to every session. Without manon, every other gate is unaffected.
 
 ## Configuration panel (v1.3+)
+
+With the default `verispring/claude-opus-5-5` main-session route, history is automatically compacted at about 40k tokens while retaining a recent tail and generating a summary. The execution agent and Manon Deep Query do not use this main-session policy.
 
 After install, the bundle detail page displays the configuration directly. The panel uses
 the DSH shared form controls and reads the live model catalog, so provider and model choices
