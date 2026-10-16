@@ -62,6 +62,18 @@ function configValue(value, fallback) {
   return typeof resolved === "string" && resolved !== "{}" && resolved !== "[object Object]" && (resolved !== "" || !fallback) ? resolved : fallback;
 }
 
+function findNestedPluginConfig(config, id) {
+  if (!config || typeof config !== "object") return undefined;
+  const plugins = Array.isArray(config.plugins) ? config.plugins : Array.isArray(config) ? config : [];
+  for (const entry of plugins) {
+    if (!entry || typeof entry !== "object") continue;
+    if (entry.id === id) return entry.config ?? (entry.config = {});
+    const nested = findNestedPluginConfig(entry.config, id);
+    if (nested) return nested;
+  }
+  return undefined;
+}
+
 export function apply(ctx, config) {
   // 写入根 = DSH_HOME；未挂 profileContext 时才回落到用户 home 下的 .dsh。
   const dshHome = ctx.profileContext?.home ?? `${homedir()}/.dsh`;
@@ -114,7 +126,7 @@ export function apply(ctx, config) {
   });
   chmodSync(manonEnv, 0o600);
 
-  // 3 主会话默认（含思考强度）+ 子代理默认路由 -> profile patch（活重载）
+  // 3 主会话默认（含思考强度）+ 子代理角色 preset 与默认路由 -> profile patch（活重载）
   // 有差异才写，避免每次启动对 patch 做无意义写入。
   const writes = [
     ["agent-default-model", (next) => {
@@ -123,14 +135,17 @@ export function apply(ctx, config) {
       if (mainSessionEffort) next.reasoningEffort = mainSessionEffort;
       else delete next.reasoningEffort;
     }],
-    ["tool-subagent", (next) => {
-      next.agentOptions = {
-        ...(next.agentOptions ?? {}),
+    ["preset-standard", (next) => {
+      const tool = findNestedPluginConfig(next, "tool-subagent");
+      if (!tool) return;
+      tool.agentPreset = "verispring-subagent";
+      tool.agentOptions = {
+        ...(tool.agentOptions ?? {}),
         provider: executorProvider,
         model: executorModel,
       };
-      if (executorEffort) next.agentOptions.reasoningEffort = executorEffort;
-      else delete next.agentOptions.reasoningEffort;
+      if (executorEffort) tool.agentOptions.reasoningEffort = executorEffort;
+      else delete tool.agentOptions.reasoningEffort;
     }],
   ];
   for (const [entryId, mutate] of writes) {
