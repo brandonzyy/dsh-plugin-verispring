@@ -21,21 +21,18 @@ executor persona, and default route `verispring`/`deepseek-flash`.
 ## Install
 
 ```bash
-# Preferred: registry install (version-pinned; mainland China resolves via the built-in
-# npmmirror fallback automatically)
-dsh plugin --profile <your-profile> add dsh-plugin-verispring
-
-# Fallback: install straight from GitHub (tracks the repo, no registry involved)
+# Install / update (tracks main; pin a release with a tag like #v1.2.2)
 dsh plugin --profile <your-profile> add github:brandonzyy/dsh-plugin-verispring
 
-# Desktop app: Settings → Plugins → install, paste either spec
+# Desktop app: Settings → Plugins → install, paste the same spec
 ```
 
 The desktop app enables HMR by default (the base bundle turns it on whenever a profile
 context exists), so installs initiated through the plugin manager **apply immediately** —
 no restart needed. Already-running sessions keep their current tree; new sessions and new
 dispatches pick up the new one. A restart is only required where HMR is explicitly disabled
-(headless/SDK/ACP).
+(headless/SDK/ACP). Updates: uninstall and reinstall the same spec (the platform reserves
+the Update button for official on-demand bundles).
 
 ## manon component (bundled)
 

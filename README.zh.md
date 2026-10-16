@@ -21,17 +21,15 @@ dsh（DeepSeek Harness）三角色会话架构（领导 / 常驻测绘兵 scout 
 ## 安装
 
 ```bash
-# 首选：registry 安装（版本固定；中国大陆自动经 npmmirror 内置回退源解析）
-dsh plugin --profile <你的profile> add dsh-plugin-verispring
-
-# 备用：GitHub 直装（跟随仓库当前状态，不走 registry）
+# 安装 / 更新（跟随仓库 main；固定版本用 #v1.2.2 这类 tag）
 dsh plugin --profile <你的profile> add github:brandonzyy/dsh-plugin-verispring
 
-# 桌面版：设置 → 插件 → 安装，粘贴以上任一 spec
+# 桌面版：设置 → 插件 → 安装，粘贴同一条 spec
 ```
 
 桌面版默认启用 HMR（base 组合包随 profile 上下文开启），插件管理器发起的安装**即时生效**，无需重启；
 已经在跑的会话保持旧组合，新会话/新派遣拿到新树。仅当 HMR 被显式禁用（如 headless/SDK/ACP）时才需要重启。
+更新方式：卸载后重装同一条 spec（非官方插件的「更新」按钮按平台设计仅提供给官方按需插件）。
 
 ## manon 组件（随包分发）
 
