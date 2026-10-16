@@ -52,7 +52,8 @@ tree-sitter 语言包按需动态加载，缺包只降级该语言不崩。密�
   与 `gates/dispatch-gate.js` 的 `PIN_PROVIDER`/`PIN_MODEL`，两处保持一致。
 - **manon（可选）**：组件自带，无需本机安装；密钥放 `~/.dsh/manon.env`
   （`MANON_EMBEDDING_API_KEY`，sync 的向量嵌入）与 `~/.dsh/verispring.env`
-  （`VERISPRING_API_KEY`，deep-query 复用）——注入的调用式会自行 source 这两个文件。
+  （`VERISPRING_API_KEY`，deep-query 缺省回退）——注入的调用式会自行 source 这两个文件，
+  模型/端点的环境变量覆盖（`MANON_DEEPQUERY_*` / `MANON_EMBEDDING_*`）也写在这里即随会话生效。
   不用 manon 时包内其余门禁不受影响。
 
 ## 模型配置建议
@@ -63,8 +64,8 @@ tree-sitter 语言包按需动态加载，缺包只降级该语言不崩。密�
 |---|---|---|
 | 主会话 | profile 的 `agent-default-model`（或会话内模型选择器） | **Claude Opus 5.5**——指挥、复核、写任务书吃推理；预算敏感可降 Sonnet 档 |
 | 子代理（scout + 执行） | 插件已钉死 `verispring`/`deepseek-flash` | **DeepSeek Flash**——测绘与执行是高频低复杂度调用，快且省；确要换，改包内 `cordis.patch.yml` 的 `agentOptions` 与 `gates/dispatch-gate.js` 的 `PIN_PROVIDER`/`PIN_MODEL`（两处保持一致） |
-| manon deep-query | 组件内硬编码 `verispring`/`deepseek-flash`（`manon/matrixone_graph/cli.py` 的 `DEEPQUERY_LLM_URL`/`DEEPQUERY_LLM_MODEL`） | **DeepSeek Flash**（出厂即推荐）；换模型需改这两个常量，注意旁边 thinking-disabled 的兼容注释 |
-| embedding | 组件硬编码硅基流动 `BAAI/bge-m3`，key 走 `MANON_EMBEDDING_API_KEY` | 无需配置，不建议更换 |
+| manon deep-query | 环境变量：`MANON_DEEPQUERY_LLM_URL` / `MANON_DEEPQUERY_LLM_MODEL` / `MANON_DEEPQUERY_API_KEY`（缺省回退 `VERISPRING_API_KEY`；默认 verispring deepseek-flash） | **DeepSeek Flash**（出厂即推荐）；写进 `~/.dsh/manon.env` 即随注入调用式生效。非 deepseek 模型自动省略 thinking 字段（GLM 等可直接换） |
+| embedding | 环境变量：`MANON_EMBEDDING_URL` / `MANON_EMBEDDING_MODEL` / `MANON_EMBEDDING_API_KEY`（默认硅基流动 `BAAI/bge-m3`） | 内置 bge-m3 即推荐；更换需重新 sync 重建向量 |
 
 主会话 + 网关最小配置（放进 profile 的 `cordis.patch.yml`；与插件钉死的 `verispring`/`deepseek-flash` 路由配套）：
 

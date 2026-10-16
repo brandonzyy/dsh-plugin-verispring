@@ -59,8 +59,9 @@ injected invocation.
   `gates/dispatch-gate.js`, keeping the two in sync.
 - **manon (optional)**: bundled — no local install needed. Keys live in `~/.dsh/manon.env`
   (`MANON_EMBEDDING_API_KEY`, sync embeddings) and `~/.dsh/verispring.env`
-  (`VERISPRING_API_KEY`, deep-query); the injected invocation sources both files itself.
-  Without manon, every other gate is unaffected.
+  (`VERISPRING_API_KEY`, deep-query fallback); the injected invocation sources both files
+  itself, so model/endpoint overrides (`MANON_DEEPQUERY_*` / `MANON_EMBEDDING_*`) set there
+  apply to every session. Without manon, every other gate is unaffected.
 
 ## Model configuration guide
 
@@ -70,8 +71,8 @@ Four model slots: two you configure, two ship pre-configured with the recommende
 |---|---|---|
 | Main session | the profile's `agent-default-model` (or the in-session picker) | **Claude Opus 5.5** — leading, reviewing, and task-book writing need the reasoning; drop to a Sonnet tier when budget-sensitive |
 | Subagents (scout + executor) | pinned by the plugin to `verispring`/`deepseek-flash` | **DeepSeek Flash** — scouting and execution are high-frequency, low-complexity calls; to change, edit `agentOptions` in `cordis.patch.yml` and `PIN_PROVIDER`/`PIN_MODEL` in `gates/dispatch-gate.js` (keep them in sync) |
-| manon deep-query | hardcoded in the component to `verispring`/`deepseek-flash` (`DEEPQUERY_LLM_URL`/`DEEPQUERY_LLM_MODEL` in `manon/matrixone_graph/cli.py`) | **DeepSeek Flash** (shipped as recommended); changing it means editing those constants — mind the thinking-disabled compatibility note beside them |
-| embedding | hardcoded in the component to SiliconFlow `BAAI/bge-m3`, key via `MANON_EMBEDDING_API_KEY` | no configuration needed; not recommended to change |
+| manon deep-query | env: `MANON_DEEPQUERY_LLM_URL` / `MANON_DEEPQUERY_LLM_MODEL` / `MANON_DEEPQUERY_API_KEY` (falls back to `VERISPRING_API_KEY`; defaults to verispring deepseek-flash) | **DeepSeek Flash** (shipped as recommended); put overrides in `~/.dsh/manon.env` and they flow in with the sourced invocation. Non-deepseek models automatically omit the thinking field (GLM etc. work as-is) |
+| embedding | env: `MANON_EMBEDDING_URL` / `MANON_EMBEDDING_MODEL` / `MANON_EMBEDDING_API_KEY` (defaults to SiliconFlow `BAAI/bge-m3`) | the built-in bge-m3 is the recommendation; switching requires a re-sync to rebuild vectors |
 
 Minimal main-session + gateway config (goes into the profile's `cordis.patch.yml`; pairs with
 the plugin-pinned `verispring`/`deepseek-flash` route):
