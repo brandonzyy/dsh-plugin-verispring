@@ -55,6 +55,58 @@ tree-sitter 语言包按需动态加载，缺包只降级该语言不崩。密�
   （`VERISPRING_API_KEY`，deep-query 复用）——注入的调用式会自行 source 这两个文件。
   不用 manon 时包内其余门禁不受影响。
 
+## 模型配置建议
+
+四个模型位：两个要你配，两个出厂即推荐。
+
+| 模型位 | 配置处 | 建议 |
+|---|---|---|
+| 主会话 | profile 的 `agent-default-model`（或会话内模型选择器） | **Claude Opus 5.5**——指挥、复核、写任务书吃推理；预算敏感可降 Sonnet 档 |
+| 子代理（scout + 执行） | 插件已钉死 `verispring`/`deepseek-flash` | **DeepSeek Flash**——测绘与执行是高频低复杂度调用，快且省；确要换，改包内 `cordis.patch.yml` 的 `agentOptions` 与 `gates/dispatch-gate.js` 的 `PIN_PROVIDER`/`PIN_MODEL`（两处保持一致） |
+| manon deep-query | 组件内硬编码 `verispring`/`deepseek-flash`（`manon/matrixone_graph/cli.py` 的 `DEEPQUERY_LLM_URL`/`DEEPQUERY_LLM_MODEL`） | **DeepSeek Flash**（出厂即推荐）；换模型需改这两个常量，注意旁边 thinking-disabled 的兼容注释 |
+| embedding | 组件硬编码硅基流动 `BAAI/bge-m3`，key 走 `MANON_EMBEDDING_API_KEY` | 无需配置，不建议更换 |
+
+主会话 + 网关最小配置（放进 profile 的 `cordis.patch.yml`；与插件钉死的 `verispring`/`deepseek-flash` 路由配套）：
+
+```yaml
+- id: llm-pi-ai
+  config:
+    providers:
+      verispring:
+        displayName: Verispring
+        apiKeyEnv: VERISPRING_API_KEY
+        api: anthropic-messages
+        baseURL: https://api.verispring.cn
+        models:
+          - id: claude-opus-5-5
+            name: Claude Opus 5.5
+            contextWindow: 1000000
+            maxTokens: 128000
+            compat:
+              forceAdaptiveThinking: true
+            reasoningEfforts:
+              low: low
+              medium: medium
+              high: high
+              xhigh: xhigh
+              max: max
+          - id: deepseek-flash
+            name: DeepSeek V4.1 Flash
+            contextWindow: 1000000
+            maxTokens: 384000
+            reasoningEfforts:
+              'off': null
+              low: low
+              high: high
+              max: max
+- id: agent-default-model
+  config:
+    provider: verispring
+    model: claude-opus-5-5
+```
+
+> **专属优惠**：找插件发布包作者领取——**Claude 7.8 折，DeepSeek Flash 5 折**。
+
 ## 兼容性
 
 `peerDependencies` 钉 `@deepseek-ai/cordis` `4.0.4 || ~4.0.5-alpha.1`（对应 dsh 0.2.0-rc.2 与

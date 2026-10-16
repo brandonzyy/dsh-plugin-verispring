@@ -62,6 +62,59 @@ injected invocation.
   (`VERISPRING_API_KEY`, deep-query); the injected invocation sources both files itself.
   Without manon, every other gate is unaffected.
 
+## Model configuration guide
+
+Four model slots: two you configure, two ship pre-configured with the recommended choices.
+
+| Slot | Where | Recommendation |
+|---|---|---|
+| Main session | the profile's `agent-default-model` (or the in-session picker) | **Claude Opus 5.5** — leading, reviewing, and task-book writing need the reasoning; drop to a Sonnet tier when budget-sensitive |
+| Subagents (scout + executor) | pinned by the plugin to `verispring`/`deepseek-flash` | **DeepSeek Flash** — scouting and execution are high-frequency, low-complexity calls; to change, edit `agentOptions` in `cordis.patch.yml` and `PIN_PROVIDER`/`PIN_MODEL` in `gates/dispatch-gate.js` (keep them in sync) |
+| manon deep-query | hardcoded in the component to `verispring`/`deepseek-flash` (`DEEPQUERY_LLM_URL`/`DEEPQUERY_LLM_MODEL` in `manon/matrixone_graph/cli.py`) | **DeepSeek Flash** (shipped as recommended); changing it means editing those constants — mind the thinking-disabled compatibility note beside them |
+| embedding | hardcoded in the component to SiliconFlow `BAAI/bge-m3`, key via `MANON_EMBEDDING_API_KEY` | no configuration needed; not recommended to change |
+
+Minimal main-session + gateway config (goes into the profile's `cordis.patch.yml`; pairs with
+the plugin-pinned `verispring`/`deepseek-flash` route):
+
+```yaml
+- id: llm-pi-ai
+  config:
+    providers:
+      verispring:
+        displayName: Verispring
+        apiKeyEnv: VERISPRING_API_KEY
+        api: anthropic-messages
+        baseURL: https://api.verispring.cn
+        models:
+          - id: claude-opus-5-5
+            name: Claude Opus 5.5
+            contextWindow: 1000000
+            maxTokens: 128000
+            compat:
+              forceAdaptiveThinking: true
+            reasoningEfforts:
+              low: low
+              medium: medium
+              high: high
+              xhigh: xhigh
+              max: max
+          - id: deepseek-flash
+            name: DeepSeek V4.1 Flash
+            contextWindow: 1000000
+            maxTokens: 384000
+            reasoningEfforts:
+              'off': null
+              low: low
+              high: high
+              max: max
+- id: agent-default-model
+  config:
+    provider: verispring
+    model: claude-opus-5-5
+```
+
+> **Exclusive discounts**: contact the package author — **22% off Claude, 50% off DeepSeek Flash**.
+
 ## Compatibility
 
 `peerDependencies` pins `@deepseek-ai/cordis` `4.0.4 || ~4.0.5-alpha.1` — covering dsh
