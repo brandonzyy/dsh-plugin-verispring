@@ -1,6 +1,6 @@
 # dsh-plugin-verispring
 
-dsh（DeepSeek Harness）三角色会话架构（领导 / 常驻测绘兵 scout / 执行层）的代码级强制 + 本地图谱 manon 组件，打成一个组合包（bundle）。
+Verispring 三角色会话架构 + 本地知识图谱 manon，大幅度优化主会话上下文，大幅节省顶级模型API费用。
 [English](README.md) | 中文
 
 ## 它强制什么
@@ -21,7 +21,7 @@ dsh（DeepSeek Harness）三角色会话架构（领导 / 常驻测绘兵 scout 
 ## 安装
 
 ```bash
-# 安装 / 更新（跟随仓库 main；固定版本用 #v1.2.2 这类 tag）
+# 安装 / 更新（跟随仓库 main；固定版本用 #v1.3.1 这类 tag）
 dsh plugin --profile <你的profile> add github:brandonzyy/dsh-plugin-verispring
 
 # 桌面版：设置 → 插件 → 安装，粘贴同一条 spec
@@ -55,18 +55,18 @@ tree-sitter 语言包按需动态加载，缺包只降级该语言不崩。密�
   模型/端点的环境变量覆盖（`MANON_DEEPQUERY_*` / `MANON_EMBEDDING_*`）也写在这里即随会话生效。
   不用 manon 时包内其余门禁不受影响。
 
-## 配置面板（v1.2+）
+## 配置面板（v1.3+）
 
-安装后 dsh 设置/插件页会出现本条目的**原生配置页**（由 Config schema 自动生成），四个模型位逐项可配，保存即生效：
+安装后组合包详情页直接显示配置。面板使用 DSH 共用表单控件并读取实时模型目录，渠道和模型选项与模型设置保持一致，保存即生效：
 
 | 面板字段 | 落盘位置 | 生效方式 |
 |---|---|---|
-| 子代理渠道 / 模型 | `~/.dsh/verispring.json` | 派遣门禁即时读取强制执法；同时写回 profile patch 的 tool-subagent `agentOptions` 作默认路由 |
+| 测绘/执行智能体渠道 / 模型 / 思考强度 | `~/.dsh/verispring.json` | 两套路由分别由派遣门禁执法；执行路由同时写回 tool-subagent 默认值 |
 | 主会话默认渠道 / 模型 / 思考强度 | profile patch 的 `agent-default-model` 条目 | configEditor 活重载；会话内用原生模型选择器可临时覆盖 |
-| deep-query 端点 / 模型 | `~/.dsh/manon.env` 的 `MANON_DEEPQUERY_*` | 随注入调用式 source 进 manon-kg |
+| Manon Deep Query 渠道 / 模型 / 思考强度 | `~/.dsh/manon.env` 的 `MANON_DEEPQUERY_*` | 随注入调用式 source 进 manon-kg |
 | embedding 端点 / 模型 | `~/.dsh/manon.env` 的 `MANON_EMBEDDING_*` | 更换模型后需重新 sync 重建向量 |
 
-写入根为 Harness home（`DSH_HOME`），多 home / 探针环境互不串扰；`manon.env` 只 upsert 面板键，用户凭据行原样保留。已配置渠道/模型的图形化下拉选择器（读 llm-pi-ai 条目）为二期 client-ui 卡片。
+写入根为 Harness home（`DSH_HOME`），多 home / 探针环境互不串扰；`manon.env` 只 upsert 面板键，用户凭据行原样保留。测绘智能体和执行智能体分别选择渠道、模型、思考强度；Verispring key 通过 DSH 凭据库保存，保存后自动发现网关模型目录并刷新选项，embedding 模型保留文本输入。
 
 ## 模型配置建议
 
@@ -75,8 +75,8 @@ tree-sitter 语言包按需动态加载，缺包只降级该语言不崩。密�
 | 模型位 | 配置处 | 建议 |
 |---|---|---|
 | 主会话 | profile 的 `agent-default-model`（或会话内模型选择器） | **Claude Opus 5.5**——指挥、复核、写任务书吃推理；预算敏感可降 Sonnet 档 |
-| 子代理（scout + 执行） | 插件已钉死 `verispring`/`deepseek-flash` | **DeepSeek Flash**——测绘与执行是高频低复杂度调用，快且省；确要换，改包内 `cordis.patch.yml` 的 `agentOptions` 与 `gates/dispatch-gate.js` 的 `PIN_PROVIDER`/`PIN_MODEL`（两处保持一致） |
-| manon deep-query | 环境变量：`MANON_DEEPQUERY_LLM_URL` / `MANON_DEEPQUERY_LLM_MODEL` / `MANON_DEEPQUERY_API_KEY`（缺省回退 `VERISPRING_API_KEY`；默认 verispring deepseek-flash） | **DeepSeek Flash**（出厂即推荐）；写进 `~/.dsh/manon.env` 即随注入调用式生效。非 deepseek 模型自动省略 thinking 字段（GLM 等可直接换） |
+| 测绘智能体 / 执行智能体 | 插件面板分别选择 | 默认都用 **DeepSeek Flash**；两套路由可独立选择渠道、模型和思考强度 |
+| Manon Deep Query | 面板选择 verispring 渠道、模型、思考强度；密钥回退 `VERISPRING_API_KEY` | **DeepSeek Flash + off**（出厂即推荐）；保存后写入 `~/.dsh/manon.env`，随注入调用式生效。 |
 | embedding | 环境变量：`MANON_EMBEDDING_URL` / `MANON_EMBEDDING_MODEL` / `MANON_EMBEDDING_API_KEY`（默认硅基流动 `BAAI/bge-m3`） | 内置 bge-m3 即推荐；更换需重新 sync 重建向量 |
 
 主会话 + 网关最小配置（放进 profile 的 `cordis.patch.yml`；与插件钉死的 `verispring`/`deepseek-flash` 路由配套）：
@@ -104,7 +104,7 @@ tree-sitter 语言包按需动态加载，缺包只降级该语言不崩。密�
               xhigh: xhigh
               max: max
           - id: deepseek-flash
-            name: DeepSeek V4.1 Flash
+            name: DeepSeek Flash
             contextWindow: 1000000
             maxTokens: 384000
             reasoningEfforts:
@@ -118,7 +118,7 @@ tree-sitter 语言包按需动态加载，缺包只降级该语言不崩。密�
     model: claude-opus-5-5
 ```
 
-> **专属优惠**：找插件发布包作者领取——**Claude 7.8 折，DeepSeek Flash 5 折**。
+> **专属优惠**：找插件发布包作者领取——**Claude 8 折，DeepSeek Flash 5 折**；微信：`jinyong0716`。
 
 ## 兼容性
 

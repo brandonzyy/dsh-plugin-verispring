@@ -135,10 +135,13 @@ def _with_retry(coro_factory, attempts: int = 4):
 
 
 # ── deep-query：LLM 引导的多轮图谱问答（移植自 saas/services/query.py）──
-# LLM 端点/模型/密钥经环境变量覆盖，默认 verispring deepseek-flash：
-#   MANON_DEEPQUERY_LLM_URL / MANON_DEEPQUERY_LLM_MODEL / MANON_DEEPQUERY_API_KEY（缺省回退 VERISPRING_API_KEY）
+# LLM 渠道、模型、思考强度和密钥经环境变量覆盖；面板当前提供 verispring 渠道。
+#   MANON_DEEPQUERY_LLM_PROVIDER / MANON_DEEPQUERY_LLM_URL / MANON_DEEPQUERY_LLM_MODEL
+#   MANON_DEEPQUERY_LLM_REASONING_EFFORT / MANON_DEEPQUERY_API_KEY（缺省回退 VERISPRING_API_KEY）
+DEEPQUERY_LLM_PROVIDER = os.environ.get("MANON_DEEPQUERY_LLM_PROVIDER", "verispring")
 DEEPQUERY_LLM_URL = os.environ.get("MANON_DEEPQUERY_LLM_URL", "https://api.verispring.cn/v1/chat/completions")
 DEEPQUERY_LLM_MODEL = os.environ.get("MANON_DEEPQUERY_LLM_MODEL", "deepseek-flash")
+DEEPQUERY_LLM_REASONING_EFFORT = os.environ.get("MANON_DEEPQUERY_LLM_REASONING_EFFORT", "off")
 
 _DEEPQUERY_SYSTEM = """You are a code-graph query planner.
 Return JSON with:
@@ -157,6 +160,8 @@ async def _llm_chat(messages: list[dict], *, max_tokens: int = 4096, timeout: fl
     import asyncio as _asyncio
     import httpx
 
+    if DEEPQUERY_LLM_PROVIDER != "verispring":
+        raise RuntimeError(f"Manon Deep Query 暂只支持 verispring 渠道：{DEEPQUERY_LLM_PROVIDER}")
     key = os.environ.get("MANON_DEEPQUERY_API_KEY", "") or os.environ.get("VERISPRING_API_KEY", "")
     if not key:
         raise RuntimeError("deep-query 需要 MANON_DEEPQUERY_API_KEY（或回退的 VERISPRING_API_KEY）")
@@ -165,9 +170,11 @@ async def _llm_chat(messages: list[dict], *, max_tokens: int = 4096, timeout: fl
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(timeout, connect=10.0)) as c:
                 payload = {"model": DEEPQUERY_LLM_MODEL, "max_tokens": max_tokens, "messages": messages}
-                # thinking disabled 仅 deepseek 系模型接受；其它模型（GLM-5.x 等）省略该字段
-                if "deepseek" in DEEPQUERY_LLM_MODEL.lower():
-                    payload["thinking"] = {"type": "disabled"}
+                if DEEPQUERY_LLM_REASONING_EFFORT in ("", "off"):
+                    if "deepseek" in DEEPQUERY_LLM_MODEL.lower():
+                        payload["thinking"] = {"type": "disabled"}
+                else:
+                    payload["reasoning_effort"] = DEEPQUERY_LLM_REASONING_EFFORT
                 resp = await c.post(
                     DEEPQUERY_LLM_URL,
                     headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},

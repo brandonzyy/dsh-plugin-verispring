@@ -1,12 +1,42 @@
-# dsh-verispring-architecture —— 三角色会话架构（领导 / 常驻测绘兵 scout / 执行层）
+# dsh-verispring-architecture —— 三角色会话架构（领导 / 测绘智能体 / 执行智能体）
 # 本组合包一个 patch 文件做两件事：
-#   1) 子代理工具默认路由钉死 verispring / deepseek-flash（continuable 后台、
-#      maxDepth 1 不派孙代理、执行层 persona）；
+#   1) 子代理工具默认路由使用执行智能体配置（continuable 后台、maxDepth 1 不派孙代理）；
 #   2) insert 三个代码级门禁插件（gates/ 目录）。
 # 代码级兜底在 dispatch-gate 第 4 条：即便调用显式指定其它 provider/model 也会被拒绝。
 # 逃生开关：CASEOS_SCOUT=0 关闭领导分工条款；各门禁拒绝信息均含可满足的解锁步骤。
-# 换网关：改下面 agentOptions 的 provider/model 与 gates/dispatch-gate.js 的
-# PIN_PROVIDER/PIN_MODEL，两处保持一致。
+# 换网关：在配置面板分别选择测绘智能体与执行智能体的渠道、模型、思考强度。
+- id: llm-pi-ai
+  name: '@deepseek-ai/dsh-llm-pi-ai'
+  config:
+    providers:
+      verispring:
+        displayName: Verispring
+        apiKeyEnv: VERISPRING_API_KEY
+        api: anthropic-messages
+        baseURL: https://api.verispring.cn
+        reasoning: high
+        models:
+          - id: claude-opus-5-5
+            name: Claude Opus 5.5
+            contextWindow: 1000000
+            maxTokens: 128000
+            compat:
+              forceAdaptiveThinking: true
+            reasoningEfforts:
+              low: low
+              medium: medium
+              high: high
+              xhigh: xhigh
+              max: max
+          - id: deepseek-flash
+            name: DeepSeek Flash
+            contextWindow: 1000000
+            maxTokens: 384000
+            reasoningEfforts:
+              'off': null
+              low: low
+              high: high
+              max: max
 - id: tool-subagent
   config:
     provider: spawn
@@ -14,22 +44,25 @@
     backgroundMode: continuable
     maxDepth: 1
     persona: >-
-      你是执行层子代理：承接全部执行类工作——读码、检索、改码、跑测试与门禁、查代码图谱、
+      你是执行智能体：承接全部执行类工作——读码、检索、改码、跑测试与门禁、查代码图谱、
       web 查证。你拥有全部工具与规范权限；动作涉及派遣/提交/工程规范时，先读
       ~/.dsh/specs/ 下同名规范再动手。全部工作完成后一次性验证并汇报：
       结论、改动文件路径、测试读数，不报过程，不追加确认轮。
     agentOptions:
       provider: verispring
       model: deepseek-flash
+      reasoningEffort: high
 - insert:
     - id: caseos-dispatch-gate
-      name: './gates/dispatch-gate.js'
+      # 以包名加载根入口：既保留 dispatch-gate 宿主插件，又让 client-modules
+      # 能从该 Loader 行定位本包的 dsh.client 声明并加入渲染端 boot graph。
+      name: 'dsh-plugin-verispring'
     - id: caseos-codestyle-gate
       name: './gates/codestyle-gate.js'
     - id: caseos-leader-scope
       name: './gates/leader-scope.js'
     - id: caseos-manon-bridge
       name: './gates/manon-bridge.js'
-    # 配置面板：Config schema 自动生成原生设置页；apply 把四个模型位落盘到执法面
+    # 配置面板：Config schema 提供宿主表单服务；client 组合包页渲染并把模型位落盘到执法面
     - id: verispring-config
-      name: './verispring-config.js'
+      name: './gates/verispring-config.js'

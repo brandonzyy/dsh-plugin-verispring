@@ -1,6 +1,6 @@
 # dsh-plugin-verispring
 
-Code-level enforcement of the dsh three-role session architecture (leader / resident scout / executor), plus a bundled local code-graph (manon) component, packaged as a dsh bundle.
+Verispring three-role session architecture plus a bundled local knowledge graph (manon), substantially improving main-session context and reducing premium model API costs.
 [中文](README.zh.md) | English
 
 ## What it enforces
@@ -21,7 +21,7 @@ executor persona, and default route `verispring`/`deepseek-flash`.
 ## Install
 
 ```bash
-# Install / update (tracks main; pin a release with a tag like #v1.2.2)
+# Install / update (tracks main; pin a release with a tag like #v1.3.1)
 dsh plugin --profile <your-profile> add github:brandonzyy/dsh-plugin-verispring
 
 # Desktop app: Settings → Plugins → install, paste the same spec
@@ -63,23 +63,25 @@ injected invocation.
   itself, so model/endpoint overrides (`MANON_DEEPQUERY_*` / `MANON_EMBEDDING_*`) set there
   apply to every session. Without manon, every other gate is unaffected.
 
-## Configuration panel (v1.2+)
+## Configuration panel (v1.3+)
 
-After install, the dsh settings/plugins page shows a **native configuration page** for this
-entry (auto-generated from its Config schema). The four model slots are editable there and
-apply on save:
+After install, the bundle detail page displays the configuration directly. The panel uses
+the DSH shared form controls and reads the live model catalog, so provider and model choices
+stay aligned with the Models configuration. The four model slots are editable and apply on save:
 
 | Panel field | Persisted to | Takes effect |
 |---|---|---|
-| Subagent provider / model | `~/.dsh/verispring.json` | enforced immediately by the dispatch gate; also written to the `tool-subagent` `agentOptions` as the default route |
+| Surveying/execution provider / model / effort | `~/.dsh/verispring.json` | each route is enforced by the dispatch gate; execution defaults are also written to `tool-subagent` |
 | Main-session provider / model / effort | the `agent-default-model` profile entry | live reload via configEditor; the native in-session picker still overrides per session |
-| deep-query endpoint / model | `MANON_DEEPQUERY_*` keys in `~/.dsh/manon.env` | flows into manon-kg with the sourced invocation |
+| Manon Deep Query provider / model / effort | `MANON_DEEPQUERY_*` keys in `~/.dsh/manon.env` | flows into manon-kg with the sourced invocation |
 | embedding endpoint / model | `MANON_EMBEDDING_*` keys in `~/.dsh/manon.env` | re-run sync after switching models |
 
 Writes are rooted at the Harness home (`DSH_HOME`), so multi-home/probe environments never
 cross-contaminate; `manon.env` upserts only the panel-owned keys and preserves your
-credential lines. Graphical dropdowns over the configured providers/models are a phase-2
-client-ui card.
+credential lines. The plugin ships the `verispring` `llm-pi-ai` route. Surveying and execution
+each have independent provider, model, and reasoning-effort selectors. The Verispring key is
+stored through DSH credentials; saving it discovers the gateway model list and refreshes the
+catalog. The embedding model remains a text field.
 
 ## Model configuration guide
 
@@ -88,8 +90,8 @@ Four model slots: two you configure, two ship pre-configured with the recommende
 | Slot | Where | Recommendation |
 |---|---|---|
 | Main session | the profile's `agent-default-model` (or the in-session picker) | **Claude Opus 5.5** — leading, reviewing, and task-book writing need the reasoning; drop to a Sonnet tier when budget-sensitive |
-| Subagents (scout + executor) | pinned by the plugin to `verispring`/`deepseek-flash` | **DeepSeek Flash** — scouting and execution are high-frequency, low-complexity calls; to change, edit `agentOptions` in `cordis.patch.yml` and `PIN_PROVIDER`/`PIN_MODEL` in `gates/dispatch-gate.js` (keep them in sync) |
-| manon deep-query | env: `MANON_DEEPQUERY_LLM_URL` / `MANON_DEEPQUERY_LLM_MODEL` / `MANON_DEEPQUERY_API_KEY` (falls back to `VERISPRING_API_KEY`; defaults to verispring deepseek-flash) | **DeepSeek Flash** (shipped as recommended); put overrides in `~/.dsh/manon.env` and they flow in with the sourced invocation. Non-deepseek models automatically omit the thinking field (GLM etc. work as-is) |
+| Surveying / execution agents | independently selected in the plugin panel | **DeepSeek Flash** for both by default; each route can choose its own provider, model, and effort |
+| Manon Deep Query | choose the verispring provider, model, and effort in the panel; key falls back to `VERISPRING_API_KEY` | **DeepSeek Flash + off** (shipped as recommended); saving writes `~/.dsh/manon.env` and the sourced invocation uses it. |
 | embedding | env: `MANON_EMBEDDING_URL` / `MANON_EMBEDDING_MODEL` / `MANON_EMBEDDING_API_KEY` (defaults to SiliconFlow `BAAI/bge-m3`) | the built-in bge-m3 is the recommendation; switching requires a re-sync to rebuild vectors |
 
 Minimal main-session + gateway config (goes into the profile's `cordis.patch.yml`; pairs with
@@ -118,7 +120,7 @@ the plugin-pinned `verispring`/`deepseek-flash` route):
               xhigh: xhigh
               max: max
           - id: deepseek-flash
-            name: DeepSeek V4.1 Flash
+            name: DeepSeek Flash
             contextWindow: 1000000
             maxTokens: 384000
             reasoningEfforts:
@@ -132,7 +134,7 @@ the plugin-pinned `verispring`/`deepseek-flash` route):
     model: claude-opus-5-5
 ```
 
-> **Exclusive discounts**: contact the package author — **22% off Claude, 50% off DeepSeek Flash**.
+> **Exclusive discounts**: contact the package author — **20% off Claude, 50% off DeepSeek Flash**; WeChat: `jinyong0716`.
 
 ## Compatibility
 

@@ -1,11 +1,11 @@
-// 领导/执行层双面工具架构（C，2026-10-15 用户定稿；进门票 <5000 压缩版）：
+// 领导/测绘/执行三面工具架构（C，2026-10-15 用户定稿；进门票 <5000 压缩版）：
 // - 领导会话（origin != subagent）创建时两步：
 //     1) agent.ctx.tools.restrict({ allow })——声明面收缩到复核五件 + subagent；
 //     2) 把这 6 个工具以「瘦身定义」重注册进领导自己的层（own-layer 遮蔽全局原版）：
 //        截断工具描述与参数说明。执行闭包保留原版，参数校验不受瘦身影响；
 //        list_agents/interrupt_agent/send_message 不进白名单——前台一次性派遣模式下
 //        这三件物理不可用（subagent 调用阻塞到子代理结束，无并发可管理）。
-// - 执行层子代理（origin == subagent）：创建时把白名单外的全局工具按原版重注册进
+// - 测绘/执行智能体（origin == subagent）：创建时把白名单外的全局工具按原版重注册进
 //   子代理自己的层（own-layer 注册豁免祖先限制），全量工具面不变。
 // 已知边界：领导保有 bash（复核需要），本插件收缩声明面并引导分工，不防对抗性绕过。
 const LEADER_ALLOW = new Set([
@@ -20,7 +20,7 @@ const SLIM_DESC = {
   read: "Read a text file with line numbers; use offset/limit for large files.",
   read_image: "Read an image file and return the image.",
   subagent:
-    "派遣执行类工作给执行层子代理（deepseek-flash，全工具面）；任务书须自足。默认后台运行，返回子代理 id，结束后有通知；运行中可 send_message 纠偏。",
+    "派遣执行类工作给执行智能体；任务书须自足。测绘智能体需在 description 开头写“测绘智能体”，并显式带渠道、模型、思考强度；执行智能体默认使用面板配置。默认后台运行，返回子代理 id，结束后有通知；运行中可 send_message 纠偏。",
   send_message: "向运行中的子代理发消息：纠偏、补充约束或追加任务。",
   interrupt_agent: "让某个子代理停止当前工作。",
   list_agents: "列出你启动的子代理及其状态。",
@@ -47,7 +47,7 @@ function isSubagent(agent) {
   }
 }
 
-// 常驻只读测绘兵：description 以 scout 开头（描述符在创建期写入子代理会话）
+// 常驻只读测绘智能体：description 以“测绘智能体”或 scout 开头（描述符在创建期写入子代理会话）
 function isScout(agent) {
   try {
     const session = agent?.session;
@@ -58,7 +58,7 @@ function isScout(agent) {
       if (!e) return false;
       if (e.type === "subagent/descriptor") {
         const label = e.data?.label ?? "";
-        return typeof label === "string" && label.toLowerCase().startsWith("scout");
+        return typeof label === "string" && (label.toLowerCase().startsWith("scout") || label.startsWith("测绘智能体"));
       }
     }
   } catch {}
@@ -98,7 +98,7 @@ const plugin = {
     const scoutClause =
       process.env.CASEOS_SCOUT === "0"
         ? ""
-        : "常驻测绘兵：派执行任务前，先确保有一个 description 以 scout: 开头的只读测绘兵常驻（它被硬禁改码）。scout 只派遣一次，之后 send_message 复用；重复派遣与无地图派遣（仓库根没有 .project-map.md）会被插件拒绝。产出=入口表 ≤20 行，由你落盘为仓库根 .project-map.md；仓库已有该文件时 scout 只做增量校对。执行任务书的定位与事实先 send_message 问它，执行完成后让它把新结构事实并入地图。";
+        : "常驻测绘智能体：派执行任务前，先确保有一个 description 以“测绘智能体”开头的只读智能体常驻（它被硬禁改码）。测绘智能体只派遣一次，之后 send_message 复用；重复派遣与无地图派遣（仓库根没有 .project-map.md）会被插件拒绝。产出=入口表 ≤20 行，由你落盘为仓库根 .project-map.md；仓库已有该文件时测绘智能体只做增量校对。执行任务书的定位与事实先 send_message 问它，执行完成后让它把新结构事实并入地图。";
     ctx.systemPrompt.section({
       name: "caseos:leader-dispatch",
       order: ctx.systemPrompt.getSectionOrder("TOOL_SUBAGENT"),
@@ -115,7 +115,7 @@ const plugin = {
       if (isSubagent(agent)) {
         const defs = heavyDefs();
         const scout = isScout(agent);
-        if (scout) process.stderr.write("leader-scope: 识别到 scout 测绘兵，将施加只读约束\n");
+        if (scout) process.stderr.write("leader-scope: 识别到测绘智能体，将施加只读约束\n");
         agent.ctx.inject(["tools"], (rtc) => {
           for (const def of defs) {
             try {
@@ -127,7 +127,7 @@ const plugin = {
           if (scout) {
             try {
               rtc.tools.restrict({ deny: ["edit", "write"] });
-              process.stderr.write("leader-scope: scout 只读约束生效（deny edit/write）\n");
+              process.stderr.write("leader-scope: 测绘智能体只读约束生效（deny edit/write）\n");
             } catch (error) {
               process.stderr.write(`leader-scope: scout 只读约束失败: ${String(error)}\n`);
             }
