@@ -30,7 +30,7 @@ window.__ModuleLoader__.load({
       try {
         const { view, form } = props;
         if (view === "summary") {
-          return React.createElement("span", null, "四个模型位：子代理 / 主会话默认（含思考强度）/ deep-query / embedding");
+          return React.createElement("span", null, "配置面板 v1.2.2 已加载 —— 四个模型位：子代理 / 主会话默认（含思考强度）/ deep-query / embedding");
         }
         if (view !== "page" || !form) return null;
         const snapshot = form.state;
