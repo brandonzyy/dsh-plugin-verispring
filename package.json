@@ -25,7 +25,8 @@
     "./leader-scope": "./gates/leader-scope.js",
     "./manon-bridge": "./gates/manon-bridge.js",
     "./cordis.patch.yml": "./cordis.patch.yml",
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./client": "./client.js"
   },
   "files": [
     "icon.svg",
@@ -37,11 +38,19 @@
     "manon/requirements.txt",
     "manon/matrixone_graph",
     "manon/codeindex",
-    "manon/core"
+    "manon/core",
+    "client.js"
   ],
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-plugin-manager"
+      ],
+      "platform": "web"
     }
   },
   "publishConfig": {
