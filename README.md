@@ -65,7 +65,7 @@ injected invocation.
 
 ## Configuration panel (v1.3+)
 
-With either Verispring `claude-opus-5-5` or `deepseek-flash` as the main-session route, history is automatically compacted at about 40k tokens: oversized tool results are pruned first, then the safely balanced history is condensed with DSH's structured template into a summary capped at 4k tokens, with no extra verbatim tail; context-overflow recovery retries automatically. The execution agent and Manon Deep Query do not use this main-session policy.
+With Verispring `claude-opus-5-5` as the default main-session route, history is automatically compacted at about 40k tokens into a summary capped at 4k tokens. The surveying and execution agents use `deepseek-flash` and compact at about 60k tokens into a summary capped at 6k tokens. Both routes prune oversized tool results first, condense the safely balanced history with DSH's structured template, keep no extra verbatim tail, and retry after context overflow. Each summary target is 10% of the trigger context.
 
 After install, the bundle detail page displays the configuration directly. The panel uses
 the DSH shared form controls and reads the live model catalog, so provider and model choices
