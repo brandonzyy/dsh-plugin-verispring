@@ -157,18 +157,6 @@ const plugin = {
       const session = exec.agent?.session;
       const state = scoutSessions.get(session) ?? { started: false };
       const role = state.started ? "executor" : "scout";
-      const route = loadRoutes()[role];
-      const provider = exec.arguments?.provider;
-      const model = exec.arguments?.model;
-      const effort = exec.arguments?.reasoning_effort;
-      const hasRoute = provider !== void 0 || model !== void 0 || effort !== void 0;
-      if (role === "scout" && (provider === void 0 || model === void 0 || (route.reasoningEffort && effort === void 0))) {
-        return `测绘智能体必须显式指定 provider=${route.provider}、model=${route.model}、reasoning_effort=${route.reasoningEffort || "模型默认"}；执行智能体才省略路由字段。`;
-      }
-      if (hasRoute && (provider !== route.provider || model !== route.model || (effort !== void 0 && effort !== route.reasoningEffort))) {
-        process.stderr.write(`caseos-dispatch-gate: ${role} 路由拦截 (${provider ?? "-"}/${model ?? "-"}@${effort ?? "-"})\n`);
-        return `${role === "scout" ? "测绘智能体" : "执行智能体"}路由已配置为 ${routeText(route)}，请按面板配置发起 ${exec.name}。`;
-      }
       if (!readSessions.get(session)) return DENY_REASON;
       const desc = String(description ?? "").trim().toLowerCase();
       // 第一笔派遣的身份由运行时决定为测绘智能体，description 只是展示标签。
