@@ -31,8 +31,11 @@ dsh plugin --profile <your-profile> add github:brandonzyy/dsh-plugin-verispring
 # Desktop app: Settings → Plugins → install, paste either spec
 ```
 
-Without HMR, running compositions keep their current tree; new sessions pick it up. The
-desktop app needs a restart.
+The desktop app enables HMR by default (the base bundle turns it on whenever a profile
+context exists), so installs initiated through the plugin manager **apply immediately** —
+no restart needed. Already-running sessions keep their current tree; new sessions and new
+dispatches pick up the new one. A restart is only required where HMR is explicitly disabled
+(headless/SDK/ACP).
 
 ## manon component (bundled)
 

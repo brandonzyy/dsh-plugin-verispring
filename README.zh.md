@@ -30,7 +30,8 @@ dsh plugin --profile <你的profile> add github:brandonzyy/dsh-plugin-verispring
 # 桌面版：设置 → 插件 → 安装，粘贴以上任一 spec
 ```
 
-无 HMR 的运行中会话保留当前组合，新会话生效；桌面版重启 App 后生效。
+桌面版默认启用 HMR（base 组合包随 profile 上下文开启），插件管理器发起的安装**即时生效**，无需重启；
+已经在跑的会话保持旧组合，新会话/新派遣拿到新树。仅当 HMR 被显式禁用（如 headless/SDK/ACP）时才需要重启。
 
 ## manon 组件（随包分发）
 
