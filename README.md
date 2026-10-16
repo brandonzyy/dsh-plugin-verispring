@@ -63,6 +63,24 @@ injected invocation.
   itself, so model/endpoint overrides (`MANON_DEEPQUERY_*` / `MANON_EMBEDDING_*`) set there
   apply to every session. Without manon, every other gate is unaffected.
 
+## Configuration panel (v1.2+)
+
+After install, the dsh settings/plugins page shows a **native configuration page** for this
+entry (auto-generated from its Config schema). The four model slots are editable there and
+apply on save:
+
+| Panel field | Persisted to | Takes effect |
+|---|---|---|
+| Subagent provider / model | `~/.dsh/verispring.json` | enforced immediately by the dispatch gate; also written to the `tool-subagent` `agentOptions` as the default route |
+| Main-session provider / model / effort | the `agent-default-model` profile entry | live reload via configEditor; the native in-session picker still overrides per session |
+| deep-query endpoint / model | `MANON_DEEPQUERY_*` keys in `~/.dsh/manon.env` | flows into manon-kg with the sourced invocation |
+| embedding endpoint / model | `MANON_EMBEDDING_*` keys in `~/.dsh/manon.env` | re-run sync after switching models |
+
+Writes are rooted at the Harness home (`DSH_HOME`), so multi-home/probe environments never
+cross-contaminate; `manon.env` upserts only the panel-owned keys and preserves your
+credential lines. Graphical dropdowns over the configured providers/models are a phase-2
+client-ui card.
+
 ## Model configuration guide
 
 Four model slots: two you configure, two ship pre-configured with the recommended choices.

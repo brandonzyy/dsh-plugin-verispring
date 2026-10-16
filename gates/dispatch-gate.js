@@ -20,13 +20,24 @@ const MAP_FILE = ".project-map.md";
 const RESET_FILE = `/tmp/dsh-caseos-scout-reset-${process.pid}`;
 const PIN_PROVIDER = "verispring";
 const PIN_MODEL = "deepseek-flash";
+// 用户配置文件（配置向导写入）：{ "subagent": { "provider": "...", "model": "..." } }
+// 存在且字段完整时覆盖默认钉死值；读取失败/缺省回落常量，门禁永不因配置文件崩。
+const CONFIG_FILE = `${homedir()}/.dsh/verispring.json`;
 
-import { existsSync, unlinkSync } from "node:fs";
+import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
 
 const SPEC_PATH = `${homedir()}/.dsh/specs/子代理派遣规范.md`;
 const DENY_REASON =
   `派遣前必读 ${SPEC_PATH}：先用 read 工具读取该规范（含任务书模板与派发前自查），然后重新发起本次调用。`;
+
+function loadPin() {
+  try {
+    const cfg = JSON.parse(readFileSync(CONFIG_FILE, "utf8"));
+    if (cfg?.subagent?.provider && cfg?.subagent?.model) return cfg.subagent;
+  } catch {}
+  return { provider: PIN_PROVIDER, model: PIN_MODEL };
+}
 
 function pathMatches(value) {
   if (typeof value !== "string") return false;
@@ -37,7 +48,10 @@ function pathMatches(value) {
 const plugin = {
   inject: ["tools"],
   apply(ctx) {
-    process.stderr.write(`caseos-dispatch-gate: plugin activated (scout reset: ${RESET_FILE})\n`);
+    const pin = loadPin();
+    process.stderr.write(
+      `caseos-dispatch-gate: plugin activated (scout reset: ${RESET_FILE}; pin: ${pin.provider}/${pin.model})\n`,
+    );
     const readSessions = new WeakMap();
     const scoutSessions = new WeakMap();
     ctx.on("tools/result", (exec, result) => {
@@ -57,9 +71,9 @@ const plugin = {
       const provider = exec.arguments?.provider;
       const model = exec.arguments?.model;
       if (provider !== void 0 || model !== void 0) {
-        if (provider !== PIN_PROVIDER || model !== PIN_MODEL) {
+        if (provider !== pin.provider || model !== pin.model) {
           process.stderr.write(`caseos-dispatch-gate: 模型钉死拦截 (${provider ?? "-"}/${model ?? "-"})\n`);
-          return `子代理模型已钉死为 ${PIN_PROVIDER}/${PIN_MODEL}：不要在 ${exec.name} 调用里指定其它 provider/model，去掉这两个字段重新发起即可（默认路由就是钉死的模型）。`;
+          return `子代理模型已钉死为 ${pin.provider}/${pin.model}：不要在 ${exec.name} 调用里指定其它 provider/model，去掉这两个字段重新发起即可（默认路由就是钉死的模型）。`;
         }
       }
       const session = exec.agent?.session;

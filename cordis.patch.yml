@@ -30,3 +30,6 @@
       name: './gates/leader-scope.js'
     - id: caseos-manon-bridge
       name: './gates/manon-bridge.js'
+    # 配置面板：Config schema 自动生成原生设置页；apply 把四个模型位落盘到执法面
+    - id: verispring-config
+      name: './verispring-config.js'

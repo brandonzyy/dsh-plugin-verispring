@@ -56,6 +56,19 @@ tree-sitter 语言包按需动态加载，缺包只降级该语言不崩。密�
   模型/端点的环境变量覆盖（`MANON_DEEPQUERY_*` / `MANON_EMBEDDING_*`）也写在这里即随会话生效。
   不用 manon 时包内其余门禁不受影响。
 
+## 配置面板（v1.2+）
+
+安装后 dsh 设置/插件页会出现本条目的**原生配置页**（由 Config schema 自动生成），四个模型位逐项可配，保存即生效：
+
+| 面板字段 | 落盘位置 | 生效方式 |
+|---|---|---|
+| 子代理渠道 / 模型 | `~/.dsh/verispring.json` | 派遣门禁即时读取强制执法；同时写回 profile patch 的 tool-subagent `agentOptions` 作默认路由 |
+| 主会话默认渠道 / 模型 / 思考强度 | profile patch 的 `agent-default-model` 条目 | configEditor 活重载；会话内用原生模型选择器可临时覆盖 |
+| deep-query 端点 / 模型 | `~/.dsh/manon.env` 的 `MANON_DEEPQUERY_*` | 随注入调用式 source 进 manon-kg |
+| embedding 端点 / 模型 | `~/.dsh/manon.env` 的 `MANON_EMBEDDING_*` | 更换模型后需重新 sync 重建向量 |
+
+写入根为 Harness home（`DSH_HOME`），多 home / 探针环境互不串扰；`manon.env` 只 upsert 面板键，用户凭据行原样保留。已配置渠道/模型的图形化下拉选择器（读 llm-pi-ai 条目）为二期 client-ui 卡片。
+
 ## 模型配置建议
 
 四个模型位：两个要你配，两个出厂即推荐。
