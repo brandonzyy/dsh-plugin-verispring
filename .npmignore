@@ -1,0 +1,5 @@
+manon/.venv
+__pycache__
+*.pyc
+.gitea/
+.github/

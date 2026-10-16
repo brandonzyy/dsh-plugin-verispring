@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# manon-kg — 随 dsh-verispring-architecture 组件分发的本地图谱 CLI 入口。
+# 与上游（~/manon）同源；本副本自带自举：首次运行创建 .venv 并安装 requirements.txt
+# （需要网络，一次性；此后离线可用）。索引落在 <项目>/.manon/，密钥经环境注入——
+# 在 dsh 会话内务必用 bridge 注入的 source 前缀（子进程凭据清洗见包 README）。
+# 用法: manon-kg sync [--full] [-j] | query TEXT [-j] | deep-query TEXT | graph | impact | health | status
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+if [ ! -x "$ROOT/.venv/bin/python" ]; then
+  echo "manon-kg: 首次运行，创建运行环境（一次性，需要网络）..." >&2
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "manon-kg: 需要 python3（>=3.11），未找到" >&2
+    exit 1
+  fi
+  python3 -m venv "$ROOT/.venv"
+  "$ROOT/.venv/bin/pip" install --quiet -r "$ROOT/requirements.txt"
+fi
+export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
+exec "$ROOT/.venv/bin/python" -m matrixone_graph.cli "$@"

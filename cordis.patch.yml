@@ -1,0 +1,32 @@
+# dsh-verispring-architecture —— 三角色会话架构（领导 / 常驻测绘兵 scout / 执行层）
+# 本组合包一个 patch 文件做两件事：
+#   1) 子代理工具默认路由钉死 verispring / deepseek-flash（continuable 后台、
+#      maxDepth 1 不派孙代理、执行层 persona）；
+#   2) insert 三个代码级门禁插件（gates/ 目录）。
+# 代码级兜底在 dispatch-gate 第 4 条：即便调用显式指定其它 provider/model 也会被拒绝。
+# 逃生开关：CASEOS_SCOUT=0 关闭领导分工条款；各门禁拒绝信息均含可满足的解锁步骤。
+# 换网关：改下面 agentOptions 的 provider/model 与 gates/dispatch-gate.js 的
+# PIN_PROVIDER/PIN_MODEL，两处保持一致。
+- id: tool-subagent
+  config:
+    provider: spawn
+    toolName: subagent
+    backgroundMode: continuable
+    maxDepth: 1
+    persona: >-
+      你是执行层子代理：承接全部执行类工作——读码、检索、改码、跑测试与门禁、查代码图谱、
+      web 查证。你拥有全部工具与规范权限；动作涉及派遣/提交/工程规范时，先读
+      ~/.dsh/specs/ 下同名规范再动手。全部工作完成后一次性验证并汇报：
+      结论、改动文件路径、测试读数，不报过程，不追加确认轮。
+    agentOptions:
+      provider: verispring
+      model: deepseek-flash
+- insert:
+    - id: caseos-dispatch-gate
+      name: './gates/dispatch-gate.js'
+    - id: caseos-codestyle-gate
+      name: './gates/codestyle-gate.js'
+    - id: caseos-leader-scope
+      name: './gates/leader-scope.js'
+    - id: caseos-manon-bridge
+      name: './gates/manon-bridge.js'
