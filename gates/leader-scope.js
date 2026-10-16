@@ -9,16 +9,10 @@
 //   子代理自己的层（own-layer 注册豁免祖先限制），全量工具面不变。
 // 已知边界：领导保有 bash（复核需要），本插件收缩声明面并引导分工，不防对抗性绕过。
 const LEADER_ALLOW = new Set([
-  "bash", "edit", "write", "read", "read_image",
   "subagent", "send_message", "interrupt_agent", "list_agents",
 ]);
 
 const SLIM_DESC = {
-  bash: "Run a bash command; returns stdout/stderr and exit code.",
-  edit: "Replace literal text in an existing UTF-8 file.",
-  write: "Create or fully overwrite a UTF-8 file.",
-  read: "Read a text file with line numbers; use offset/limit for large files.",
-  read_image: "Read an image file and return the image.",
   subagent:
     "派遣执行类工作给执行智能体；任务书须自足。测绘智能体需在 description 开头写“测绘智能体”，并显式带渠道、模型、思考强度；执行智能体默认使用面板配置。默认后台运行，返回子代理 id，结束后有通知；运行中可 send_message 纠偏。",
   send_message: "向运行中的子代理发消息：纠偏、补充约束或追加任务。",
