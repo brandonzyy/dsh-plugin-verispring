@@ -1,13 +1,11 @@
 // 领导/测绘/执行三面工具架构（C，2026-10-15 用户定稿；进门票 <5000 压缩版）：
 // - 领导会话（origin != subagent）创建时两步：
-//     1) agent.ctx.tools.restrict({ allow })——声明面收缩到复核五件 + subagent；
-//     2) 把这 6 个工具以「瘦身定义」重注册进领导自己的层（own-layer 遮蔽全局原版）：
+//     1) agent.ctx.tools.restrict({ allow })——声明面收缩到派遣与回执工具；
+//     2) 把这 4 个工具以「瘦身定义」重注册进领导自己的层（own-layer 遮蔽全局原版）：
 //        截断工具描述与参数说明。执行闭包保留原版，参数校验不受瘦身影响；
-//        list_agents/interrupt_agent/send_message 不进白名单——前台一次性派遣模式下
-//        这三件物理不可用（subagent 调用阻塞到子代理结束，无并发可管理）。
 // - 测绘/执行智能体（origin == subagent）：创建时把白名单外的全局工具按原版重注册进
 //   子代理自己的层（own-layer 注册豁免祖先限制），全量工具面不变。
-// 已知边界：领导保有 bash（复核需要），本插件收缩声明面并引导分工，不防对抗性绕过。
+// 领导没有读码和改码工具；复核只依赖子代理回执与最终业务事实。
 const LEADER_ALLOW = new Set([
   "subagent", "send_message", "interrupt_agent", "list_agents",
 ]);
