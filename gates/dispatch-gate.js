@@ -65,8 +65,13 @@ function pathMatches(value) {
   return expanded.includes(SPEC_FRAGMENT);
 }
 
+const EXECUTOR_PERSONA =
+  "你是执行智能体：承接全部执行类工作——读码、检索、改码、跑测试与门禁、查代码图谱、web 查证。" +
+  "你拥有全部工具与规范权限；动作涉及派遣/提交/工程规范时，先读 ~/.dsh/specs/ 下同名规范再动手。" +
+  "全部工作完成后一次性验证并汇报：结论、改动文件路径、测试读数，不报过程，不追加确认轮。";
+
 const plugin = {
-  inject: ["tools"],
+  inject: ["tools", "agents"],
   apply(ctx) {
     const routes = loadRoutes();
     process.stderr.write(
@@ -74,6 +79,63 @@ const plugin = {
     );
     const readSessions = new WeakMap();
     const scoutSessions = new WeakMap();
+    const leaderToolInstalled = new WeakSet();
+
+    // 子代理的 provider/model/preset 是运行时契约，不能依赖模型是否记得在
+    // tool call 里填写，也不能依赖旧会话当时加载的 preset 配置。领导会话的
+    // subagent 工具在这里被替换成唯一的 spawn 入口，所有请求统一挂载
+    // verispring-subagent 并使用当前面板的执行路由。
+    const installLeaderTool = (agent) => {
+      if (!agent || agent.session?.header?.origin === "subagent") return;
+      if (leaderToolInstalled.has(agent)) return;
+      agent.ctx.inject(["tools"], (rtc) => {
+        const original = rtc.tools.get("subagent");
+        if (!original) return;
+        const wrapped = {
+          ...original,
+          async execute(args, exec) {
+            const session = exec.agent?.session;
+            const route = loadRoutes().executor;
+            const state = scoutSessions.get(session) ?? { started: false };
+            const role = state.started ? "executor" : "scout";
+            if (role === "scout") state.started = true;
+            scoutSessions.set(session, state);
+            const label = String(args.description ?? "").trim();
+            const roleLabel = role === "scout" ? `scout: ${label}` : `executor: ${label}`;
+            process.stderr.write(
+              `caseos-dispatch-gate: 强制 ${role} 子代理 ${routeText(route)} preset=verispring-subagent\n`,
+            );
+            const child = await exec.agent.ctx.subagents.startActivation({
+              provider: "spawn",
+              label: roleLabel,
+              request: {
+                ...(args.cwd === void 0 ? {} : { cwd: args.cwd }),
+                prompt: [{ type: "text", text: String(args.prompt ?? "") }],
+                parent: exec.agent,
+                agentPreset: "verispring-subagent",
+                agentOptions: {
+                  provider: route.provider,
+                  model: route.model,
+                  reasoningEffort: route.reasoningEffort,
+                },
+                persona: role === "scout" ? "你是只读测绘智能体：只读扫描项目并在项目根写入 .project-map.md；禁止编辑业务代码。" : EXECUTOR_PERSONA,
+                maxDepth: 1,
+              },
+              signal: exec.signal,
+              delivery: "parent",
+            });
+            return { kind: "activation", subagentId: child.childId };
+          },
+        };
+        rtc.tools.register(wrapped);
+        leaderToolInstalled.add(agent);
+        process.stderr.write("caseos-dispatch-gate: 领导 subagent 入口已绑定强制 preset/路由\n");
+      });
+    };
+
+    for (const agent of ctx.agents.list()) installLeaderTool(agent);
+    ctx.on("agent/created", ({ agent }) => installLeaderTool(agent));
+
     ctx.on("tools/result", (exec, result) => {
       if (!exec || result?.isError) return;
       if (exec.name !== "read" && exec.name !== "bash") return;
@@ -88,8 +150,13 @@ const plugin = {
     });
     ctx.tools.guard((exec) => {
       if (!GATE_TOOLS.has(exec.name)) return undefined;
+      if (exec.name === "subagent_fork") {
+        return "本插件统一使用 subagent spawn 入口；subagent_fork 不属于三智能体架构。";
+      }
       const description = exec.arguments?.description;
-      const role = isScoutDescription(description) ? "scout" : "executor";
+      const session = exec.agent?.session;
+      const state = scoutSessions.get(session) ?? { started: false };
+      const role = state.started ? "executor" : "scout";
       const route = loadRoutes()[role];
       const provider = exec.arguments?.provider;
       const model = exec.arguments?.model;
@@ -102,9 +169,11 @@ const plugin = {
         process.stderr.write(`caseos-dispatch-gate: ${role} 路由拦截 (${provider ?? "-"}/${model ?? "-"}@${effort ?? "-"})\n`);
         return `${role === "scout" ? "测绘智能体" : "执行智能体"}路由已配置为 ${routeText(route)}，请按面板配置发起 ${exec.name}。`;
       }
-      const session = exec.agent?.session;
       if (!readSessions.get(session)) return DENY_REASON;
       const desc = String(description ?? "").trim().toLowerCase();
+      // 第一笔派遣的身份由运行时决定为测绘智能体，description 只是展示标签。
+      // 这样模型无法通过漏写 scout 前缀跳过测绘阶段。
+      if (!state.started) return undefined;
       if (isScoutDescription(desc)) {
         if (scoutSessions.get(session)) {
           if (existsSync(RESET_FILE)) {
