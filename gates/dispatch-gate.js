@@ -36,10 +36,15 @@ const DENY_REASON =
 function loadRoutes() {
   try {
     const cfg = JSON.parse(readFileSync(CONFIG_FILE, "utf8"));
-    const route = (name) => ({
-      ...DEFAULT_ROUTES[name],
-      ...(cfg?.[name]?.provider && cfg?.[name]?.model ? cfg[name] : {}),
-    });
+    const route = (name) => {
+      const configured = cfg?.[name];
+      if (!configured?.provider || !configured?.model) return DEFAULT_ROUTES[name];
+      return {
+        ...DEFAULT_ROUTES[name],
+        ...configured,
+        reasoningEffort: configured.reasoningEffort || DEFAULT_ROUTES[name].reasoningEffort,
+      };
+    };
     return { scout: route("scout"), executor: route("executor") };
   } catch {}
   return DEFAULT_ROUTES;
