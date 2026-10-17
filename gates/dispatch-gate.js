@@ -320,6 +320,10 @@ const plugin = {
       } else installLeaderTool(agent);
     });
 
+    // 新建主会话的首个回合可能在 agent/created 返回后立刻开始；在正式生成
+    // 回合前再绑定一次，确保模型拿到的是本插件的强制路由入口，而不是原始工具。
+    ctx.on("agent/pre-step", ({ agent }) => installLeaderTool(agent));
+
     // 规范已读的路径判定补充：read/bash 结果内容不含首行标记（如被截断）但调用路径
     // 指向规范文件时，同样计入。内容判定由 sessionState 的增量扫描覆盖。
     ctx.on("tools/result", (exec, result) => {
