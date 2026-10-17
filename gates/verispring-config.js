@@ -126,6 +126,14 @@ export function apply(ctx, config) {
       deepQueryProvider === "verispring" && deepQueryModel === "deepseek-flash" && deepQueryEffort === "off" &&
       embeddingUrl === "https://api.siliconflow.cn/v1" && embeddingModel === "BAAI/bge-m3";
     const configRows = typeof editor.configuration === "function" ? editor.configuration() : [];
+    writeFileSync(`/tmp/verispring-config-debug-${process.pid}.json`, `${JSON.stringify(configRows.map(({ entry, inherited }) => ({
+      id: entry.options.id,
+      name: entry.options.name,
+      currentKeys: Object.keys(entry.options.config ?? {}),
+      inheritedKeys: Object.keys(inherited ?? {}),
+      currentHasTool: Boolean(findNestedPluginConfig(entry.options.config, "tool-subagent")),
+      inheritedHasTool: Boolean(findNestedPluginConfig(inherited, "tool-subagent")),
+    })), null, 2)}\n`);
     const row = configRows.find(({ entry, inherited }) =>
       entry.options.id === "tool-subagent" ||
       findNestedPluginConfig(entry.options.config, "tool-subagent") || findNestedPluginConfig(inherited, "tool-subagent"));
