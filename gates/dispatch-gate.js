@@ -29,7 +29,7 @@ const DEFAULT_ROUTES = {
 };
 // 用户配置文件（配置面板写入）：{ scout: {...}, executor: {...} }。
 // 读取失败/缺省回落常量，门禁永不因配置文件崩。
-import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { SLIM_DESC, slimSchema } from "./leader-scope.js";
 
@@ -176,6 +176,10 @@ const plugin = {
     const dshHome = ctx.profileContext?.home ?? process.env.DSH_HOME ?? `${homedir()}/.dsh`;
     const configFile = `${dshHome}/verispring.json`;
     const stateDir = `${dshHome}/caseos/session-state`;
+    const debug = (message) => {
+      try { appendFileSync(`${dshHome}/caseos-dispatch-debug.log`, `${new Date().toISOString()} ${message}\n`); }
+      catch {}
+    };
     const specPath = `${dshHome}/specs/子代理派遣规范.md`;
     const denyReason =
       `派遣前必读 ${specPath}：先用 read 工具读取该规范（含任务书模板与派发前自查），然后重新发起本次调用。`;
@@ -188,6 +192,7 @@ const plugin = {
     process.stderr.write(
       `caseos-dispatch-gate: plugin activated (测绘: ${routeText(routes.scout)}; 执行: ${routeText(routes.executor)})\n`,
     );
+    debug(`apply root=${Boolean(ctx.root)} routes=${routeText(routes.scout)};${routeText(routes.executor)}`);
     const leaderToolInstalled = new WeakSet();
     let globalLeaderToolInstalled = false;
     // 桌面恢复/切换 fiber 时 session 可能被重新包装；领导 agent 身份更稳定，
@@ -200,13 +205,14 @@ const plugin = {
     // 这样不在官方同名工具作用域上重复注册，角色由会话事件推导（首笔=测绘，其后=执行）。
     const installLeaderTool = async (agent) => {
       if (!agent || agent.session?.header?.origin === "subagent") return;
+      debug(`install agent=${agent.id}`);
       if (leaderToolInstalled.has(agent) || leaderToolInstalling.has(agent)) return;
       leaderToolInstalling.add(agent);
       try {
         await agent.ctx.inject(["tools", "subagents"], (rtc) => {
         // 按领导自己的视图取官方基座；它只作为执行实现，不直接暴露给模型。
         const current = rtc.tools.get(BASE_SUBAGENT_TOOL, agent);
-        if (!current) return;
+        if (!current) { debug(`base-missing agent=${agent.id}`); return; }
         // 领导层的 subagent 只此一处注册：瘦身文案来自 leader-scope，执行体是本文件的路由强制。
         // 其他插件（如 leader-scope）不得再注册同名工具，否则同层重复注册会抛错。
         if (current.__caseosRouted) {
@@ -294,13 +300,16 @@ const plugin = {
             ctx.root.tools.register(wrapped);
             globalLeaderToolInstalled = true;
             registered = true;
+            debug(`global-register-ok agent=${agent.id}`);
             process.stderr.write("caseos-dispatch-gate: 全局 subagent 入口已绑定强制路由\n");
           } catch (error) {
             try {
               rtc.tools.register(wrapped);
               registered = true;
+              debug(`scoped-register-ok agent=${agent.id}`);
               process.stderr.write("caseos-dispatch-gate: 领导 subagent 入口已绑定强制路由\n");
             } catch (scopedError) {
+              debug(`register-fail agent=${agent.id} global=${String(error)} scoped=${String(scopedError)}`);
               process.stderr.write(`caseos-dispatch-gate: subagent 入口注册失败: ${String(scopedError)}; 全局尝试: ${String(error)}\n`);
             }
           }
@@ -350,6 +359,7 @@ const plugin = {
 
     for (const agent of ctx.agents.list()) void installLeaderTool(agent);
     ctx.root.on("agent/created", async ({ agent }) => {
+      debug(`created agent=${agent?.id} subagent=${agent?.session?.header?.origin === "subagent"}`);
       if (agent?.session?.header?.origin === "subagent") {
         await composeSubagentPreset(agent);
         await hideBaseSubagentTool(agent);
@@ -365,6 +375,7 @@ const plugin = {
     // 新建主会话的首个回合可能在 agent/created 返回后立刻开始；在正式生成
     // 回合前再绑定一次，确保模型拿到的是本插件的强制路由入口，而不是原始工具。
     ctx.root.on("agent/pre-step", async ({ agent }, next) => {
+      debug(`pre-step agent=${agent?.id}`);
       await installLeaderTool(agent);
       return next();
     });
