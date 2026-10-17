@@ -152,7 +152,7 @@ function takeRouteLabel(parent) {
 }
 
 const plugin = {
-  inject: ["tools", "agents"],
+  inject: ["tools", "agents", "sessionTitle"],
   apply(ctx) {
     const routes = loadRoutes();
     process.stderr.write(
