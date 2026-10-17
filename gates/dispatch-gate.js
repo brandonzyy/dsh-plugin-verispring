@@ -202,6 +202,9 @@ const plugin = {
           async execute(args, exec) {
             const session = exec.agent?.session;
             const role = stateOf(session).scoutStarted ? "executor" : "scout";
+            // 配置保存与派遣之间可能跨越不同的宿主 fiber；每次派遣直接读取文件，
+            // 确保保存后的路由无需依赖事件总线或重启即可生效。
+            routes = loadRoutes(configFile);
             const route = routes[role];
             const label = String(args.description ?? "").trim();
             const roleLabel = `${routeText(route)} · ${role} · ${label}`;
