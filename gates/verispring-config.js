@@ -125,11 +125,14 @@ export function apply(ctx, config) {
       executorProvider === "verispring" && executorModel === "deepseek-flash" && executorEffort === "high" &&
       deepQueryProvider === "verispring" && deepQueryModel === "deepseek-flash" && deepQueryEffort === "off" &&
       embeddingUrl === "https://api.siliconflow.cn/v1" && embeddingModel === "BAAI/bge-m3";
-    const entry = (typeof editor.entries === "function" ? editor.entries() : [])
-      .find((candidate) => candidate.options.id === "preset-standard");
+    const configRows = typeof editor.configuration === "function" ? editor.configuration() : [];
+    const row = configRows.find(({ entry, inherited }) =>
+      findNestedPluginConfig(entry.options.config, "tool-subagent") || findNestedPluginConfig(inherited, "tool-subagent"));
+    const entry = row?.entry;
     if (entry) {
       const current = JSON.parse(JSON.stringify(entry.options.config ?? {}));
-      const next = JSON.parse(JSON.stringify(current));
+      const inherited = JSON.parse(JSON.stringify(row.inherited ?? {}));
+      const next = findNestedPluginConfig(current, "tool-subagent") ? current : inherited;
       const tool = findNestedPluginConfig(next, "tool-subagent");
       if (tool) {
         delete tool.persona;
@@ -142,7 +145,7 @@ export function apply(ctx, config) {
           editor.edit(entry, () => next).catch((error) => ctx.logger.warn(`verispring-config: 写 preset-standard 失败: ${String(error)}`));
         }
       }
-    }
+    } else process.stderr.write("verispring-config: 未找到包含 tool-subagent 的 preset 配置\n");
 
     if (allDefault) return;
 
