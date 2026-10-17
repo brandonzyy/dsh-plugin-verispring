@@ -16,9 +16,6 @@ window.__ModuleLoader__.load({
       executorProvider: "verispring",
       executorModel: "deepseek-flash",
       executorEffort: "high",
-      mainSessionProvider: "verispring",
-      mainSessionModel: "claude-opus-5-5",
-      mainSessionEffort: "high",
       deepQueryProvider: "verispring",
       deepQueryModel: "deepseek-flash",
       deepQueryEffort: "off",
@@ -53,7 +50,6 @@ window.__ModuleLoader__.load({
     const menuValueStyle = { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" };
     const menuChevronStyle = { flex: "none", opacity: 0.65 };
     const modelGridStyle = { display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 12, alignItems: "start" };
-    const embeddingGridStyle = { display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 16, alignItems: "start" };
     const modelCardStyle = { minWidth: 0, padding: 12, border: "0.5px solid var(--dsw-alias-border-l2)", borderRadius: "var(--dsw-radius-lg)", background: "var(--dsw-alias-bg-layer-2)" };
     const modelHeadingStyle = { display: "flex", alignItems: "baseline", gap: 8, minWidth: 0, margin: "0 0 4px" };
     const modelAdviceStyle = { overflow: "hidden", color: "var(--dsw-alias-label-tertiary)", fontSize: 12, fontWeight: 400, whiteSpace: "nowrap", textOverflow: "ellipsis" };
@@ -72,6 +68,7 @@ window.__ModuleLoader__.load({
     let embeddingCredentialStore;
     let modelConfigForm;
     let clientRemote;
+    let legacyConfigMigrationStarted = false;
     const CREDENTIAL_REF = "VERISPRING_API_KEY";
     const EMBEDDING_CREDENTIAL_REF = "MANON_EMBEDDING_API_KEY";
     const emptySubscribe = () => () => {};
@@ -149,6 +146,19 @@ window.__ModuleLoader__.load({
 
     function groupsFor(catalog) {
       return catalog.groups.length > 0 ? catalog.groups : FALLBACK_GROUPS;
+    }
+
+    function migrateLegacyMainSessionFields(form) {
+      if (legacyConfigMigrationStarted) return;
+      const snapshot = form.getSnapshot();
+      const value = snapshot?.value;
+      if (!value || snapshot.revision === undefined) return;
+      const legacyKeys = ["mainSessionProvider", "mainSessionModel", "mainSessionEffort"]
+        .filter(key => Object.prototype.hasOwnProperty.call(value, key));
+      if (legacyKeys.length === 0) return;
+      legacyConfigMigrationStarted = true;
+      void form.mutate(legacyKeys.map(key => ({ op: "remove", path: [key] })), snapshot.revision)
+        .catch(() => { legacyConfigMigrationStarted = false; });
     }
 
     function providerLabel(group) {
@@ -351,9 +361,6 @@ window.__ModuleLoader__.load({
       const executorProvider = read("executorProvider");
       const executorModel = read("executorModel");
       const executorEffort = read("executorEffort");
-      const mainSessionProvider = read("mainSessionProvider");
-      const mainSessionModel = read("mainSessionModel");
-      const mainSessionEffort = read("mainSessionEffort");
       const deepQueryProvider = read("deepQueryProvider");
       const deepQueryModel = read("deepQueryModel");
       const deepQueryEffort = read("deepQueryEffort");
@@ -406,6 +413,15 @@ window.__ModuleLoader__.load({
       const section = (title, hint) => React.createElement("section", { style: { margin: "12px 0 6px" } },
         React.createElement("h4", { style: { margin: "0 0 3px", color: "var(--dsw-alias-label-primary)", fontSize: 14 } }, title),
         hint ? React.createElement("p", { style: { margin: 0, color: "var(--dsw-alias-label-tertiary)", fontSize: 12 } }, hint) : null);
+      const embeddingCard = React.createElement("section", { style: modelCardStyle },
+        React.createElement("h4", { style: modelHeadingStyle },
+          React.createElement("span", { style: { flex: "none", color: "var(--dsw-alias-label-primary)", fontSize: 14 } }, "Embedding"),
+          React.createElement("span", { style: modelAdviceStyle, title: "更换模型后需重新 sync 重建向量" }, "更换模型后需重新 sync 重建向量"),
+        ),
+        textField("embeddingUrl", "端点", "向量嵌入服务地址", read("embeddingUrl"), disabled, edit),
+        textField("embeddingModel", "模型", "只填写模型名", read("embeddingModel"), disabled, edit),
+        embeddingKeyField({ configured: embeddingCredential.configured, value: embeddingKeyDraft, disabled: !embeddingCredential.writable || saving, onEdit: setEmbeddingKeyDraft }),
+      );
       const modelCard = (title, advice, providerKey, modelKey, effortKey) => React.createElement("section", { style: modelCardStyle },
         React.createElement("h4", { style: modelHeadingStyle },
           React.createElement("span", { style: { flex: "none", color: "var(--dsw-alias-label-primary)", fontSize: 14 } }, title),
@@ -431,18 +447,12 @@ window.__ModuleLoader__.load({
         }, onSave: save, onDiscard: discard },
           section("Verispring API Key"),
           React.createElement(CredentialField, { configured: credential.configured, value: keyDraft, disabled: !credential.writable || saving, onEdit: setKeyDraft }),
-          section("语言模型", "选择渠道后，模型与思考强度只显示该渠道目录"),
+          section("语言模型与 Embedding", "选择渠道后，模型与思考强度只显示该渠道目录"),
           React.createElement("div", { style: modelGridStyle },
             modelCard("测绘智能体", "建议：高精度模型，High", "scoutProvider", "scoutModel", "scoutEffort"),
             modelCard("执行智能体", "建议：DeepSeek Flash，High", "executorProvider", "executorModel", "executorEffort"),
-            modelCard("主会话默认", "建议：Claude Opus 5.5，High，适合主会话推理", "mainSessionProvider", "mainSessionModel", "mainSessionEffort"),
             modelCard("Manon Deep Query", "建议：DeepSeek Flash，Off，查询响应快", "deepQueryProvider", "deepQueryModel", "deepQueryEffort"),
-          ),
-          section("Embedding", "更换模型后需重新 sync 重建向量"),
-          React.createElement("div", { style: embeddingGridStyle },
-            textField("embeddingUrl", "端点", "向量嵌入服务地址", read("embeddingUrl"), disabled, edit),
-            textField("embeddingModel", "模型", "只填写模型名", read("embeddingModel"), disabled, edit),
-            embeddingKeyField({ configured: embeddingCredential.configured, value: embeddingKeyDraft, disabled: !embeddingCredential.writable || saving, onEdit: setEmbeddingKeyDraft }),
+            embeddingCard,
           ),
         ),
         success ? React.createElement(Toast, { text: "全部成功连通✅", tone: "success", holdMs: 4000, onDone: () => setSuccess(false) }) : null,
@@ -478,6 +488,7 @@ window.__ModuleLoader__.load({
             subscribe: (listener) => source.subscribe(listener),
             mutate: (ops, revision) => source.mutate(ops, revision),
           };
+          migrateLegacyMainSessionFields(source);
           modelConfigForm = ctx.configForms.get("llm-pi-ai");
           catalogStore = createCatalogStore(ctx.remote);
           credentialStore = createCredentialStore(ctx.remote, CREDENTIAL_REF);

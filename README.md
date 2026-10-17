@@ -96,15 +96,14 @@ injected invocation.
 
 After install, the bundle detail page displays the configuration directly. The panel uses
 the DSH shared form controls and reads the live model catalog, so provider and model choices
-stay aligned with the Models configuration. The four model slots are editable and apply on save.
+stay aligned with the Models configuration. The three agent route slots are editable and apply on save; the main session uses the native DSH model picker.
 While the panel has never been saved (everything at defaults), the plugin rewrites no
-enforcement surface — `verispring.json`, `agent-default-model` and `manon.env` keep your
+enforcement surface — `verispring.json` and `manon.env` keep your
 native values:
 
 | Panel field | Persisted to | Takes effect |
 |---|---|---|
 | Surveying/execution provider / model / effort | `~/.dsh/verispring.json` | each route is enforced by the dispatch gate; execution defaults are also written to `tool-subagent` |
-| Main-session provider / model / effort | the `agent-default-model` profile entry | live reload via configEditor; the native in-session picker still overrides per session |
 | Manon Deep Query provider / model / effort | `MANON_DEEPQUERY_*` keys in `~/.dsh/manon.env` | flows into manon-kg with the sourced invocation |
 | embedding endpoint / model | `MANON_EMBEDDING_*` keys in `~/.dsh/manon.env` | re-run sync after switching models |
 
@@ -117,11 +116,10 @@ catalog. The embedding model remains a text field.
 
 ## Model configuration guide
 
-Four model slots: two you configure, two ship pre-configured with the recommended choices.
+Three agent route slots are configurable in the plugin panel; the main session uses DSH's native model picker.
 
 | Slot | Where | Recommendation |
 |---|---|---|
-| Main session | the profile's `agent-default-model` (or the in-session picker) | **Claude Opus 5.5** — leading, reviewing, and task-book writing need the reasoning; drop to a Sonnet tier when budget-sensitive |
 | Surveying / execution agents | independently selected in the plugin panel | **DeepSeek Flash** for both by default; each route can choose its own provider, model, and effort |
 | Manon Deep Query | choose the verispring provider, model, and effort in the panel; key falls back to `VERISPRING_API_KEY` | **DeepSeek Flash + off** (shipped as recommended); saving writes `~/.dsh/manon.env` and the sourced invocation uses it. |
 | embedding | env: `MANON_EMBEDDING_URL` / `MANON_EMBEDDING_MODEL` / `MANON_EMBEDDING_API_KEY` (defaults to SiliconFlow `BAAI/bge-m3`) | the built-in bge-m3 is the recommendation; switching requires a re-sync to rebuild vectors |

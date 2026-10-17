@@ -383,12 +383,6 @@
                   modelSelectionSettings: false
                   backgroundMode: continuable
                   maxDepth: 1
-              - id: tool-subagent-fork
-                name: '@deepseek-ai/dsh-tool-subagent'
-                config:
-                  provider: fork
-                  toolName: subagent_fork
-                  backgroundMode: continuable
               - id: tool-subagent-codex
                 name: '@deepseek-ai/dsh-tool-subagent'
                 disabled: true

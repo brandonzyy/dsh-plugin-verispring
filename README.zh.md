@@ -80,12 +80,11 @@ tree-sitter 语言包按需动态加载，缺包只降级该语言不崩。密�
 
 ## 配置面板（v1.3+）
 
-安装后组合包详情页直接显示配置。面板使用 DSH 共用表单控件并读取实时模型目录，渠道和模型选项与模型设置保持一致，保存即生效。面板从未保存（全部取默认）时插件不改写任何执法面——`verispring.json`、`agent-default-model`、`manon.env` 里的原生配置不被默认值覆盖：
+安装后组合包详情页直接显示配置。面板使用 DSH 共用表单控件并读取实时模型目录，渠道和模型选项与模型设置保持一致，保存即生效。面板从未保存（全部取默认）时插件不改写任何执法面——`verispring.json`、`manon.env` 里的原生配置不被默认值覆盖：
 
 | 面板字段 | 落盘位置 | 生效方式 |
 |---|---|---|
 | 测绘/执行智能体渠道 / 模型 / 思考强度 | `~/.dsh/verispring.json` | 两套路由分别由派遣门禁执法；执行路由同时写回 tool-subagent 默认值 |
-| 主会话默认渠道 / 模型 / 思考强度 | profile patch 的 `agent-default-model` 条目 | configEditor 活重载；会话内用原生模型选择器可临时覆盖 |
 | Manon Deep Query 渠道 / 模型 / 思考强度 | `~/.dsh/manon.env` 的 `MANON_DEEPQUERY_*` | 随注入调用式 source 进 manon-kg |
 | embedding 端点 / 模型 | `~/.dsh/manon.env` 的 `MANON_EMBEDDING_*` | 更换模型后需重新 sync 重建向量 |
 
@@ -93,11 +92,10 @@ tree-sitter 语言包按需动态加载，缺包只降级该语言不崩。密�
 
 ## 模型配置建议
 
-四个模型位：两个要你配，两个出厂即推荐。
+三个智能体路由位在插件面板配置；主会话使用 DSH 原生模型选择器。
 
 | 模型位 | 配置处 | 建议 |
 |---|---|---|
-| 主会话 | profile 的 `agent-default-model`（或会话内模型选择器） | **Claude Opus 5.5**——指挥、复核、写任务书吃推理；预算敏感可降 Sonnet 档 |
 | 测绘智能体 / 执行智能体 | 插件面板分别选择 | 默认都用 **DeepSeek Flash**；两套路由可独立选择渠道、模型和思考强度 |
 | Manon Deep Query | 面板选择 verispring 渠道、模型、思考强度；密钥回退 `VERISPRING_API_KEY` | **DeepSeek Flash + off**（出厂即推荐）；保存后写入 `~/.dsh/manon.env`，随注入调用式生效。 |
 | embedding | 环境变量：`MANON_EMBEDDING_URL` / `MANON_EMBEDDING_MODEL` / `MANON_EMBEDDING_API_KEY`（默认硅基流动 `BAAI/bge-m3`） | 内置 bge-m3 即推荐；更换需重新 sync 重建向量 |

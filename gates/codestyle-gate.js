@@ -12,6 +12,8 @@ import { homedir } from "node:os";
 const SPEC_PATH = `${homedir()}/.dsh/specs/代码写作规范.md`;
 const DENY_REASON =
   `提交代码前必读 ${SPEC_PATH}：先用 read 工具读取该规范，然后重新发起本次 git commit。`;
+const SHAPE_REASON =
+  "提交门禁要求使用 `git commit -F <提交信息文件> -- <显式路径...>`；禁止 -a/-am、-m 或省略显式路径。";
 
 // git 的全局选项：-c/-C 类带一个值令牌，其余旗标单令牌。子命令判定必须跳过它们，
 // 否则 `git -C commit status`（目录名恰为 commit）会把选项值误判成子命令。
@@ -38,9 +40,37 @@ function isGitCommitCommand(command) {
       if (t.startsWith("-")) { i++; continue; }
       break;
     }
+    if (tokens[i] === "bash" || tokens[i] === "sh") {
+      const inner = /-c\s+(.+)$/s.exec(tokens.slice(i).join(" "));
+      if (inner) return hasSafeCommitShape(inner[1].replace(/^['"]|['"]$/g, ""));
+      continue;
+    }
     if (tokens[i] === "commit") return true;
   }
   return false;
+}
+
+function hasSafeCommitShape(command) {
+  for (const segment of String(command).split(/(?:&&|\|\||;|\n|\(|\))/)) {
+    const tokens = segment.trim().replace(/^[('"` ]+/, "").split(/\s+/).filter(Boolean);
+    let i = 0;
+    while (i < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[i])) i++;
+    if (tokens[i] !== "git") continue;
+    i++;
+    while (i < tokens.length) {
+      const t = tokens[i];
+      if (GIT_OPTS_WITH_VALUE.has(t)) { i += 2; continue; }
+      if (t.startsWith("-")) { i++; continue; }
+      break;
+    }
+    if (tokens[i] !== "commit") continue;
+    const args = tokens.slice(i + 1);
+    const separator = args.indexOf("--");
+    const messageIndex = args.findIndex((token) => token === "-F" || token === "--file");
+    return separator >= 0 && messageIndex >= 0 && messageIndex + 1 < separator && separator + 1 < args.length &&
+      !args.slice(0, separator).some((token) => token === "-a" || token === "--all" || token === "-am" || token === "-m" || token.startsWith("-m"));
+  }
+  return true;
 }
 
 function pathMatches(value) {
@@ -73,6 +103,7 @@ const plugin = {
         command = typeof exec.arguments?.command === "string" ? exec.arguments.command : "";
       } catch {}
       if (!isGitCommitCommand(command)) return undefined;
+      if (!hasSafeCommitShape(command)) return SHAPE_REASON;
       if (readSessions.get(exec.agent?.session)) return undefined;
       return DENY_REASON;
     });

@@ -20,8 +20,22 @@ import { fileURLToPath } from "node:url";
 const SOURCE_PREFIX =
   "set -a; [ -f ~/.dsh/manon.env ] && source ~/.dsh/manon.env; [ -f ~/.dsh/verispring.env ] && source ~/.dsh/verispring.env; set +a; ";
 
+const SECRET_FILES = new Set(["manon.env", "verispring.env"]);
+
+function isSecretFile(value) {
+  if (typeof value !== "string") return false;
+  const normalized = value.replaceAll("\\", "/");
+  return SECRET_FILES.has(normalized.split("/").at(-1));
+}
+
+function readsSecretFile(command) {
+  const text = String(command ?? "");
+  if (!/(?:cat|head|tail|sed|awk|cut|env|printenv|grep|rg)\b/.test(text)) return false;
+  return [...SECRET_FILES].some((name) => text.includes(name));
+}
+
 const plugin = {
-  inject: ["systemPrompt"],
+  inject: ["systemPrompt", "tools"],
   apply(ctx) {
     const home = homedir();
     const bundled = join(dirname(fileURLToPath(import.meta.url)), "..", "manon", "manon-kg");
@@ -29,6 +43,15 @@ const plugin = {
     const kg = process.env[KG_BIN_ENV] ?? (existsSync(bundled) ? bundled : legacy);
     const kgOk = existsSync(kg);
     process.stderr.write(`manon-bridge: activated; kg=${kg}${kgOk ? "" : " (missing -> 用法注入跳过)"}\n`);
+    ctx.tools.guard((exec) => {
+      if (exec.name === "read" && isSecretFile(exec.arguments?.path ?? exec.arguments?.file ?? exec.arguments?.file_path)) {
+        return "凭据文件只允许由受控 manon 调用式 source；禁止用 read 读取并写入会话日志。";
+      }
+      if (exec.name === "bash" && readsSecretFile(exec.arguments?.command)) {
+        return "凭据文件禁止用命令输出；只允许在 manon 调用式中 source 后执行目标子命令。";
+      }
+      return undefined;
+    });
     if (!kgOk) return;
     ctx.systemPrompt.section({
       name: "verispring:manon-kg",

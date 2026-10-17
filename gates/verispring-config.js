@@ -1,15 +1,13 @@
 // verispring 配置面板（宿主侧）：Config schema 即设置页——dsh settings 传输会把每个条目的
 // schema 自动生成原生配置页（autoGenerate 默认开），表单写入经官方传输回到本条目的 live
-// Config，cordis 随即以新配置重跑 apply，apply 把四个模型位落到三处执法面：
+// Config，cordis 随即以新配置重跑 apply，apply 把三套路由位落到两处执法面：
 //   1 测绘/执行路由 -> ~/.dsh/verispring.json（dispatch-gate 读取并执法）
-//   2 主会话默认   -> profile patch 条目 agent-default-model（configEditor.edit，含思考强度，
-//                     agentDefaultModel 服务活重载）
-//   3 执行智能体默认路由 -> profile patch 条目 tool-subagent 的 agentOptions（活重载）
-//   4 deep-query / embedding -> ~/.dsh/manon.env 键值 upsert（bridge 注入的 source 调用式
+//   2 执行智能体默认路由 -> profile patch 条目 tool-subagent 的 agentOptions（活重载）
+//   3 deep-query / embedding -> ~/.dsh/manon.env 键值 upsert（bridge 注入的 source 调用式
 //                     让 manon-kg 子进程读到；manon-kg 侧 MANON_DEEPQUERY_* / MANON_EMBEDDING_*）
-// 主会话默认也可继续用 dsh 原生模型选择器按会话选择——本面板写的是"无会话选择时的默认"。
+// 主会话由 DSH 原生模型选择器管理，不由本插件面板覆盖。
 import z from "@deepseek-ai/schemastery";
-import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 
 export const Config = z.object({
@@ -19,9 +17,6 @@ export const Config = z.object({
   executorProvider: z.string().description("执行智能体渠道").default("verispring").volatile(),
   executorModel: z.string().description("执行智能体模型").default("deepseek-flash").volatile(),
   executorEffort: z.string().description("执行智能体思考强度（默认 High）").default("high").volatile(),
-  mainSessionProvider: z.string().description("主会话默认渠道").default("verispring").volatile(),
-  mainSessionModel: z.string().description("主会话默认模型").default("claude-opus-5-5").volatile(),
-  mainSessionEffort: z.string().description("主会话思考强度（off/low/medium/high/xhigh/max；默认 High）").default("high").volatile(),
   deepQueryProvider: z.string().description("Manon Deep Query 渠道").default("verispring").volatile(),
   deepQueryModel: z.string().description("Manon Deep Query 模型").default("deepseek-flash").volatile(),
   deepQueryEffort: z.string().description("Manon Deep Query 思考强度（默认 Off）").default("off").volatile(),
@@ -49,7 +44,11 @@ function upsertEnvKeys(path, entries) {
   });
   for (const [key, value] of Object.entries(entries)) if (!seen.has(key)) out.push(`${key}=${shellWord(value)}`);
   const next = out.join("\n");
-  if (next !== original) writeFileSync(path, next);
+  if (next !== original) {
+    const temp = `${path}.tmp-${process.pid}`;
+    writeFileSync(temp, next);
+    renameSync(temp, path);
+  }
 }
 
 function shellUnquote(raw) {
@@ -100,98 +99,79 @@ export function apply(ctx, config) {
     if (ref === EMBEDDING_CREDENTIAL_REF) void syncEmbeddingKey();
   });
   const editor = ctx.configEditor;
-  const rawConfig = editor.configuration().find(item => item.entry.options.id === "verispring-config")?.override ?? {};
-  const valueOf = (key, fallback) => {
-    if (typeof rawConfig[key] === "string") return rawConfig[key];
-    return configValue(config[key], fallback);
-  };
-  const scoutProvider = valueOf("scoutProvider", "verispring");
-  const scoutModel = valueOf("scoutModel", "deepseek-flash");
-  const scoutEffort = valueOf("scoutEffort", "high") || "high";
-  const executorProvider = valueOf("executorProvider", "verispring");
-  const executorModel = valueOf("executorModel", "deepseek-flash");
-  const executorEffort = valueOf("executorEffort", "high") || "high";
-  const mainSessionProvider = valueOf("mainSessionProvider", "verispring");
-  const mainSessionModel = valueOf("mainSessionModel", "claude-opus-5-5");
-  const mainSessionEffort = valueOf("mainSessionEffort", "high") || "high";
-  const deepQueryProvider = valueOf("deepQueryProvider", "verispring");
-  const deepQueryModel = valueOf("deepQueryModel", "deepseek-flash");
-  const deepQueryEffort = valueOf("deepQueryEffort", "off") || "off";
-  const embeddingUrl = valueOf("embeddingUrl", "https://api.siliconflow.cn/v1");
-  const embeddingModel = valueOf("embeddingModel", "BAAI/bge-m3");
-
-  // 面板从未保存（全部取默认）时不改写任何执法面：verispring.json、agent-default-model、
-  // tool-subagent agentOptions 里的用户原生配置不被默认值冲掉。面板保存非默认值后才落盘。
-  const allDefault =
-    scoutProvider === "verispring" && scoutModel === "deepseek-flash" && scoutEffort === "high" &&
-    executorProvider === "verispring" && executorModel === "deepseek-flash" && executorEffort === "high" &&
-    mainSessionProvider === "verispring" && mainSessionModel === "claude-opus-5-5" && mainSessionEffort === "high" &&
-    deepQueryProvider === "verispring" && deepQueryModel === "deepseek-flash" && deepQueryEffort === "off" &&
-    embeddingUrl === "https://api.siliconflow.cn/v1" && embeddingModel === "BAAI/bge-m3";
-
-  // 1-2 落盘：面板保存过非默认值才写 verispring.json 与 manon.env 的 MANON_* 值键；
-  // 全默认时跳过（manon-kg 对这些键有同值内建默认，fresh install 不受影响）。
-  if (allDefault) {
-    process.stderr.write("verispring-config: 面板未配置（全部默认），跳过 verispring.json / manon.env / patch 落盘\n");
+  if (!editor) {
+    ctx.logger.warn("verispring-config: configEditor 不可用，跳过 profile patch 同步");
     return;
   }
-  writeFileSync(
-    `${dshHome}/verispring.json`,
-    `${JSON.stringify({
+  const persist = () => {
+    const override = (typeof editor.configuration === "function" ? editor.configuration() : [])
+      .find(item => item.entry.options.id === "verispring-config")?.override ?? {};
+    const valueOf = (key, fallback) => configValue(config[key], configValue(override[key], fallback));
+    const scoutProvider = valueOf("scoutProvider", "verispring");
+    const scoutModel = valueOf("scoutModel", "deepseek-flash");
+    const scoutEffort = valueOf("scoutEffort", "high") || "high";
+    const executorProvider = valueOf("executorProvider", "verispring");
+    const executorModel = valueOf("executorModel", "deepseek-flash");
+    const executorEffort = valueOf("executorEffort", "high") || "high";
+    const deepQueryProvider = valueOf("deepQueryProvider", "verispring");
+    const deepQueryModel = valueOf("deepQueryModel", "deepseek-flash");
+    const deepQueryEffort = valueOf("deepQueryEffort", "off") || "off";
+    const embeddingUrl = valueOf("embeddingUrl", "https://api.siliconflow.cn/v1");
+    const embeddingModel = valueOf("embeddingModel", "BAAI/bge-m3");
+
+    const allDefault =
+      scoutProvider === "verispring" && scoutModel === "deepseek-flash" && scoutEffort === "high" &&
+      executorProvider === "verispring" && executorModel === "deepseek-flash" && executorEffort === "high" &&
+      deepQueryProvider === "verispring" && deepQueryModel === "deepseek-flash" && deepQueryEffort === "off" &&
+      embeddingUrl === "https://api.siliconflow.cn/v1" && embeddingModel === "BAAI/bge-m3";
+    if (allDefault) return;
+
+    const routeFile = `${dshHome}/verispring.json`;
+    const routeTemp = `${routeFile}.tmp-${process.pid}`;
+    writeFileSync(routeTemp, `${JSON.stringify({
       scout: { provider: scoutProvider, model: scoutModel, reasoningEffort: scoutEffort },
       executor: { provider: executorProvider, model: executorModel, reasoningEffort: executorEffort },
-    }, null, 2)}\n`,
-  );
+    }, null, 2)}\n`);
+    renameSync(routeTemp, routeFile);
 
-  // 2 deep-query / embedding -> manon.env（只动自己的 MANON_* 键，凭据行原样保留）
-  upsertEnvKeys(manonEnv, {
-    MANON_DEEPQUERY_LLM_URL: "https://api.verispring.cn/v1/chat/completions",
-    MANON_DEEPQUERY_LLM_PROVIDER: deepQueryProvider,
-    MANON_DEEPQUERY_LLM_MODEL: deepQueryModel,
-    MANON_DEEPQUERY_LLM_REASONING_EFFORT: deepQueryEffort,
-    MANON_EMBEDDING_URL: embeddingUrl,
-    MANON_EMBEDDING_MODEL: embeddingModel,
-  });
-  chmodSync(manonEnv, 0o600);
+    upsertEnvKeys(manonEnv, {
+      MANON_DEEPQUERY_LLM_URL: "https://api.verispring.cn/v1/chat/completions",
+      MANON_DEEPQUERY_LLM_PROVIDER: deepQueryProvider,
+      MANON_DEEPQUERY_LLM_MODEL: deepQueryModel,
+      MANON_DEEPQUERY_LLM_REASONING_EFFORT: deepQueryEffort,
+      MANON_EMBEDDING_URL: embeddingUrl,
+      MANON_EMBEDDING_MODEL: embeddingModel,
+    });
+    chmodSync(manonEnv, 0o600);
 
-  // 3 主会话默认（含思考强度）+ 子代理角色 preset 与默认路由 -> profile patch（活重载）
-  // 有差异才写，避免每次启动对 patch 做无意义写入。
-  const writes = [
-    ["agent-default-model", (next) => {
-      next.provider = mainSessionProvider;
-      next.model = mainSessionModel;
-      if (mainSessionEffort) next.reasoningEffort = mainSessionEffort;
-      else delete next.reasoningEffort;
-    }],
-    ["preset-standard", (next) => {
+    const entry = (typeof editor.entries === "function" ? editor.entries() : [])
+      .find((candidate) => candidate.options.id === "preset-standard");
+    if (entry) {
+      const current = { ...(entry.options.config ?? {}) };
+      const next = { ...current };
       const tool = findNestedPluginConfig(next, "tool-subagent");
-      if (!tool) return;
-      tool.agentOptions = {
-        ...(tool.agentOptions ?? {}),
-        provider: executorProvider,
-        model: executorModel,
-      };
-      if (executorEffort) tool.agentOptions.reasoningEffort = executorEffort;
-      else delete tool.agentOptions.reasoningEffort;
-    }],
-  ];
-  for (const [entryId, mutate] of writes) {
-    const entry = editor.entries().find((candidate) => candidate.options.id === entryId);
-    if (!entry) continue;
-    const current = { ...(entry.options.config ?? {}) };
-    const next = { ...current };
-    mutate(next);
-    if (JSON.stringify(next) === JSON.stringify(current)) continue;
-    editor.edit(entry, () => next).catch((error) => ctx.logger.warn(`verispring-config: 写 ${entryId} 失败: ${String(error)}`));
-  }
+      if (tool) {
+        tool.agentOptions = { ...(tool.agentOptions ?? {}), provider: executorProvider, model: executorModel };
+        if (executorEffort) tool.agentOptions.reasoningEffort = executorEffort;
+        else delete tool.agentOptions.reasoningEffort;
+        if (JSON.stringify(next) !== JSON.stringify(current)) {
+          editor.edit(entry, () => next).catch((error) => ctx.logger.warn(`verispring-config: 写 preset-standard 失败: ${String(error)}`));
+        }
+      }
+    }
 
-  process.stderr.write(
-    `verispring-config: applied (scout ${scoutProvider}/${scoutModel}` +
-    `${scoutEffort ? `@${scoutEffort}` : ""};` +
-    ` executor ${executorProvider}/${executorModel}` +
-    `${executorEffort ? `@${executorEffort}` : ""};` +
-    ` main ${mainSessionProvider}/${mainSessionModel}` +
-    `${mainSessionEffort ? `@${mainSessionEffort}` : ""};` +
-    ` deep-query ${deepQueryProvider}/${deepQueryModel}${deepQueryEffort ? `@${deepQueryEffort}` : "@off"})\n`,
-  );
+    process.stderr.write(
+      `verispring-config: applied (scout ${scoutProvider}/${scoutModel}` +
+      `${scoutEffort ? `@${scoutEffort}` : ""};` +
+      ` executor ${executorProvider}/${executorModel}` +
+      `${executorEffort ? `@${executorEffort}` : ""};` +
+      ` deep-query ${deepQueryProvider}/${deepQueryModel}${deepQueryEffort ? `@${deepQueryEffort}` : "@off"})\n`,
+    );
+  };
+
+  ctx.on("loader/volatile-update", () => {
+    try { persist(); } catch (error) { ctx.logger.warn(`verispring-config: volatile update failed: ${String(error)}`); }
+  });
+  try { persist(); } catch (error) { ctx.logger.warn(`verispring-config: 初始配置同步失败: ${String(error)}`); }
+
 }

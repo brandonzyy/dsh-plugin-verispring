@@ -28,7 +28,7 @@ const DEFAULT_ROUTES = {
 // 读取失败/缺省回落常量，门禁永不因配置文件崩。
 const CONFIG_FILE = `${homedir()}/.dsh/verispring.json`;
 
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { SLIM_DESC, slimSchema } from "./leader-scope.js";
 
@@ -49,7 +49,18 @@ function loadRoutes() {
       };
     };
     return { scout: route("scout"), executor: route("executor") };
-  } catch {}
+  } catch (error) {
+    // 配置文件是唯一事实源；损坏时恢复默认结构，避免每次启动继续运行在不可见的旧路由上。
+    try {
+      const temp = `${CONFIG_FILE}.tmp-${process.pid}`;
+      mkdirSync(homedir() + "/.dsh", { recursive: true });
+      writeFileSync(temp, `${JSON.stringify(DEFAULT_ROUTES, null, 2)}\n`);
+      renameSync(temp, CONFIG_FILE);
+      process.stderr.write(`caseos-dispatch-gate: verispring.json 已按默认路由自愈: ${String(error)}\n`);
+    } catch (repairError) {
+      process.stderr.write(`caseos-dispatch-gate: verispring.json 自愈失败: ${String(repairError)}\n`);
+    }
+  }
   return DEFAULT_ROUTES;
 }
 
@@ -87,6 +98,8 @@ function scoutStartedPersisted(session) {
 }
 
 function writeScoutStarted(session, value) {
+  const state = sessionState(session);
+  if (state) state.scoutStarted = value === true;
   const id = sessionIdOf(session);
   if (!id) return;
   try {
