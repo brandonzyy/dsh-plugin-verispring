@@ -88,6 +88,36 @@ function findNestedPluginConfig(config, id) {
   return undefined;
 }
 
+function syncToolSubagentPatch(path, route) {
+  let source;
+  try { source = readFileSync(path, "utf8"); } catch { return false; }
+  const marker = "- id: tool-subagent\n";
+  const start = source.indexOf(marker);
+  if (start < 0) return false;
+  const nextEntry = source.indexOf("\n- id:", start + marker.length);
+  const end = nextEntry < 0 ? source.length : nextEntry;
+  let block = source.slice(start, end);
+  const optionsMarker = "agentOptions:\n";
+  const optionsStart = block.indexOf(optionsMarker);
+  if (optionsStart < 0) return false;
+  const head = block.slice(0, optionsStart + optionsMarker.length);
+  let options = block.slice(optionsStart + optionsMarker.length);
+  const replace = (key, value) => {
+    const pattern = new RegExp(`(^\\s+${key}: ).*$`, "m");
+    options = options.replace(pattern, `$1${value}`);
+  };
+  replace("provider", route.provider);
+  replace("model", route.model);
+  replace("reasoningEffort", route.reasoningEffort);
+  block = head + options;
+  const next = `${source.slice(0, start)}${block}${source.slice(end)}`;
+  if (next === source) return true;
+  const temp = `${path}.tmp-${process.pid}`;
+  writeFileSync(temp, next);
+  renameSync(temp, path);
+  return true;
+}
+
 export function apply(ctx, config) {
   // 写入根 = DSH_HOME；未挂 profileContext 时才回落到用户 home 下的 .dsh。
   const dshHome = ctx.profileContext?.home ?? process.env.DSH_HOME ?? `${homedir()}/.dsh`;
@@ -126,14 +156,6 @@ export function apply(ctx, config) {
       deepQueryProvider === "verispring" && deepQueryModel === "deepseek-flash" && deepQueryEffort === "off" &&
       embeddingUrl === "https://api.siliconflow.cn/v1" && embeddingModel === "BAAI/bge-m3";
     const configRows = typeof editor.configuration === "function" ? editor.configuration() : [];
-    writeFileSync(`/tmp/verispring-config-debug-${process.pid}.json`, `${JSON.stringify(configRows.map(({ entry, inherited }) => ({
-      id: entry.options.id,
-      name: entry.options.name,
-      currentKeys: Object.keys(entry.options.config ?? {}),
-      inheritedKeys: Object.keys(inherited ?? {}),
-      currentHasTool: Boolean(findNestedPluginConfig(entry.options.config, "tool-subagent")),
-      inheritedHasTool: Boolean(findNestedPluginConfig(inherited, "tool-subagent")),
-    })), null, 2)}\n`);
     const row = configRows.find(({ entry, inherited }) =>
       entry.options.id === "tool-subagent" ||
       findNestedPluginConfig(entry.options.config, "tool-subagent") || findNestedPluginConfig(inherited, "tool-subagent"));
@@ -158,6 +180,12 @@ export function apply(ctx, config) {
         }
       }
     } else process.stderr.write("verispring-config: 未找到包含 tool-subagent 的 preset 配置\n");
+    const patchPath = ctx.profileContext?.patchPath;
+    if (patchPath) syncToolSubagentPatch(patchPath, {
+      provider: executorProvider,
+      model: executorModel,
+      reasoningEffort: executorEffort,
+    });
 
     if (allDefault) return;
 
