@@ -151,6 +151,9 @@ export function apply(ctx, config) {
         if (executorEffort) tool.agentOptions.reasoningEffort = executorEffort;
         else delete tool.agentOptions.reasoningEffort;
         if (JSON.stringify(next) !== JSON.stringify(current)) {
+          // volatile-update 在配置编辑器写入期间触发；让当前 loader 事务先完成，
+          // 再通过官方 editor.edit 写入嵌套 preset，避免重入被旧快照覆盖。
+          await new Promise((resolve) => setTimeout(resolve, 0));
           await editor.edit(entry, () => next);
         }
       }
