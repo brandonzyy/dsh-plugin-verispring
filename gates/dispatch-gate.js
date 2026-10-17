@@ -171,7 +171,7 @@ function renameChildTitleAfterAutoTitle(ctx, childId, title) {
 }
 
 const plugin = {
-  inject: ["tools", "agents", "sessionTitle", "profileContext"],
+  inject: ["tools", "agents", "sessionController", "sessionTitle", "profileContext"],
   apply(ctx) {
     const dshHome = ctx.profileContext?.home ?? process.env.DSH_HOME ?? `${homedir()}/.dsh`;
     const configFile = `${dshHome}/verispring.json`;
@@ -208,7 +208,7 @@ const plugin = {
       }
       childRoutePlans.set(agent.id, plan);
       try {
-        ctx.agents.selectForNextRequest(agent, {
+        ctx.sessionController.agents.selectForNextRequest(agent, {
           provider: plan.route.provider,
           model: plan.route.model,
           ...(plan.route.reasoningEffort ? { reasoningEffort: plan.route.reasoningEffort } : {}),
