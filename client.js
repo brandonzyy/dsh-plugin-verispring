@@ -220,25 +220,24 @@ window.__ModuleLoader__.load({
       textOverflow: "ellipsis",
     };
 
-    function routeRole(title) {
-      if (/(?:测绘智能体|\bscout\b)/i.test(title)) return "测绘智能体";
-      if (/(?:执行智能体|\bexecutor\b)/i.test(title)) return "执行智能体";
-      return "子代理";
+    function routeProviderLabel(provider) {
+      return provider === "verispring" ? "Verispring" : provider;
     }
 
-    function SubagentRouteBar({ useSession, useSessions, useProjection, resolveRole }) {
+    function routeModelLabel(model) {
+      return model === "deepseek-flash" ? "deepseek flash" : model;
+    }
+
+    function SubagentRouteBar({ useSession, useProjection }) {
       const session = useSession(value => value);
-      const sessionId = session?.sessionId;
-      const title = useSessions(value => sessionId ? value.byId[sessionId]?.displayTitle ?? "" : "");
       const projection = useProjection("modelSelection");
       if (!session?.subagent) return null;
       const selection = projection?.next ?? projection?.selection ?? projection;
-      const provider = selection?.provider || "未知渠道";
-      const model = selection?.model || "未知模型";
+      const provider = routeProviderLabel(selection?.provider || "未知渠道");
+      const model = routeModelLabel(selection?.model || "未知模型");
       const effort = selection?.reasoningEffort || "未标注";
-      const role = resolveRole?.(sessionId) || routeRole(title);
       return React.createElement("div", { style: routeBarStyle, role: "status" },
-        `角色：${role} · 渠道：${provider} · 模型：${model} · 思考强度：${effort}`,
+        `${provider} · ${model} · ${effort}`,
       );
     }
 
@@ -520,24 +519,13 @@ window.__ModuleLoader__.load({
     }
 
     const plugin = {
-      inject: ["slots", "sessions", "configForms", "remote", "remote.session", "remote.credentials", "remote.llm"],
+      inject: ["slots", "configForms", "remote", "remote.session", "remote.credentials", "remote.llm"],
       apply(ctx) {
         window.__VSP_CLIENT__.applied = true;
         ctx.slots.inject("conversation.composer.dock", () => ctx.slots.register({
           name: "conversation.composer.dock",
           id: "verispring-subagent-route",
           order: -100,
-          inject: (sessionId) => ({
-            resolveRole: () => {
-              const address = ctx.sessions.subagentAddress(sessionId);
-              const parent = address ? ctx.sessions.binding(address.parentSessionId) : undefined;
-              const entries = parent?.session.projections.faceOf("subagentCatalog").getSnapshot();
-              const index = Array.isArray(entries) ? entries.findIndex(entry => entry?.id === sessionId) : -1;
-              if (index === 0) return "测绘智能体";
-              if (index > 0) return "执行智能体";
-              return undefined;
-            },
-          }),
         }, SubagentRouteBar));
         try {
           clientRemote = ctx.remote;

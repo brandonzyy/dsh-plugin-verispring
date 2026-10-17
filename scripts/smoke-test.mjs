@@ -39,10 +39,7 @@ if (!dispatchText.includes("sessionTitle.rename(agent.session, title)")) fail("�
 if (!dispatchText.includes("ctx.sessionTitle ?? ctx.get(\"sessionTitle\")")) fail("子代理未使用官方 sessionTitle 服务");
 if (!dispatchText.includes("renameChildTitleAfterAutoTitle(ctx, child.childId, roleLabel)")) fail("子代理启动完成后未延迟写入持久标题");
 if (!clientText.includes("conversation.composer.dock")) fail("客户端未注册子代理路由展示栏");
-if (!clientText.includes("角色：")) fail("客户端路由展示栏未包含角色字段");
-if (!clientText.includes("渠道：")) fail("客户端路由展示栏未包含渠道字段");
-if (!clientText.includes("思考强度：")) fail("客户端路由展示栏未包含思考强度字段");
-if (!clientText.includes("subagentCatalog")) fail("客户端路由展示栏未读取子代理目录");
+if (!clientText.includes("`${provider} · ${model} · ${effort}`")) fail("客户端路由展示栏未使用简化格式");
 
 const sourceFiles = [
   "client.js",
