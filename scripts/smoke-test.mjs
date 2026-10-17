@@ -39,6 +39,7 @@ const dispatchText = readFileSync(join(root, "gates/dispatch-gate.js"), "utf8");
 const manonText = readFileSync(join(root, "gates/manon-bridge.js"), "utf8");
 const codestyleText = readFileSync(join(root, "gates/codestyle-gate.js"), "utf8");
 if (!dispatchText.includes("ctx.profileContext?.home") || !dispatchText.includes("process.env.DSH_HOME") || !dispatchText.includes("specPath")) fail("派遣门禁未使用 DSH profile home");
+if (!dispatchText.includes('verispring/routes-updated') || !configText.includes('verispring/routes-updated')) fail("配置保存未触发派遣路由热更新");
 if (!configText.includes("process.env.DSH_HOME")) fail("配置同步未使用 DSH_HOME 回退");
 if (!manonText.includes("ctx.profileContext?.home") || !manonText.includes("sourcePrefix")) fail("Manon 调用前缀未使用 DSH profile home");
 if (!codestyleText.includes("ctx.profileContext?.home") || !codestyleText.includes("specPath")) fail("提交门禁未使用 DSH profile home");

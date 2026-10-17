@@ -27,6 +27,7 @@ export const Config = z.object({
 export const inject = ["configEditor", "credentials"];
 
 const EMBEDDING_CREDENTIAL_REF = "MANON_EMBEDDING_API_KEY";
+const ROUTES_UPDATED_EVENT = "verispring/routes-updated";
 
 // manon.env 是用户与插件共用的文件：只增改自己名下的键；值未变的行原样保留（export 前缀、
 // 引号形式都是用户的），改值时沿用原行的 export 前缀；整文件内容未变不写。
@@ -162,6 +163,7 @@ export function apply(ctx, config) {
       MANON_EMBEDDING_MODEL: embeddingModel,
     });
     chmodSync(manonEnv, 0o600);
+    ctx.root.emit(ROUTES_UPDATED_EVENT);
 
     process.stderr.write(
       `verispring-config: applied (scout ${scoutProvider}/${scoutModel}` +

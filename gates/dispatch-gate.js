@@ -19,6 +19,7 @@ const SPEC_FRAGMENT = "specs/子代理派遣规范.md";
 const GATE_TOOLS = new Set(["subagent", "subagent_fork"]);
 const MAP_FILE = ".project-map.md";
 const SUBAGENT_PRESET = "verispring-subagent";
+const ROUTES_UPDATED_EVENT = "verispring/routes-updated";
 const RESET_FILE = `/tmp/dsh-caseos-scout-reset-${process.pid}`;
 const DEFAULT_ROUTES = {
   scout: { provider: "verispring", model: "deepseek-flash", reasoningEffort: "high" },
@@ -167,7 +168,11 @@ const plugin = {
     const denyReason =
       `派遣前必读 ${specPath}：先用 read 工具读取该规范（含任务书模板与派发前自查），然后重新发起本次调用。`;
     const stateOf = (session) => sessionState(session, stateDir);
-    const routes = loadRoutes(configFile);
+    let routes = loadRoutes(configFile);
+    ctx.root.on(ROUTES_UPDATED_EVENT, () => {
+      routes = loadRoutes(configFile);
+      process.stderr.write(`caseos-dispatch-gate: routes reloaded (${routeText(routes.scout)}; ${routeText(routes.executor)})\n`);
+    });
     process.stderr.write(
       `caseos-dispatch-gate: plugin activated (测绘: ${routeText(routes.scout)}; 执行: ${routeText(routes.executor)})\n`,
     );
@@ -197,7 +202,7 @@ const plugin = {
           async execute(args, exec) {
             const session = exec.agent?.session;
             const role = stateOf(session).scoutStarted ? "executor" : "scout";
-            const route = loadRoutes(configFile)[role];
+            const route = routes[role];
             const label = String(args.description ?? "").trim();
             const roleLabel = `${routeText(route)} · ${role} · ${label}`;
             const routedPrompt = `【实际路由：${role} · ${routeText(route)}】\n${String(args.prompt ?? "")}`;
