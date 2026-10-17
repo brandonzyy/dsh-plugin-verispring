@@ -78,7 +78,17 @@ function pathMatches(value, dshHome) {
 // 位点）；测绘常驻落在状态文件（跨进程、跨重启一致）。
 const sessionStates = new WeakMap();
 function sessionIdOf(session) {
-  return session?.header?.id ?? session?.id ?? void 0;
+  return session?.header?.id ?? session?.header?.sessionId ?? session?.id ?? session?.sessionId ?? void 0;
+}
+
+function hasChildAgent(agents, session, parentAgent) {
+  const parentId = sessionIdOf(session);
+  return agents.list().some((agent) => {
+    if (agent === parentAgent) return false;
+    const childParent = agent?.parent ?? agent?.parentAgent;
+    if (childParent === parentAgent || childParent?.id === parentAgent?.id) return true;
+    return Boolean(parentId && agent?.session?.header?.parentSession === parentId);
+  });
 }
 
 function scoutStartedPersisted(session, stateDir) {
@@ -177,6 +187,9 @@ const plugin = {
       `caseos-dispatch-gate: plugin activated (测绘: ${routeText(routes.scout)}; 执行: ${routeText(routes.executor)})\n`,
     );
     const leaderToolInstalled = new WeakSet();
+    // 桌面恢复/切换 fiber 时 session 可能被重新包装；领导 agent 身份更稳定，
+    // 作为当前进程内的第二份测绘完成事实。
+    const leaderScoutStarted = new WeakSet();
 
     // 子代理的 provider/model/角色是运行时契约，不能依赖模型是否记得在 tool call 里填写。
     // 领导会话的 subagent 工具在这里被替换成唯一的 spawn 入口：角色由会话事件推导
@@ -201,7 +214,15 @@ const plugin = {
           parameters: slimSchema(current.parameters ?? {}),
           async execute(args, exec) {
             const session = exec.agent?.session;
-            const role = stateOf(session).scoutStarted ? "executor" : "scout";
+            const state = stateOf(session);
+            // 会话恢复时状态文件可能尚未写入或路径曾发生迁移；已有直接子代理
+            // 就意味着测绘阶段已经完成，不能再次使用测绘路由。
+            const recovered = state.scoutStarted || leaderScoutStarted.has(exec.agent)
+              || hasChildAgent(ctx.agents, session, exec.agent);
+            if (!state.scoutStarted && recovered) {
+              writeScoutStarted(session, true, stateDir);
+            }
+            const role = recovered ? "executor" : "scout";
             // 配置保存与派遣之间可能跨越不同的宿主 fiber；每次派遣直接读取文件，
             // 确保保存后的路由无需依赖事件总线或重启即可生效。
             routes = loadRoutes(configFile);
@@ -253,7 +274,10 @@ const plugin = {
               throw error;
             }
             // 常驻标记只在 spawn 成功后落位：spawn 失败不能把本会话污染成 executor。
-            if (role === "scout") writeScoutStarted(session, true, stateDir);
+            if (role === "scout") {
+              leaderScoutStarted.add(exec.agent);
+              writeScoutStarted(session, true, stateDir);
+            }
             return result;
           },
         };
@@ -328,6 +352,7 @@ const plugin = {
       if (isScoutDescription(desc)) {
         if (existsSync(RESET_FILE)) {
           try { unlinkSync(RESET_FILE); } catch {}
+          leaderScoutStarted.delete(exec.agent);
           writeScoutStarted(session, false, stateDir);
           sessionStates.delete(session);
           process.stderr.write("caseos-dispatch-gate: 测绘智能体常驻标记已重置（reset 文件）\n");
