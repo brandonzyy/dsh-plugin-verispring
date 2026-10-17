@@ -28,6 +28,7 @@ if (!packageData.peerDependencies?.["@deepseek-ai/cordis"]) fail("缺少 Cordis 
 if (!patchText.includes("agentPreset: verispring-subagent")) fail("tool-subagent 缺少 agentPreset");
 if (/^\s+persona:\s/m.test(patchText)) fail("cordis.patch.yml 仍包含已废弃的 persona 配置");
 if (/^\s+toolFilter:\s/m.test(patchText)) fail("cordis.patch.yml 仍包含已废弃的 toolFilter 配置");
+if (patchText.includes("{{cwd}}")) fail("cordis.patch.yml 仍引用 DSH 0.2.1-rc.1 不再注册的 cwd 变量");
 if (!configText.includes("delete tool.persona") || !configText.includes("delete tool.toolFilter")) fail("profile patch 迁移未清理旧字段");
 
 const sourceFiles = [
