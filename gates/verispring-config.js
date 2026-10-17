@@ -127,13 +127,14 @@ export function apply(ctx, config) {
       embeddingUrl === "https://api.siliconflow.cn/v1" && embeddingModel === "BAAI/bge-m3";
     const configRows = typeof editor.configuration === "function" ? editor.configuration() : [];
     const row = configRows.find(({ entry, inherited }) =>
+      entry.options.id === "tool-subagent" ||
       findNestedPluginConfig(entry.options.config, "tool-subagent") || findNestedPluginConfig(inherited, "tool-subagent"));
     const entry = row?.entry;
     if (entry) {
       const current = JSON.parse(JSON.stringify(entry.options.config ?? {}));
       const inherited = JSON.parse(JSON.stringify(row.inherited ?? {}));
-      const next = findNestedPluginConfig(current, "tool-subagent") ? current : inherited;
-      const tool = findNestedPluginConfig(next, "tool-subagent");
+      const next = entry.options.id === "tool-subagent" || findNestedPluginConfig(current, "tool-subagent") ? current : inherited;
+      const tool = entry.options.id === "tool-subagent" ? next : findNestedPluginConfig(next, "tool-subagent");
       if (tool) {
         delete tool.persona;
         delete tool.toolFilter;
