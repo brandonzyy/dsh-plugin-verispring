@@ -291,7 +291,7 @@ const plugin = {
         let registered = globalLeaderToolInstalled;
         if (!registered) {
           try {
-            ctx.tools.register(wrapped);
+            ctx.root.tools.register(wrapped);
             globalLeaderToolInstalled = true;
             registered = true;
             process.stderr.write("caseos-dispatch-gate: 全局 subagent 入口已绑定强制路由\n");
