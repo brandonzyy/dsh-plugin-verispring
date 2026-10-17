@@ -139,21 +139,21 @@ function sessionState(session, stateDir) {
   return st;
 }
 
-const pendingRouteLabels = new Map();
+const pendingRoutePlans = new Map();
 
-function queueRouteLabel(parent, label) {
+function queueRoutePlan(parent, plan) {
   if (!parent) return;
-  const queue = pendingRouteLabels.get(parent) ?? [];
-  queue.push(label);
-  pendingRouteLabels.set(parent, queue);
+  const queue = pendingRoutePlans.get(parent) ?? [];
+  queue.push(plan);
+  pendingRoutePlans.set(parent, queue);
 }
 
-function takeRouteLabel(parent) {
+function takeRoutePlan(parent) {
   if (!parent) return undefined;
-  const queue = pendingRouteLabels.get(parent);
-  const label = queue?.shift();
-  if (!queue?.length) pendingRouteLabels.delete(parent);
-  return label;
+  const queue = pendingRoutePlans.get(parent);
+  const plan = queue?.shift();
+  if (!queue?.length) pendingRoutePlans.delete(parent);
+  return plan;
 }
 
 function renameChildTitle(ctx, childId, title) {
@@ -224,7 +224,7 @@ const plugin = {
         maxDepth: 1,
       };
       const parentId = sessionIdOf(session);
-      queueRouteLabel(parentId, roleLabel);
+      queueRoutePlan(parentId, { label: roleLabel, route, role });
       let result;
       try {
         if (args.run_in_background === false) {
@@ -242,7 +242,7 @@ const plugin = {
           result = { kind: "continuable", subagentId: child.childId };
         }
       } catch (error) {
-        takeRouteLabel(parentId);
+        takeRoutePlan(parentId);
         throw error;
       }
       if (role === "scout") {
@@ -380,9 +380,23 @@ const plugin = {
     ctx.root.on("agent/created", async ({ agent }) => {
       debug(`created agent=${agent?.id} subagent=${agent?.session?.header?.origin === "subagent"}`);
       if (agent?.session?.header?.origin === "subagent") {
+        const plan = takeRoutePlan(agent.session.header.parentSession);
+        if (plan) {
+          try {
+            ctx.agents.selectForNextRequest(agent, {
+              provider: plan.route.provider,
+              model: plan.route.model,
+              ...(plan.route.reasoningEffort ? { reasoningEffort: plan.route.reasoningEffort } : {}),
+            });
+            debug(`selection agent=${agent.id} role=${plan.role} route=${routeText(plan.route)}`);
+          } catch (error) {
+            debug(`selection-fail agent=${agent.id} ${String(error)}`);
+            process.stderr.write(`caseos-dispatch-gate: 子代理模型选择写入失败: ${String(error)}\n`);
+          }
+        }
         await composeSubagentPreset(agent);
         await hideBaseSubagentTool(agent);
-        const title = takeRouteLabel(agent.session.header.parentSession);
+        const title = plan?.label;
         const sessionTitle = ctx.sessionTitle ?? ctx.get("sessionTitle");
         if (title && sessionTitle) {
           try { sessionTitle.rename(agent.session, title); }
