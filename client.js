@@ -170,8 +170,7 @@ window.__ModuleLoader__.load({
     }
 
     function modelLabel(model) {
-      if (model.id === "deepseek-flash") return "DeepSeek Flash";
-      return String(model.name || model.id || "").replace(/^verispring[\/:]/i, "");
+      return String(model.id || model.name || "").replace(/^verispring[\/:]/i, "");
     }
 
     function modelChoices(groups, provider, current) {
@@ -498,8 +497,8 @@ window.__ModuleLoader__.load({
           section("语言模型与 Embedding", "选择渠道后，模型与思考强度只显示该渠道目录"),
           React.createElement("div", { style: modelGridStyle },
             modelCard("测绘智能体", "建议：高精度模型，High", "scoutProvider", "scoutModel", "scoutEffort"),
-            modelCard("执行智能体", "建议：DeepSeek Flash，High", "executorProvider", "executorModel", "executorEffort"),
-            modelCard("Manon Deep Query", "建议：DeepSeek Flash，Off，查询响应快", "deepQueryProvider", "deepQueryModel", "deepQueryEffort"),
+            modelCard("执行智能体", "建议：deepseek-flash，High", "executorProvider", "executorModel", "executorEffort"),
+            modelCard("Manon Deep Query", "建议：deepseek-flash，Off，查询响应快", "deepQueryProvider", "deepQueryModel", "deepQueryEffort"),
             embeddingCard,
           ),
         ),
