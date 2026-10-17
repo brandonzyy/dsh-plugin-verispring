@@ -349,7 +349,7 @@ const plugin = {
     };
 
     for (const agent of ctx.agents.list()) void installLeaderTool(agent);
-    ctx.on("agent/created", async ({ agent }) => {
+    ctx.root.on("agent/created", async ({ agent }) => {
       if (agent?.session?.header?.origin === "subagent") {
         await composeSubagentPreset(agent);
         await hideBaseSubagentTool(agent);
@@ -364,7 +364,7 @@ const plugin = {
 
     // 新建主会话的首个回合可能在 agent/created 返回后立刻开始；在正式生成
     // 回合前再绑定一次，确保模型拿到的是本插件的强制路由入口，而不是原始工具。
-    ctx.on("agent/pre-step", async ({ agent }, next) => {
+    ctx.root.on("agent/pre-step", async ({ agent }, next) => {
       await installLeaderTool(agent);
       return next();
     });
