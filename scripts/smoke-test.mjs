@@ -6,6 +6,7 @@ import { spawnSync } from "node:child_process";
 const root = resolve(new URL("..", import.meta.url).pathname);
 const packageData = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
 const expectedEngine = ">=0.2.0-rc.2 <0.2.2-0";
+const patchText = readFileSync(join(root, "cordis.patch.yml"), "utf8");
 
 function fail(message) {
   console.error(`smoke-test: FAIL: ${message}`);
@@ -23,6 +24,9 @@ function run(command, args) {
 
 if (packageData.engines?.dsh !== expectedEngine) fail(`engines.dsh 必须是 ${expectedEngine}`);
 if (!packageData.peerDependencies?.["@deepseek-ai/cordis"]) fail("缺少 Cordis peerDependency");
+if (!patchText.includes("agentPreset: verispring-subagent")) fail("tool-subagent 缺少 agentPreset");
+if (/^\s+persona:\s/m.test(patchText)) fail("cordis.patch.yml 仍包含已废弃的 persona 配置");
+if (/^\s+toolFilter:\s/m.test(patchText)) fail("cordis.patch.yml 仍包含已废弃的 toolFilter 配置");
 
 const sourceFiles = [
   "client.js",

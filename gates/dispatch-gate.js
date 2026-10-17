@@ -11,8 +11,8 @@
 //   （fail-open）。没有地图先派测绘（建图 + 入口表），由领导 write 落盘后重派。
 // 4 模型路由：测绘与执行分别读取面板配置（verispring.json），运行时按角色强制注入，
 //   调用里显式写的 provider/model 一律忽略。fork 拒绝（三智能体架构唯一入口是 spawn）。
-// 5 子代理 preset：spawn 请求没有 preset 字段，harness 让子代理继承父会话 preset；本门在
-//   agent/created（串行等待，早于子代理首个 prompt）把子代理切到 verispring-subagent。
+// 5 子代理 preset：spawn 通过 agentPreset 显式选择 verispring-subagent；创建事件只负责
+//   记录组合结果，不再发送 0.2.1-rc.1 已移除的 persona/toolFilter 请求字段。
 // 规范目录按主目录解析（~/.dsh/specs/），搬家无需改码。
 const MARKER = "# 子代理派遣规范";
 const SPEC_FRAGMENT = "specs/子代理派遣规范.md";
@@ -134,15 +134,6 @@ function sessionState(session) {
   return st;
 }
 
-const EXECUTOR_PERSONA =
-  "你是执行智能体：承接全部执行类工作——读码、检索、改码、跑测试与门禁、查代码图谱、web 查证。" +
-  "你拥有全部工具与规范权限；动作涉及派遣/提交/工程规范时，先读 ~/.dsh/specs/ 下同名规范再动手。" +
-  "全部工作完成后一次性验证并汇报：结论、改动文件路径、测试读数，不报过程，不追加确认轮。";
-
-const SCOUT_PERSONA =
-  "你是只读测绘智能体：只读扫描项目并回报入口表（≤20 行），由领导落盘为 .project-map.md；" +
-  "禁止编辑业务代码。";
-
 const plugin = {
   inject: ["tools", "agents"],
   apply(ctx) {
@@ -186,15 +177,12 @@ const plugin = {
               label: roleLabel,
               prompt: [{ type: "text", text: String(args.prompt ?? "") }],
               parent: exec.agent,
+              agentPreset: SUBAGENT_PRESET,
               agentOptions: {
                 provider: route.provider,
                 model: route.model,
                 reasoningEffort: route.reasoningEffort,
               },
-              persona: role === "scout" ? SCOUT_PERSONA : EXECUTOR_PERSONA,
-              // 测绘只读由 harness 在子代理 setup 内 restrict：前台 one-shot 的 descriptor 晚于
-              // agent/created 才写入，事后按标签识别测绘不可靠。
-              ...(role === "scout" ? { toolFilter: { deny: ["edit", "write"] } } : {}),
               maxDepth: 1,
             };
             let result;

@@ -2,8 +2,8 @@
 # 主会话与子代理分别覆盖各自 preset 的 compaction-basic：主会话 400k→40k，子代理 600k→60k
 # （上下文窗口 1M 的 40% / 60% 触发；maxTokens 是摘要输出上限）。
 # 两条策略都复用 DSH 的 token meter、工具结果剪枝、结构化摘要与溢出恢复。
-# 子代理挂 verispring-subagent preset：harness 的 spawn 请求不带 preset 字段、子代理默认继承
-# 父会话 preset，由 dispatch-gate 在子代理创建窗口（首个 prompt 之前）切换并记入会话日志。
+# 子代理挂 verispring-subagent preset：DSH 0.2.1-rc.1 要求 spawn 通过 agentPreset 选择独立
+# Agent Preset；dispatch-gate 与 tool-subagent 均显式指定该 preset。
 # 本组合包一个 patch 文件做两件事：
 #   1) 子代理工具默认路由使用执行智能体配置（continuable 后台、maxDepth 1 不派孙代理）；
 #   2) insert 三个代码级门禁插件（gates/ 目录）。
@@ -184,11 +184,7 @@
               modelSelectionSettings: false
               backgroundMode: continuable
               maxDepth: 1
-              persona: >-
-                你是执行智能体：承接全部执行类工作——读码、检索、改码、跑测试与门禁、查代码图谱、
-                web 查证。你拥有全部工具与规范权限；动作涉及派遣/提交/工程规范时，先读
-                ~/.dsh/specs/ 下同名规范再动手。全部工作完成后一次性验证并汇报：
-                结论、改动文件路径、测试读数，不报过程，不追加确认轮。
+              agentPreset: verispring-subagent
               agentOptions:
                 provider: verispring
                 model: deepseek-flash
