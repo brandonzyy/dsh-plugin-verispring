@@ -124,6 +124,25 @@ export function apply(ctx, config) {
       executorProvider === "verispring" && executorModel === "deepseek-flash" && executorEffort === "high" &&
       deepQueryProvider === "verispring" && deepQueryModel === "deepseek-flash" && deepQueryEffort === "off" &&
       embeddingUrl === "https://api.siliconflow.cn/v1" && embeddingModel === "BAAI/bge-m3";
+    const entry = (typeof editor.entries === "function" ? editor.entries() : [])
+      .find((candidate) => candidate.options.id === "preset-standard");
+    if (entry) {
+      const current = JSON.parse(JSON.stringify(entry.options.config ?? {}));
+      const next = JSON.parse(JSON.stringify(current));
+      const tool = findNestedPluginConfig(next, "tool-subagent");
+      if (tool) {
+        delete tool.persona;
+        delete tool.toolFilter;
+        tool.agentPreset = "verispring-subagent";
+        tool.agentOptions = { ...(tool.agentOptions ?? {}), provider: executorProvider, model: executorModel };
+        if (executorEffort) tool.agentOptions.reasoningEffort = executorEffort;
+        else delete tool.agentOptions.reasoningEffort;
+        if (JSON.stringify(next) !== JSON.stringify(current)) {
+          editor.edit(entry, () => next).catch((error) => ctx.logger.warn(`verispring-config: 写 preset-standard 失败: ${String(error)}`));
+        }
+      }
+    }
+
     if (allDefault) return;
 
     const routeFile = `${dshHome}/verispring.json`;
@@ -143,22 +162,6 @@ export function apply(ctx, config) {
       MANON_EMBEDDING_MODEL: embeddingModel,
     });
     chmodSync(manonEnv, 0o600);
-
-    const entry = (typeof editor.entries === "function" ? editor.entries() : [])
-      .find((candidate) => candidate.options.id === "preset-standard");
-    if (entry) {
-      const current = { ...(entry.options.config ?? {}) };
-      const next = { ...current };
-      const tool = findNestedPluginConfig(next, "tool-subagent");
-      if (tool) {
-        tool.agentOptions = { ...(tool.agentOptions ?? {}), provider: executorProvider, model: executorModel };
-        if (executorEffort) tool.agentOptions.reasoningEffort = executorEffort;
-        else delete tool.agentOptions.reasoningEffort;
-        if (JSON.stringify(next) !== JSON.stringify(current)) {
-          editor.edit(entry, () => next).catch((error) => ctx.logger.warn(`verispring-config: 写 preset-standard 失败: ${String(error)}`));
-        }
-      }
-    }
 
     process.stderr.write(
       `verispring-config: applied (scout ${scoutProvider}/${scoutModel}` +
