@@ -190,14 +190,17 @@ const plugin = {
     // 桌面恢复/切换 fiber 时 session 可能被重新包装；领导 agent 身份更稳定，
     // 作为当前进程内的第二份测绘完成事实。
     const leaderScoutStarted = new WeakSet();
+    const leaderToolInstalling = new WeakSet();
 
     // 子代理的 provider/model/角色是运行时契约，不能依赖模型是否记得在 tool call 里填写。
     // 领导会话的 subagent 工具在这里被替换成唯一的 spawn 入口：角色由会话事件推导
     // （首笔=测绘，其后=执行），路由按角色取面板配置。
-    const installLeaderTool = (agent) => {
+    const installLeaderTool = async (agent) => {
       if (!agent || agent.session?.header?.origin === "subagent") return;
-      if (leaderToolInstalled.has(agent)) return;
-      agent.ctx.inject(["tools", "subagents"], (rtc) => {
+      if (leaderToolInstalled.has(agent) || leaderToolInstalling.has(agent)) return;
+      leaderToolInstalling.add(agent);
+      try {
+        await agent.ctx.inject(["tools", "subagents"], (rtc) => {
         // 按领导自己的视图取：桌面把模型可见工具全放在 preset 层，全局视图里没有 subagent。
         const current = rtc.tools.get("subagent", agent);
         if (!current) return;
@@ -288,7 +291,12 @@ const plugin = {
         } catch (error) {
           process.stderr.write(`caseos-dispatch-gate: 领导 subagent 注册失败（同名工具已被其他插件占用）: ${String(error)}\n`);
         }
-      });
+        });
+      } catch (error) {
+        process.stderr.write(`caseos-dispatch-gate: 领导 subagent 入口注入失败: ${String(error)}\n`);
+      } finally {
+        leaderToolInstalling.delete(agent);
+      }
     };
 
     // 新建子代理会话仍空白，走 select（写 agent-preset/selected，冷读按日志重建组合）；
@@ -307,7 +315,7 @@ const plugin = {
       }
     };
 
-    for (const agent of ctx.agents.list()) installLeaderTool(agent);
+    for (const agent of ctx.agents.list()) void installLeaderTool(agent);
     ctx.on("agent/created", async ({ agent }) => {
       if (agent?.session?.header?.origin === "subagent") {
         await composeSubagentPreset(agent);
@@ -317,12 +325,15 @@ const plugin = {
           try { sessionTitle.rename(agent.session, title); }
           catch (error) { process.stderr.write(`caseos-dispatch-gate: 子代理标题写入失败: ${String(error)}\n`); }
         }
-      } else installLeaderTool(agent);
+      } else await installLeaderTool(agent);
     });
 
     // 新建主会话的首个回合可能在 agent/created 返回后立刻开始；在正式生成
     // 回合前再绑定一次，确保模型拿到的是本插件的强制路由入口，而不是原始工具。
-    ctx.on("agent/pre-step", ({ agent }) => installLeaderTool(agent));
+    ctx.on("agent/pre-step", async ({ agent }, next) => {
+      await installLeaderTool(agent);
+      return next();
+    });
 
     // 规范已读的路径判定补充：read/bash 结果内容不含首行标记（如被截断）但调用路径
     // 指向规范文件时，同样计入。内容判定由 sessionState 的增量扫描覆盖。
