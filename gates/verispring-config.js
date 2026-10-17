@@ -33,27 +33,41 @@ export const inject = ["configEditor", "credentials"];
 
 const EMBEDDING_CREDENTIAL_REF = "MANON_EMBEDDING_API_KEY";
 
+// manon.env 是用户与插件共用的文件：只增改自己名下的键；值未变的行原样保留（export 前缀、
+// 引号形式都是用户的），改值时沿用原行的 export 前缀；整文件内容未变不写。
 function upsertEnvKeys(path, entries) {
-  let lines = [];
-  try { lines = readFileSync(path, "utf8").split("\n"); } catch { lines = ["# manon 凭据与覆盖（dsh-plugin-verispring 面板维护 MANON_* 键）"]; }
+  let original;
+  try { original = readFileSync(path, "utf8"); } catch {}
+  const lines = original === void 0 ? ["# manon 凭据与覆盖（dsh-plugin-verispring 面板维护 MANON_* 键）"] : original.split("\n");
   const seen = new Set();
   const out = lines.map((line) => {
-    const m = /^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=/.exec(line);
-    if (!m || !(m[1] in entries)) return line;
-    seen.add(m[1]);
-    return `${m[1]}=${entries[m[1]]}`;
+    const m = /^(export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$/.exec(line);
+    if (!m || !(m[2] in entries)) return line;
+    seen.add(m[2]);
+    if (shellUnquote(m[3]) === entries[m[2]]) return line;
+    return `${m[1] ?? ""}${m[2]}=${shellWord(entries[m[2]])}`;
   });
-  for (const [key, value] of Object.entries(entries)) if (!seen.has(key)) out.push(`${key}=${value}`);
-  writeFileSync(path, out.join("\n"));
+  for (const [key, value] of Object.entries(entries)) if (!seen.has(key)) out.push(`${key}=${shellWord(value)}`);
+  const next = out.join("\n");
+  if (next !== original) writeFileSync(path, next);
 }
 
-function shellLiteral(value) {
-  return `'${String(value).replaceAll("'", "'\"'\"'")}'`;
+function shellUnquote(raw) {
+  const text = raw.trim();
+  const m = /^'([^']*)'$|^"([^"\\$`]*)"$/.exec(text);
+  return m ? (m[1] ?? m[2]) : text;
+}
+
+function shellWord(value) {
+  const text = String(value);
+  return /^[A-Za-z0-9_./:@%+,=-]*$/.test(text) ? text : `'${text.replaceAll("'", "'\"'\"'")}'`;
 }
 
 async function syncEmbeddingCredential(credentials, path) {
   const resolved = await credentials.resolve(EMBEDDING_CREDENTIAL_REF);
-  upsertEnvKeys(path, { MANON_EMBEDDING_API_KEY: shellLiteral(resolved?.value ?? "") });
+  // 凭据为空不落盘：保留 manon.env 里已有的 key 行，避免空串覆盖。
+  if (!resolved?.value) return;
+  upsertEnvKeys(path, { MANON_EMBEDDING_API_KEY: resolved.value });
   chmodSync(path, 0o600);
 }
 
@@ -106,7 +120,21 @@ export function apply(ctx, config) {
   const embeddingUrl = valueOf("embeddingUrl", "https://api.siliconflow.cn/v1");
   const embeddingModel = valueOf("embeddingModel", "BAAI/bge-m3");
 
-  // 1 测绘/执行路由 -> verispring.json
+  // 面板从未保存（全部取默认）时不改写任何执法面：verispring.json、agent-default-model、
+  // tool-subagent agentOptions 里的用户原生配置不被默认值冲掉。面板保存非默认值后才落盘。
+  const allDefault =
+    scoutProvider === "verispring" && scoutModel === "deepseek-flash" && scoutEffort === "high" &&
+    executorProvider === "verispring" && executorModel === "deepseek-flash" && executorEffort === "high" &&
+    mainSessionProvider === "verispring" && mainSessionModel === "claude-opus-5-5" && mainSessionEffort === "high" &&
+    deepQueryProvider === "verispring" && deepQueryModel === "deepseek-flash" && deepQueryEffort === "off" &&
+    embeddingUrl === "https://api.siliconflow.cn/v1" && embeddingModel === "BAAI/bge-m3";
+
+  // 1-2 落盘：面板保存过非默认值才写 verispring.json 与 manon.env 的 MANON_* 值键；
+  // 全默认时跳过（manon-kg 对这些键有同值内建默认，fresh install 不受影响）。
+  if (allDefault) {
+    process.stderr.write("verispring-config: 面板未配置（全部默认），跳过 verispring.json / manon.env / patch 落盘\n");
+    return;
+  }
   writeFileSync(
     `${dshHome}/verispring.json`,
     `${JSON.stringify({
@@ -138,7 +166,6 @@ export function apply(ctx, config) {
     ["preset-standard", (next) => {
       const tool = findNestedPluginConfig(next, "tool-subagent");
       if (!tool) return;
-      tool.agentPreset = "verispring-subagent";
       tool.agentOptions = {
         ...(tool.agentOptions ?? {}),
         provider: executorProvider,

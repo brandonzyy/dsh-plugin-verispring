@@ -7,16 +7,39 @@ Verispring three-role session architecture plus a bundled local knowledge graph 
 
 | # | Gate | Behavior |
 |---|---|---|
-| 1 | Dispatch spec gate | `subagent` / `subagent_fork` requires a prior read of `~/.dsh/specs/子代理派遣规范.md` (result text marker or argument path match; per-session state) |
-| 2 | Resident scout | One `scout`-prefixed dispatch per session; repeats are denied with a `send_message` reuse pointer; escape hatch `touch /tmp/dsh-caseos-scout-reset-<pid>` (path is in the denial) |
-| 3 | Map first | Non-scout dispatch requires `<cwd>/.project-map.md` (project root = `.git`/`.manon` present; otherwise fail-open) |
-| 4 | Pinned model | Explicit `provider`/`model` on `subagent` must be `verispring`/`deepseek-flash`; omitting fields falls back to the pinned default route |
+| 1 | Dispatch spec gate | `subagent` / `subagent_fork` requires the dispatch spec content to have appeared in the session (a read result containing the spec's first-line marker; state is persisted in the session log and survives restarts) |
+| 2 | Resident scout | The first dispatch of a session is pinned to the scout role at runtime (`description` is a display label only); once resident, repeats are denied with a `send_message` reuse pointer; escape hatch `touch /tmp/dsh-caseos-scout-reset-<pid>` (path is in the denial), and the reset is persisted too |
+| 3 | Map first | Non-scout dispatch requires `<session workspace>/.project-map.md` (project root = `.git`/`.manon` present; otherwise fail-open) |
+| 4 | Pinned model | Routes are enforced at runtime per role: the first dispatch uses the panel's scout route, later ones the executor route; explicit `provider`/`model` on the call is ignored. `subagent_fork` is always denied |
 | 5 | Commit gate | `git commit` requires a prior read of `~/.dsh/specs/代码写作规范.md` |
-| 6 | Leader scope | Leader tool face shrinks to 10 slim tools; executors get the full face back; scouts are hard-denied `edit`/`write`. Kill switch `CASEOS_SCOUT=0` |
+| 6 | Leader scope | The leader's tool face shrinks to the review five (`bash`/`edit`/`write`/`read`/`read_image`) plus the dispatch face (`subagent`/`send_message`/`interrupt_agent`/`list_agents`), intersected with the tools that actually exist in the leader's view (desktop serves them from the preset layer, headless from the root layer); dispatch tools are shadowed by slim definitions. Scout and executor subagents get the full face of the `verispring-subagent` preset, and scouts are hard-denied `edit`/`write` through the dispatch request. Kill switch `CASEOS_SCOUT=0` drops the scout part of the division clause |
 | 7 | manon bridge | Resolves the local graph CLI (`MANON_KG_BIN` > bundled `manon/manon-kg` > legacy `~/manon/manon-kg`) and, when present, injects a concise usage section: command surface, store location, scout ownership, semantics in `~/.dsh/specs/Manon调用规则.md`. **The load-bearing part is the invocation rule**: dsh's subprocess service strips KEY/TOKEN-shaped env vars from children (anti-leak), so a bare `manon-kg sync` always fails with a missing key — the injected form sources `~/.dsh/manon.env` inside the bash command first (the scrub only strips the first hop; grandchildren inherit freely). Secret values never pass through or get printed |
 
 The bundle patch also configures the subagent tool: `backgroundMode: continuable`, `maxDepth: 1`,
-executor persona, and default route `verispring`/`deepseek-flash`.
+and the executor persona; both presets turn `modelSelectionSettings` off on `tool-subagent`
+(routes are enforced per role, so model selection has no effect, and when it is on the `subagent`
+tool registers into each session's own layer where the routing wrapper cannot shadow it). In
+headless/CLI runs the process exits with the turn and background subagents are terminated with
+it — pass `run_in_background: false` to `subagent` to wait in the foreground for the delivery.
+
+## Context compaction (per role)
+
+| Role | Mounted on | Trigger → summary cap |
+|---|---|---|
+| Main session (leader) | compaction group of the `standard` preset | ~40k → 4k tokens |
+| Scout/executor subagents | compaction group of the `verispring-subagent` preset | ~60k → 6k tokens |
+
+Both policies prune oversized tool results first (a result over 8192 characters keeps its first
+4096 and last 1024), then condense the safely balanced history with DSH's structured template; no
+verbatim tail is kept, and context overflow retries automatically.
+
+Subagents on `verispring-subagent`: the harness spawn request has no preset field and a child
+inherits its parent's preset by default; dispatch-gate switches the child inside its creation
+window (`agent/created`, before the first prompt) and records an `agent-preset/selected` event,
+so a cold resume recomposes from the session log. The headless one-shot runner
+(`dsh --profile … "<task>"`) composes no preset for the main session, so the main session does
+not get the `standard` 40k policy — only a root-level `compaction-basic` if the profile enables
+one; subagents are unaffected.
 
 ## Install
 
@@ -43,20 +66,25 @@ prebuilt wheels). Bridge resolution order: explicit `MANON_KG_BIN` > **bundled c
 (version-matched to this package) > legacy `~/manon/manon-kg`.
 
 On first run the component bootstraps a Python venv and installs its dependencies (one-time
-network, python3 ≥3.11 required), then works offline. tree-sitter language packs load
+network, python3 ≥3.11 required), then works offline. The venv lives under
+`${DSH_HOME:-~/.dsh}/manon-kg-runtime` (the installed package directory is read-only; the
+runtime never writes into the package). tree-sitter language packs load
 dynamically; a missing pack only downgrades that language. Keys come from
 `~/.dsh/manon.env` + `~/.dsh/verispring.env`, sourced inside the bash command by the
 injected invocation.
 
 ## Prerequisites (the gates tell you what is missing)
 
+- **Profile composition**: the agent preset registry and a `preset-standard` entry (shipped by the
+  desktop app and the web bundle). A bare `dsh-headless` profile has neither, and the plugin patch
+  fails to load with `entry "preset-standard" not found`.
 - **Spec files**: `~/.dsh/specs/子代理派遣规范.md` and `~/.dsh/specs/代码写作规范.md`
   (resolved against the home directory). Missing specs mean the corresponding gate keeps
   denying with directions — by design: every denial must be satisfiable.
 - **Model route**: the profile needs a `verispring` provider with a `deepseek-flash`
   model (via `llm-pi-ai` or an equivalent adapter). For another gateway, update
-  `agentOptions` in `cordis.patch.yml` and `PIN_PROVIDER`/`PIN_MODEL` in
-  `gates/dispatch-gate.js`, keeping the two in sync.
+  `agentOptions` in `cordis.patch.yml` and `DEFAULT_ROUTES` in
+  `gates/dispatch-gate.js`, keeping the two in sync (a saved panel wins via `~/.dsh/verispring.json`).
 - **manon (optional)**: bundled — no local install needed. Keys live in `~/.dsh/manon.env`
   (`MANON_EMBEDDING_API_KEY`, sync embeddings) and `~/.dsh/verispring.env`
   (`VERISPRING_API_KEY`, deep-query fallback); the injected invocation sources both files
@@ -65,11 +93,12 @@ injected invocation.
 
 ## Configuration panel (v1.3+)
 
-With Verispring `claude-opus-5-5` as the default main-session route, history is automatically compacted at about 40k tokens into a summary capped at 4k tokens. The surveying and execution agents use `deepseek-flash` and compact at about 60k tokens into a summary capped at 6k tokens. Both routes prune oversized tool results first, condense the safely balanced history with DSH's structured template, keep no extra verbatim tail, and retry after context overflow. Each summary target is 10% of the trigger context.
-
 After install, the bundle detail page displays the configuration directly. The panel uses
 the DSH shared form controls and reads the live model catalog, so provider and model choices
-stay aligned with the Models configuration. The four model slots are editable and apply on save:
+stay aligned with the Models configuration. The four model slots are editable and apply on save.
+While the panel has never been saved (everything at defaults), the plugin rewrites no
+enforcement surface — `verispring.json`, `agent-default-model` and `manon.env` keep your
+native values:
 
 | Panel field | Persisted to | Takes effect |
 |---|---|---|
