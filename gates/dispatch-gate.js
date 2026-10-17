@@ -152,16 +152,17 @@ function takeRouteLabel(parent) {
 }
 
 function renameChildTitle(ctx, childId, title) {
-  const sessionTitle = ctx.get("sessionTitle");
-  const child = ctx.get("agents")?.get(childId);
+  const sessionTitle = ctx.sessionTitle ?? ctx.get("sessionTitle");
+  const child = ctx.agents?.get(childId) ?? ctx.get("agents")?.get(childId);
   if (!sessionTitle || !child?.session) return;
   try { sessionTitle.rename(child.session, title); }
   catch (error) { process.stderr.write(`caseos-dispatch-gate: 子代理标题写入失败: ${String(error)}\n`); }
 }
 
 function renameChildTitleAfterAutoTitle(ctx, childId, title) {
-  renameChildTitle(ctx, childId, title);
-  setTimeout(() => renameChildTitle(ctx, childId, title), 1500);
+  for (const delay of [0, 1500, 5000, 10000]) {
+    setTimeout(() => renameChildTitle(ctx, childId, title), delay);
+  }
 }
 
 const plugin = {
@@ -280,7 +281,7 @@ const plugin = {
       if (agent?.session?.header?.origin === "subagent") {
         await composeSubagentPreset(agent);
         const title = takeRouteLabel(agent.session.header.parentSession);
-        const sessionTitle = ctx.get("sessionTitle");
+        const sessionTitle = ctx.sessionTitle ?? ctx.get("sessionTitle");
         if (title && sessionTitle) {
           try { sessionTitle.rename(agent.session, title); }
           catch (error) { process.stderr.write(`caseos-dispatch-gate: 子代理标题写入失败: ${String(error)}\n`); }
