@@ -104,7 +104,7 @@ export function apply(ctx, config) {
     ctx.logger.warn("verispring-config: configEditor 不可用，跳过 profile patch 同步");
     return;
   }
-  const persist = () => {
+  const persist = async () => {
     const override = (typeof editor.configuration === "function" ? editor.configuration() : [])
       .find(item => item.entry.options.id === "verispring-config")?.override ?? {};
     const valueOf = (key, fallback) => configValue(config[key], configValue(override[key], fallback));
@@ -142,7 +142,7 @@ export function apply(ctx, config) {
         if (executorEffort) tool.agentOptions.reasoningEffort = executorEffort;
         else delete tool.agentOptions.reasoningEffort;
         if (JSON.stringify(next) !== JSON.stringify(current)) {
-          editor.edit(entry, () => next).catch((error) => ctx.logger.warn(`verispring-config: 写 preset-standard 失败: ${String(error)}`));
+          await editor.edit(entry, () => next);
         }
       }
     } else process.stderr.write("verispring-config: 未找到包含 tool-subagent 的 preset 配置\n");
@@ -178,8 +178,8 @@ export function apply(ctx, config) {
   };
 
   ctx.on("loader/volatile-update", () => {
-    try { persist(); } catch (error) { ctx.logger.warn(`verispring-config: volatile update failed: ${String(error)}`); }
+    void persist().catch((error) => ctx.logger.warn(`verispring-config: volatile update failed: ${String(error)}`));
   });
-  try { persist(); } catch (error) { ctx.logger.warn(`verispring-config: 初始配置同步失败: ${String(error)}`); }
+  void persist().catch((error) => ctx.logger.warn(`verispring-config: 初始配置同步失败: ${String(error)}`));
 
 }
