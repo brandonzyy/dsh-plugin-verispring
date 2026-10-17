@@ -202,7 +202,10 @@ const plugin = {
     const childRoutePlans = new Map();
 
     const applyChildRoute = (agent, plan) => {
-      if (!agent || !plan) return;
+      if (!agent || !plan) {
+        debug(`selection-skip agent=${agent?.id ?? "unknown"} plan=${Boolean(plan)}`);
+        return;
+      }
       childRoutePlans.set(agent.id, plan);
       try {
         ctx.agents.selectForNextRequest(agent, {
@@ -395,11 +398,24 @@ const plugin = {
       }
     };
 
+    const childPlan = (agent) => {
+      if (!agent || agent.session?.header?.origin !== "subagent") return undefined;
+      const parent = agent.parent ?? agent.parentAgent
+        ?? ctx.agents.list().find((candidate) => ctx.agents.isOwnedBy?.(agent.id, candidate));
+      const parentSession = parent?.session;
+      const parentState = stateOf(parentSession);
+      const role = parentState?.scoutStarted || (parent && leaderScoutStarted.has(parent)) ? "executor" : "scout";
+      routes = loadRoutes(configFile);
+      const route = routes[role];
+      const queued = takeRoutePlan(agent.session.header.parentSession);
+      return queued ?? { label: `${routeText(route)} · ${role}`, route, role };
+    };
+
     for (const agent of ctx.agents.list()) void installLeaderTool(agent);
     ctx.root.on("agent/created", async ({ agent }) => {
       debug(`created agent=${agent?.id} subagent=${agent?.session?.header?.origin === "subagent"}`);
       if (agent?.session?.header?.origin === "subagent") {
-        const plan = takeRoutePlan(agent.session.header.parentSession);
+        const plan = childPlan(agent);
         applyChildRoute(agent, plan);
         await composeSubagentPreset(agent);
         await hideBaseSubagentTool(agent);
@@ -416,7 +432,7 @@ const plugin = {
     // 回合前再绑定一次，确保模型拿到的是本插件的强制路由入口，而不是原始工具。
     ctx.root.on("agent/pre-step", async ({ agent }, next) => {
       debug(`pre-step agent=${agent?.id}`);
-      if (agent?.session?.header?.origin === "subagent") applyChildRoute(agent, childRoutePlans.get(agent.id));
+      if (agent?.session?.header?.origin === "subagent") applyChildRoute(agent, childRoutePlans.get(agent.id) ?? childPlan(agent));
       await installLeaderTool(agent);
       return next();
     });
