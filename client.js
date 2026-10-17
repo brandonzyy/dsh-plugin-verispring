@@ -202,6 +202,45 @@ window.__ModuleLoader__.load({
       return available[0]?.id || preferred;
     }
 
+    const routeBarStyle = {
+      display: "flex",
+      alignItems: "center",
+      minHeight: 28,
+      boxSizing: "border-box",
+      margin: "0 0 8px",
+      padding: "6px 12px",
+      border: "0.5px solid var(--dsw-alias-border-l2)",
+      borderRadius: "var(--dsw-radius-md)",
+      background: "var(--dsw-alias-bg-layer-2)",
+      color: "var(--dsw-alias-label-secondary)",
+      fontSize: 12,
+      lineHeight: 1.4,
+      whiteSpace: "nowrap",
+      overflow: "hidden",
+      textOverflow: "ellipsis",
+    };
+
+    function routeRole(title) {
+      if (/(?:测绘智能体|\bscout\b)/i.test(title)) return "测绘智能体";
+      if (/(?:执行智能体|\bexecutor\b)/i.test(title)) return "执行智能体";
+      return "子代理";
+    }
+
+    function SubagentRouteBar({ useSession, useSessions, useProjection }) {
+      const session = useSession(value => value);
+      const sessionId = session?.sessionId;
+      const title = useSessions(value => sessionId ? value.byId[sessionId]?.displayTitle ?? "" : "");
+      const projection = useProjection("modelSelection");
+      if (!session?.subagent) return null;
+      const selection = projection?.next ?? projection?.selection ?? projection;
+      const provider = selection?.provider || "未知渠道";
+      const model = selection?.model || "未知模型";
+      const effort = selection?.reasoningEffort || "未标注";
+      return React.createElement("div", { style: routeBarStyle, role: "status" },
+        `角色：${routeRole(title)} · 渠道：${provider} · 模型：${model} · 思考强度：${effort}`,
+      );
+    }
+
     function MenuSelect({ id, label, hint, value, choices, disabled, onChange }) {
       const [open, setOpen] = React.useState(false);
       const selected = choices.find(choice => choice.value === value);
@@ -483,6 +522,11 @@ window.__ModuleLoader__.load({
       inject: ["slots", "configForms", "remote", "remote.session", "remote.credentials", "remote.llm"],
       apply(ctx) {
         window.__VSP_CLIENT__.applied = true;
+        ctx.slots.inject("conversation.composer.dock", () => ctx.slots.register({
+          name: "conversation.composer.dock",
+          id: "verispring-subagent-route",
+          order: -100,
+        }, SubagentRouteBar));
         try {
           clientRemote = ctx.remote;
           const source = ctx.configForms.get("verispring-config");

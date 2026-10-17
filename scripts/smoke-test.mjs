@@ -38,6 +38,10 @@ if (!dispatchText.includes("【实际路由：${role} · ${routeText(route)}】"
 if (!dispatchText.includes("sessionTitle.rename(agent.session, title)")) fail("子代理标题未调用 DSH sessionTitle.rename");
 if (!dispatchText.includes("ctx.sessionTitle ?? ctx.get(\"sessionTitle\")")) fail("子代理未使用官方 sessionTitle 服务");
 if (!dispatchText.includes("renameChildTitleAfterAutoTitle(ctx, child.childId, roleLabel)")) fail("子代理启动完成后未延迟写入持久标题");
+if (!clientText.includes("conversation.composer.dock")) fail("客户端未注册子代理路由展示栏");
+if (!clientText.includes("角色：")) fail("客户端路由展示栏未包含角色字段");
+if (!clientText.includes("渠道：")) fail("客户端路由展示栏未包含渠道字段");
+if (!clientText.includes("思考强度：")) fail("客户端路由展示栏未包含思考强度字段");
 
 const sourceFiles = [
   "client.js",
