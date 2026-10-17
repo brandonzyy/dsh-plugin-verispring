@@ -1,5 +1,4 @@
 node_modules/
-manon/.venv/
 __pycache__/
 *.pyc
 .DS_Store
