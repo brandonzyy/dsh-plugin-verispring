@@ -151,6 +151,14 @@ function takeRouteLabel(parent) {
   return label;
 }
 
+function renameChildTitle(ctx, childId, title) {
+  const sessionTitle = ctx.get("sessionTitle");
+  const child = ctx.get("agents")?.get(childId);
+  if (!sessionTitle || !child?.session) return;
+  try { sessionTitle.rename(child.session, title); }
+  catch (error) { process.stderr.write(`caseos-dispatch-gate: 子代理标题写入失败: ${String(error)}\n`); }
+}
+
 const plugin = {
   inject: ["tools", "agents", "sessionTitle"],
   apply(ctx) {
@@ -213,6 +221,7 @@ const plugin = {
                 try {
                   const runResult = await run.result;
                   result = { kind: "foreground", runId: run.id, output: runResult.output };
+                  renameChildTitle(ctx, run.id, roleLabel);
                 } finally {
                   await Promise.resolve(run.dispose?.()).catch(() => {});
                 }
@@ -223,6 +232,7 @@ const plugin = {
                   request,
                   signal: exec.signal,
                 });
+                renameChildTitle(ctx, child.childId, roleLabel);
                 result = { kind: "continuable", subagentId: child.childId };
               }
             } catch (error) {
