@@ -39,10 +39,15 @@ if (!clientText.includes('useProjection("subagent")') || !clientText.includes("r
 const dispatchText = readFileSync(join(root, "gates/dispatch-gate.js"), "utf8");
 const manonText = readFileSync(join(root, "gates/manon-bridge.js"), "utf8");
 const codestyleText = readFileSync(join(root, "gates/codestyle-gate.js"), "utf8");
+const { readsSecretFile } = await import(join(root, "gates/manon-bridge.js"));
 if (!dispatchText.includes("ctx.profileContext?.home") || !dispatchText.includes("process.env.DSH_HOME") || !dispatchText.includes("specPath")) fail("派遣门禁未使用 DSH profile home");
+if (!dispatchText.includes("startActivation") || dispatchText.includes("startContinuable")) fail("子代理必须使用 DSH 官方 startActivation 接口");
 if (!dispatchText.includes('verispring/routes-updated') || !configText.includes('verispring/routes-updated')) fail("配置保存未触发派遣路由热更新");
 if (!configText.includes("process.env.DSH_HOME")) fail("配置同步未使用 DSH_HOME 回退");
 if (!manonText.includes("ctx.profileContext?.home") || !manonText.includes("sourcePrefix")) fail("Manon 调用前缀未使用 DSH profile home");
+if (!manonText.includes("(?<![\\w.])")) fail("Manon 密钥文件名检测缺少词首边界");
+if (readsSecretFile("bash -c 'source ~/.dsh/manon.env; manon-kg sync'")) fail("Manon source 调用式被误判为读取密钥");
+if (!readsSecretFile("cat ~/.dsh/manon.env")) fail("Manon 明文读取密钥未被拦截");
 if (!codestyleText.includes("ctx.profileContext?.home") || !codestyleText.includes("specPath")) fail("提交门禁未使用 DSH profile home");
 if (!dispatchText.includes("${routeText(route)} · ${role} · ${label}")) fail("子代理显示标题未包含实际模型路由");
 if (!dispatchText.includes("【实际路由：${role} · ${routeText(route)}】")) fail("子代理任务未携带实际模型路由元信息");

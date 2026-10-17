@@ -31,7 +31,7 @@ function isSecretFile(value) {
 
 function readsSecretFile(command) {
   const text = String(command ?? "");
-  if (!/(?:cat|head|tail|sed|awk|cut|env|printenv|grep|rg)\b/.test(text)) return false;
+  if (!/(?<![\w.])(?:cat|head|tail|sed|awk|cut|env|printenv|grep|rg)\b/.test(text)) return false;
   return [...SECRET_FILES].some((name) => text.includes(name));
 }
 
@@ -72,4 +72,5 @@ const plugin = {
   },
 };
 
+export { readsSecretFile };
 export default plugin;

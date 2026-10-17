@@ -235,33 +235,25 @@ const plugin = {
       };
       const parentId = sessionIdOf(session);
       queueRoutePlan(parentId, { label: roleLabel, route, role });
-      let result;
       try {
-        if (args.run_in_background === false) {
-          const run = await rtc.subagents.start("spawn", { ...request, signal: exec.signal });
-          applyChildRoute(ctx.agents.get(run.id), { label: roleLabel, route, role });
-          try {
-            const runResult = await run.result;
-            result = { kind: "foreground", runId: run.id, output: runResult.output };
-            renameChildTitleAfterAutoTitle(ctx, run.id, roleLabel);
-          } finally {
-            await Promise.resolve(run.dispose?.()).catch(() => {});
-          }
-        } else {
-          const child = await rtc.subagents.startContinuable({ provider: "spawn", label: roleLabel, request, signal: exec.signal });
-          applyChildRoute(ctx.agents.get(child.childId), { label: roleLabel, route, role });
-          renameChildTitleAfterAutoTitle(ctx, child.childId, roleLabel);
-          result = { kind: "continuable", subagentId: child.childId };
+        const child = await rtc.subagents.startActivation({
+          provider: "spawn",
+          label: roleLabel,
+          request,
+          signal: exec.signal,
+          delivery: "parent",
+        });
+        applyChildRoute(ctx.agents.get(child.childId), { label: roleLabel, route, role });
+        renameChildTitleAfterAutoTitle(ctx, child.childId, roleLabel);
+        if (role === "scout") {
+          leaderScoutStarted.add(exec.agent);
+          writeScoutStarted(session, true, stateDir);
         }
+        return { kind: "activation", subagentId: child.childId };
       } catch (error) {
         takeRoutePlan(parentId);
         throw error;
       }
-      if (role === "scout") {
-        leaderScoutStarted.add(exec.agent);
-        writeScoutStarted(session, true, stateDir);
-      }
-      return result;
     };
 
     const staticSubagentBase = {
@@ -273,7 +265,6 @@ const plugin = {
           cwd: { type: "string" },
           description: { type: "string" },
           prompt: { type: "string" },
-          run_in_background: { type: "boolean" },
         },
         required: ["description", "prompt"],
       },
