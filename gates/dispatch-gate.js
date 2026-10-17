@@ -134,6 +134,23 @@ function sessionState(session) {
   return st;
 }
 
+const pendingRouteLabels = new Map();
+
+function queueRouteLabel(parent, label) {
+  if (!parent) return;
+  const queue = pendingRouteLabels.get(parent) ?? [];
+  queue.push(label);
+  pendingRouteLabels.set(parent, queue);
+}
+
+function takeRouteLabel(parent) {
+  if (!parent) return undefined;
+  const queue = pendingRouteLabels.get(parent);
+  const label = queue?.shift();
+  if (!queue?.length) pendingRouteLabels.delete(parent);
+  return label;
+}
+
 const plugin = {
   inject: ["tools", "agents"],
   apply(ctx) {
@@ -186,24 +203,31 @@ const plugin = {
               },
               maxDepth: 1,
             };
+            const parentId = sessionIdOf(session);
+            queueRouteLabel(parentId, roleLabel);
             let result;
-            if (args.run_in_background === false) {
-              // 前台：等待交付后返回（headless/单线程驱动依赖这一点拿到结果再收回合）。
-              const run = await rtc.subagents.start("spawn", { ...request, signal: exec.signal });
-              try {
-                const runResult = await run.result;
-                result = { kind: "foreground", runId: run.id, output: runResult.output };
-              } finally {
-                await Promise.resolve(run.dispose?.()).catch(() => {});
+            try {
+              if (args.run_in_background === false) {
+                // 前台：等待交付后返回（headless/单线程驱动依赖这一点拿到结果再收回合）。
+                const run = await rtc.subagents.start("spawn", { ...request, signal: exec.signal });
+                try {
+                  const runResult = await run.result;
+                  result = { kind: "foreground", runId: run.id, output: runResult.output };
+                } finally {
+                  await Promise.resolve(run.dispose?.()).catch(() => {});
+                }
+              } else {
+                const child = await rtc.subagents.startContinuable({
+                  provider: "spawn",
+                  label: roleLabel,
+                  request,
+                  signal: exec.signal,
+                });
+                result = { kind: "continuable", subagentId: child.childId };
               }
-            } else {
-              const child = await rtc.subagents.startContinuable({
-                provider: "spawn",
-                label: roleLabel,
-                request,
-                signal: exec.signal,
-              });
-              result = { kind: "continuable", subagentId: child.childId };
+            } catch (error) {
+              takeRouteLabel(parentId);
+              throw error;
             }
             // 常驻标记只在 spawn 成功后落位：spawn 失败不能把本会话污染成 executor。
             if (role === "scout") writeScoutStarted(session, true);
@@ -238,8 +262,15 @@ const plugin = {
 
     for (const agent of ctx.agents.list()) installLeaderTool(agent);
     ctx.on("agent/created", async ({ agent }) => {
-      if (agent?.session?.header?.origin === "subagent") await composeSubagentPreset(agent);
-      else installLeaderTool(agent);
+      if (agent?.session?.header?.origin === "subagent") {
+        await composeSubagentPreset(agent);
+        const title = takeRouteLabel(agent.session.header.parentSession);
+        const sessionTitle = ctx.get("sessionTitle");
+        if (title && sessionTitle) {
+          try { sessionTitle.rename(agent.session, title); }
+          catch (error) { process.stderr.write(`caseos-dispatch-gate: 子代理标题写入失败: ${String(error)}\n`); }
+        }
+      } else installLeaderTool(agent);
     });
 
     // 规范已读的路径判定补充：read/bash 结果内容不含首行标记（如被截断）但调用路径

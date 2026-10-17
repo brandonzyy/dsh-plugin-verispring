@@ -35,6 +35,7 @@ if (!clientText.includes("modelConfigForm?.subscribe") || !clientText.includes("
 const dispatchText = readFileSync(join(root, "gates/dispatch-gate.js"), "utf8");
 if (!dispatchText.includes("${routeText(route)} · ${role} · ${label}")) fail("子代理显示标题未包含实际模型路由");
 if (!dispatchText.includes("【实际路由：${role} · ${routeText(route)}】")) fail("子代理任务未携带实际模型路由元信息");
+if (!dispatchText.includes("sessionTitle.rename(agent.session, title)")) fail("子代理标题未调用 DSH sessionTitle.rename");
 
 const sourceFiles = [
   "client.js",
