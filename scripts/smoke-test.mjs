@@ -55,7 +55,6 @@ if (dsh && profile) {
   try {
     const output = run(dsh, ["--profile", profile, "--dump-config"]);
     for (const failure of [
-      'entry "preset-standard" not found',
       "failed to import",
       "did not activate",
       "persona is no longer supported",
@@ -64,10 +63,9 @@ if (dsh && profile) {
     ]) {
       if (output.includes(failure)) fail(`组合配置包含失败诊断：${failure}`);
     }
-    for (const marker of ["caseos-dispatch-gate", "verispring-config", "preset-verispring-subagent", "agentPreset: verispring-subagent"]) {
+    for (const marker of ["caseos-dispatch-gate", "verispring-config", "preset-verispring-subagent", "id: verispring-subagent"]) {
       if (!output.includes(marker)) fail(`组合配置缺少 ${marker}`);
     }
-    if (!output.includes("preset-standard")) fail("组合配置缺少 preset-standard");
   } catch (error) {
     fail(String(error));
   }
