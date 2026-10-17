@@ -201,6 +201,7 @@ const plugin = {
     const leaderToolInstalling = new WeakSet();
 
     const executeRouted = async (args, exec, rtc) => {
+      debug(`execute agent=${exec.agent?.id} description=${String(args.description ?? "")}`);
       const session = exec.agent?.session;
       const state = stateOf(session);
       const recovered = state.scoutStarted || leaderScoutStarted.has(exec.agent)
@@ -209,6 +210,7 @@ const plugin = {
       const role = recovered ? "executor" : "scout";
       routes = loadRoutes(configFile);
       const route = routes[role];
+      debug(`route role=${role} route=${routeText(route)}`);
       const label = String(args.description ?? "").trim();
       const roleLabel = `${routeText(route)} · ${role} · ${label}`;
       const routedPrompt = `【实际路由：${role} · ${routeText(route)}】\n${String(args.prompt ?? "")}`;
