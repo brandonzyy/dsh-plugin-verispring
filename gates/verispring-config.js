@@ -89,7 +89,7 @@ function findNestedPluginConfig(config, id) {
 
 export function apply(ctx, config) {
   // 写入根 = DSH_HOME；未挂 profileContext 时才回落到用户 home 下的 .dsh。
-  const dshHome = ctx.profileContext?.home ?? `${homedir()}/.dsh`;
+  const dshHome = ctx.profileContext?.home ?? process.env.DSH_HOME ?? `${homedir()}/.dsh`;
   mkdirSync(dshHome, { recursive: true });
   const manonEnv = `${dshHome}/manon.env`;
   const syncEmbeddingKey = () => syncEmbeddingCredential(ctx.credentials, manonEnv)

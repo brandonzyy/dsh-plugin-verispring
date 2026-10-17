@@ -35,6 +35,12 @@ if (!configText.includes("delete tool.persona") || !configText.includes("delete 
 if (!clientText.includes("modelConfigForm?.subscribe") || !clientText.includes("catalogStore?.reload()")) fail("模型目录未配置动态刷新");
 if (!clientText.includes('return String(model.id || model.name || "")')) fail("插件配置页模型未使用原始模型 ID 显示");
 const dispatchText = readFileSync(join(root, "gates/dispatch-gate.js"), "utf8");
+const manonText = readFileSync(join(root, "gates/manon-bridge.js"), "utf8");
+const codestyleText = readFileSync(join(root, "gates/codestyle-gate.js"), "utf8");
+if (!dispatchText.includes("ctx.profileContext?.home") || !dispatchText.includes("process.env.DSH_HOME") || !dispatchText.includes("specPath")) fail("派遣门禁未使用 DSH profile home");
+if (!configText.includes("process.env.DSH_HOME")) fail("配置同步未使用 DSH_HOME 回退");
+if (!manonText.includes("ctx.profileContext?.home") || !manonText.includes("sourcePrefix")) fail("Manon 调用前缀未使用 DSH profile home");
+if (!codestyleText.includes("ctx.profileContext?.home") || !codestyleText.includes("specPath")) fail("提交门禁未使用 DSH profile home");
 if (!dispatchText.includes("${routeText(route)} · ${role} · ${label}")) fail("子代理显示标题未包含实际模型路由");
 if (!dispatchText.includes("【实际路由：${role} · ${routeText(route)}】")) fail("子代理任务未携带实际模型路由元信息");
 if (!dispatchText.includes("sessionTitle.rename(agent.session, title)")) fail("子代理标题未调用 DSH sessionTitle.rename");

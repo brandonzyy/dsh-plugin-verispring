@@ -26,19 +26,13 @@ const DEFAULT_ROUTES = {
 };
 // 用户配置文件（配置面板写入）：{ scout: {...}, executor: {...} }。
 // 读取失败/缺省回落常量，门禁永不因配置文件崩。
-const CONFIG_FILE = `${homedir()}/.dsh/verispring.json`;
-
 import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { SLIM_DESC, slimSchema } from "./leader-scope.js";
 
-const SPEC_PATH = `${homedir()}/.dsh/specs/子代理派遣规范.md`;
-const DENY_REASON =
-  `派遣前必读 ${SPEC_PATH}：先用 read 工具读取该规范（含任务书模板与派发前自查），然后重新发起本次调用。`;
-
-function loadRoutes() {
+function loadRoutes(configFile) {
   try {
-    const cfg = JSON.parse(readFileSync(CONFIG_FILE, "utf8"));
+    const cfg = JSON.parse(readFileSync(configFile, "utf8"));
     const route = (name) => {
       const configured = cfg?.[name];
       if (!configured?.provider || !configured?.model) return DEFAULT_ROUTES[name];
@@ -52,10 +46,10 @@ function loadRoutes() {
   } catch (error) {
     // 配置文件是唯一事实源；损坏时恢复默认结构，避免每次启动继续运行在不可见的旧路由上。
     try {
-      const temp = `${CONFIG_FILE}.tmp-${process.pid}`;
-      mkdirSync(homedir() + "/.dsh", { recursive: true });
+      const temp = `${configFile}.tmp-${process.pid}`;
+      mkdirSync(`${configFile.slice(0, configFile.lastIndexOf("/"))}`, { recursive: true });
       writeFileSync(temp, `${JSON.stringify(DEFAULT_ROUTES, null, 2)}\n`);
-      renameSync(temp, CONFIG_FILE);
+      renameSync(temp, configFile);
       process.stderr.write(`caseos-dispatch-gate: verispring.json 已按默认路由自愈: ${String(error)}\n`);
     } catch (repairError) {
       process.stderr.write(`caseos-dispatch-gate: verispring.json 自愈失败: ${String(repairError)}\n`);
@@ -73,47 +67,45 @@ function routeText(route) {
   return `${route.provider}/${route.model}${route.reasoningEffort ? `@${route.reasoningEffort}` : ""}`;
 }
 
-function pathMatches(value) {
+function pathMatches(value, dshHome) {
   if (typeof value !== "string") return false;
-  const expanded = value.startsWith("~/") ? homedir() + value.slice(1) : value;
+  const expanded = value.startsWith("~/") ? dshHome + value.slice(1) : value;
   return expanded.includes(SPEC_FRAGMENT);
 }
 
 // 会话状态（规范已读 + 测绘常驻）：规范已读增量扫描会话事件日志（WeakMap 缓存扫描
 // 位点）；测绘常驻落在状态文件（跨进程、跨重启一致）。
 const sessionStates = new WeakMap();
-const STATE_DIR = `${homedir()}/.dsh/caseos/session-state`;
-
 function sessionIdOf(session) {
   return session?.header?.id ?? session?.id ?? void 0;
 }
 
-function scoutStartedPersisted(session) {
+function scoutStartedPersisted(session, stateDir) {
   const id = sessionIdOf(session);
   if (!id) return false;
   try {
-    return JSON.parse(readFileSync(`${STATE_DIR}/${id}.json`, "utf8")).scoutStarted === true;
+    return JSON.parse(readFileSync(`${stateDir}/${id}.json`, "utf8")).scoutStarted === true;
   } catch {}
   return false;
 }
 
-function writeScoutStarted(session, value) {
-  const state = sessionState(session);
+function writeScoutStarted(session, value, stateDir) {
+  const state = sessionState(session, stateDir);
   if (state) state.scoutStarted = value === true;
   const id = sessionIdOf(session);
   if (!id) return;
   try {
-    mkdirSync(STATE_DIR, { recursive: true });
-    writeFileSync(`${STATE_DIR}/${id}.json`, `${JSON.stringify({ version: 1, scoutStarted: value === true })}\n`);
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(`${stateDir}/${id}.json`, `${JSON.stringify({ version: 1, scoutStarted: value === true })}\n`);
   } catch (error) {
     process.stderr.write(`caseos-dispatch-gate: 状态文件写入失败: ${String(error)}\n`);
   }
 }
 
-function sessionState(session) {
+function sessionState(session, stateDir) {
   let st = sessionStates.get(session);
   if (!st) {
-    st = { scanned: 0, specRead: false, scoutStarted: scoutStartedPersisted(session) };
+    st = { scanned: 0, specRead: false, scoutStarted: scoutStartedPersisted(session, stateDir) };
     sessionStates.set(session, st);
   }
   const total = typeof session?.seq === "number" ? session.seq : 0;
@@ -166,9 +158,16 @@ function renameChildTitleAfterAutoTitle(ctx, childId, title) {
 }
 
 const plugin = {
-  inject: ["tools", "agents", "sessionTitle"],
+  inject: ["tools", "agents", "sessionTitle", "profileContext"],
   apply(ctx) {
-    const routes = loadRoutes();
+    const dshHome = ctx.profileContext?.home ?? process.env.DSH_HOME ?? `${homedir()}/.dsh`;
+    const configFile = `${dshHome}/verispring.json`;
+    const stateDir = `${dshHome}/caseos/session-state`;
+    const specPath = `${dshHome}/specs/子代理派遣规范.md`;
+    const denyReason =
+      `派遣前必读 ${specPath}：先用 read 工具读取该规范（含任务书模板与派发前自查），然后重新发起本次调用。`;
+    const stateOf = (session) => sessionState(session, stateDir);
+    const routes = loadRoutes(configFile);
     process.stderr.write(
       `caseos-dispatch-gate: plugin activated (测绘: ${routeText(routes.scout)}; 执行: ${routeText(routes.executor)})\n`,
     );
@@ -197,8 +196,8 @@ const plugin = {
           parameters: slimSchema(current.parameters ?? {}),
           async execute(args, exec) {
             const session = exec.agent?.session;
-            const role = sessionState(session).scoutStarted ? "executor" : "scout";
-            const route = loadRoutes()[role];
+            const role = stateOf(session).scoutStarted ? "executor" : "scout";
+            const route = loadRoutes(configFile)[role];
             const label = String(args.description ?? "").trim();
             const roleLabel = `${routeText(route)} · ${role} · ${label}`;
             const routedPrompt = `【实际路由：${role} · ${routeText(route)}】\n${String(args.prompt ?? "")}`;
@@ -246,7 +245,7 @@ const plugin = {
               throw error;
             }
             // 常驻标记只在 spawn 成功后落位：spawn 失败不能把本会话污染成 executor。
-            if (role === "scout") writeScoutStarted(session, true);
+            if (role === "scout") writeScoutStarted(session, true, stateDir);
             return result;
           },
         };
@@ -296,8 +295,8 @@ const plugin = {
       if (exec.name !== "read" && exec.name !== "bash") return;
       let args = {};
       try { args = exec.arguments ?? {}; } catch {}
-      if (pathMatches(args.path) || pathMatches(args.file)) {
-        const st = sessionState(exec.agent?.session);
+      if (pathMatches(args.path, dshHome) || pathMatches(args.file, dshHome)) {
+        const st = stateOf(exec.agent?.session);
         if (!st.specRead) {
           st.specRead = true;
           process.stderr.write("caseos-dispatch-gate: spec read detected (path)\n");
@@ -312,8 +311,8 @@ const plugin = {
       }
       const description = exec.arguments?.description;
       const session = exec.agent?.session;
-      const state = sessionState(session);
-      if (!state.specRead) return DENY_REASON;
+      const state = stateOf(session);
+      if (!state.specRead) return denyReason;
       const desc = String(description ?? "").trim().toLowerCase();
       // 第一笔派遣的身份由运行时决定为测绘智能体，description 只是展示标签。
       // 这样模型无法通过漏写 scout 前缀跳过测绘阶段。
@@ -321,7 +320,7 @@ const plugin = {
       if (isScoutDescription(desc)) {
         if (existsSync(RESET_FILE)) {
           try { unlinkSync(RESET_FILE); } catch {}
-          writeScoutStarted(session, false);
+          writeScoutStarted(session, false, stateDir);
           sessionStates.delete(session);
           process.stderr.write("caseos-dispatch-gate: 测绘智能体常驻标记已重置（reset 文件）\n");
         } else {

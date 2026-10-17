@@ -8,10 +8,6 @@ const MARKER = "# 代码写作规范";
 const SPEC_FRAGMENT = "specs/代码写作规范.md";
 
 import { homedir } from "node:os";
-
-const SPEC_PATH = `${homedir()}/.dsh/specs/代码写作规范.md`;
-const DENY_REASON =
-  `提交代码前必读 ${SPEC_PATH}：先用 read 工具读取该规范，然后重新发起本次 git commit。`;
 const SHAPE_REASON =
   "提交门禁要求使用 `git commit -F <提交信息文件> -- <显式路径...>`；禁止 -a/-am、-m 或省略显式路径。";
 
@@ -73,15 +69,19 @@ function hasSafeCommitShape(command) {
   return true;
 }
 
-function pathMatches(value) {
+function pathMatches(value, dshHome) {
   if (typeof value !== "string") return false;
-  const expanded = value.startsWith("~/") ? homedir() + value.slice(1) : value;
+  const expanded = value.startsWith("~/") ? dshHome + value.slice(1) : value;
   return expanded.includes(SPEC_FRAGMENT);
 }
 
 const plugin = {
-  inject: ["tools"],
+  inject: ["tools", "profileContext"],
   apply(ctx) {
+    const dshHome = ctx.profileContext?.home ?? process.env.DSH_HOME ?? `${homedir()}/.dsh`;
+    const specPath = `${dshHome}/specs/代码写作规范.md`;
+    const denyReason =
+      `提交代码前必读 ${specPath}：先用 read 工具读取该规范，然后重新发起本次 git commit。`;
     const readSessions = new WeakMap();
     ctx.on("tools/result", (exec, result) => {
       if (!exec || result?.isError) return;
@@ -92,7 +92,7 @@ const plugin = {
       try {
         pathArg = exec.arguments?.path ?? exec.arguments?.file;
       } catch {}
-      if (text.includes(MARKER) || pathMatches(pathArg)) {
+      if (text.includes(MARKER) || pathMatches(pathArg, dshHome)) {
         readSessions.set(session, true);
       }
     });
@@ -105,7 +105,7 @@ const plugin = {
       if (!isGitCommitCommand(command)) return undefined;
       if (!hasSafeCommitShape(command)) return SHAPE_REASON;
       if (readSessions.get(exec.agent?.session)) return undefined;
-      return DENY_REASON;
+      return denyReason;
     });
   },
 };

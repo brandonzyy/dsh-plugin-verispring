@@ -17,10 +17,11 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const SOURCE_PREFIX =
-  "set -a; [ -f ~/.dsh/manon.env ] && source ~/.dsh/manon.env; [ -f ~/.dsh/verispring.env ] && source ~/.dsh/verispring.env; set +a; ";
-
 const SECRET_FILES = new Set(["manon.env", "verispring.env"]);
+
+function shellDoubleQuote(value) {
+  return `"${String(value).replaceAll("\\", "\\\\").replaceAll("\"", "\\\"").replaceAll("$", "\\$").replaceAll("`", "\\`")}"`;
+}
 
 function isSecretFile(value) {
   if (typeof value !== "string") return false;
@@ -35,9 +36,12 @@ function readsSecretFile(command) {
 }
 
 const plugin = {
-  inject: ["systemPrompt", "tools"],
+  inject: ["systemPrompt", "tools", "profileContext"],
   apply(ctx) {
-    const home = homedir();
+    const home = ctx.profileContext?.home ?? process.env.DSH_HOME ?? `${homedir()}/.dsh`;
+    const sourcePrefix =
+      `set -a; [ -f ${shellDoubleQuote(`${home}/manon.env`)} ] && source ${shellDoubleQuote(`${home}/manon.env`)}; ` +
+      `[ -f ${shellDoubleQuote(`${home}/verispring.env`)} ] && source ${shellDoubleQuote(`${home}/verispring.env`)}; set +a; `;
     const bundled = join(dirname(fileURLToPath(import.meta.url)), "..", "manon", "manon-kg");
     const legacy = join(home, "manon", "manon-kg");
     const kg = process.env[KG_BIN_ENV] ?? (existsSync(bundled) ? bundled : legacy);
@@ -61,9 +65,9 @@ const plugin = {
         `命令面：sync（增量建图，--full 全量）、query "词" -j（检索）、deep-query "问题"（多轮规划问答）、` +
         `graph、impact、health、status。` +
         `调用铁则：dsh 会剥掉子进程里 KEY/TOKEN 形状的环境变量，直接运行必报缺密钥——必须让 bash 命令自带密钥，` +
-        `统一用这个前缀：\`bash -c '${SOURCE_PREFIX}<子命令>'\`（例：${SOURCE_PREFIX}${kg} sync）。` +
+        `统一用这个前缀：\`bash -c '${sourcePrefix}<子命令>'\`（例：${sourcePrefix}${kg} sync）。` +
         `维护纪律：常驻测绘兵（scout）进仓先 sync 并把入口表落盘为仓库根 .project-map.md；其余会话只读查询，不 clear。` +
-        `语义与陷阱详见 ~/.dsh/specs/${SPEC}，动手前先读。`,
+        `语义与陷阱详见 ${home}/specs/${SPEC}，动手前先读。`,
     });
   },
 };
