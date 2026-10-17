@@ -88,7 +88,7 @@ const plugin = {
     const installLeaderTool = (agent) => {
       if (!agent || agent.session?.header?.origin === "subagent") return;
       if (leaderToolInstalled.has(agent)) return;
-      agent.ctx.inject(["tools"], (rtc) => {
+      agent.ctx.inject(["tools", "subagents"], (rtc) => {
         const original = rtc.tools.get("subagent");
         if (!original) return;
         const wrapped = {
@@ -98,33 +98,48 @@ const plugin = {
             const route = loadRoutes().executor;
             const state = scoutSessions.get(session) ?? { started: false };
             const role = state.started ? "executor" : "scout";
-            if (role === "scout") state.started = true;
-            scoutSessions.set(session, state);
             const label = String(args.description ?? "").trim();
             const roleLabel = role === "scout" ? `scout: ${label}` : `executor: ${label}`;
             process.stderr.write(
               `caseos-dispatch-gate: 强制 ${role} 子代理 ${routeText(route)} preset=verispring-subagent\n`,
             );
-            const child = await exec.agent.ctx.subagents.startActivation({
-              provider: "spawn",
+            const request = {
               label: roleLabel,
-              request: {
-                ...(args.cwd === void 0 ? {} : { cwd: args.cwd }),
-                prompt: [{ type: "text", text: String(args.prompt ?? "") }],
-                parent: exec.agent,
-                agentPreset: "verispring-subagent",
-                agentOptions: {
-                  provider: route.provider,
-                  model: route.model,
-                  reasoningEffort: route.reasoningEffort,
-                },
-                persona: role === "scout" ? "你是只读测绘智能体：只读扫描项目并在项目根写入 .project-map.md；禁止编辑业务代码。" : EXECUTOR_PERSONA,
-                maxDepth: 1,
+              prompt: [{ type: "text", text: String(args.prompt ?? "") }],
+              parent: exec.agent,
+              agentOptions: {
+                provider: route.provider,
+                model: route.model,
+                reasoningEffort: route.reasoningEffort,
               },
-              signal: exec.signal,
-              delivery: "parent",
-            });
-            return { kind: "activation", subagentId: child.childId };
+              persona: role === "scout" ? "你是只读测绘智能体：只读扫描项目并在项目根写入 .project-map.md；禁止编辑业务代码。" : EXECUTOR_PERSONA,
+              maxDepth: 1,
+            };
+            let result;
+            if (args.run_in_background === false) {
+              // 前台：等待交付后返回（headless/单线程驱动依赖这一点拿到结果再收回合）。
+              const run = await rtc.subagents.start("spawn", { ...request, signal: exec.signal });
+              try {
+                const runResult = await run.result;
+                result = { kind: "foreground", runId: run.id, output: runResult.output };
+              } finally {
+                await Promise.resolve(run.dispose?.()).catch(() => {});
+              }
+            } else {
+              const child = await rtc.subagents.startContinuable({
+                provider: "spawn",
+                label: roleLabel,
+                request,
+                signal: exec.signal,
+              });
+              result = { kind: "continuable", subagentId: child.childId };
+            }
+            // 常驻标记只在 spawn 成功后落位：spawn 失败不能把本会话污染成 executor。
+            if (role === "scout") {
+              state.started = true;
+              scoutSessions.set(session, state);
+            }
+            return result;
           },
         };
         rtc.tools.register(wrapped);
@@ -172,7 +187,7 @@ const plugin = {
             return "测绘智能体已常驻：不得重复派遣。先用 list_agents 确认最早那个测绘智能体的状态；仍在运行就用 send_message 复用它。若确认它已结束或派遣失败，用 bash 执行 `touch " + RESET_FILE + "` 后重新派遣即可解锁。";
           }
         }
-        scoutSessions.set(session, true);
+        scoutSessions.set(session, { started: true });
         process.stderr.write("caseos-dispatch-gate: 测绘智能体常驻标记已上\n");
         return undefined;
       }
