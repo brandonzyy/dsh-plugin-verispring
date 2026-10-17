@@ -32,6 +32,8 @@ if (/^\s+toolFilter:\s/m.test(patchText)) fail("cordis.patch.yml 仍包含已废
 if (patchText.includes("{{cwd}}")) fail("cordis.patch.yml 仍引用 DSH 0.2.1-rc.1 不再注册的 cwd 变量");
 if (!configText.includes("delete tool.persona") || !configText.includes("delete tool.toolFilter")) fail("profile patch 迁移未清理旧字段");
 if (!clientText.includes("modelConfigForm?.subscribe") || !clientText.includes("catalogStore?.reload()")) fail("模型目录未配置动态刷新");
+const dispatchText = readFileSync(join(root, "gates/dispatch-gate.js"), "utf8");
+if (!dispatchText.includes("${role} · ${routeText(route)} · ${label}")) fail("子代理显示标题未包含实际模型路由");
 
 const sourceFiles = [
   "client.js",
