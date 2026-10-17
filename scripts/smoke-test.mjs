@@ -8,6 +8,7 @@ const packageData = JSON.parse(readFileSync(join(root, "package.json"), "utf8"))
 const expectedEngine = ">=0.2.0-rc.2 <0.2.2-0";
 const patchText = readFileSync(join(root, "cordis.patch.yml"), "utf8");
 const configText = readFileSync(join(root, "gates/verispring-config.js"), "utf8");
+const clientText = readFileSync(join(root, "client.js"), "utf8");
 
 function fail(message) {
   console.error(`smoke-test: FAIL: ${message}`);
@@ -30,6 +31,7 @@ if (/^\s+persona:\s/m.test(patchText)) fail("cordis.patch.yml 仍包含已废弃
 if (/^\s+toolFilter:\s/m.test(patchText)) fail("cordis.patch.yml 仍包含已废弃的 toolFilter 配置");
 if (patchText.includes("{{cwd}}")) fail("cordis.patch.yml 仍引用 DSH 0.2.1-rc.1 不再注册的 cwd 变量");
 if (!configText.includes("delete tool.persona") || !configText.includes("delete tool.toolFilter")) fail("profile patch 迁移未清理旧字段");
+if (!clientText.includes("modelConfigForm?.subscribe") || !clientText.includes("catalogStore?.reload()")) fail("模型目录未配置动态刷新");
 
 const sourceFiles = [
   "client.js",

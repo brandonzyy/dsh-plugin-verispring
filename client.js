@@ -339,6 +339,9 @@ window.__ModuleLoader__.load({
       const catalog = React.useSyncExternalStore(catalogStore?.subscribe ?? emptySubscribe, catalogStore?.getSnapshot ?? emptySnapshot);
       const credential = React.useSyncExternalStore(credentialStore?.subscribe ?? emptySubscribe, credentialStore?.getSnapshot ?? emptySnapshot) || { configured: false, writable: false };
       const embeddingCredential = React.useSyncExternalStore(embeddingCredentialStore?.subscribe ?? emptySubscribe, embeddingCredentialStore?.getSnapshot ?? emptySnapshot) || { configured: false, writable: false };
+      React.useEffect(() => {
+        void catalogStore?.reload();
+      }, []);
       const value = snapshot?.value ?? DEFAULTS;
       const groups = groupsFor(catalog || { groups: [] });
       const baseValue = (key) => {
@@ -496,6 +499,10 @@ window.__ModuleLoader__.load({
           void catalogStore.load();
           void credentialStore.load();
           void embeddingCredentialStore.load();
+          ctx.effect(() => {
+            const unsubscribe = modelConfigForm?.subscribe?.(() => { void catalogStore.reload(); });
+            return () => unsubscribe?.();
+          }, "verispring-config: model catalog refresh");
           ctx.effect(() => ctx.slots.inject("plugins.bundle.config", () => ctx.slots.register(
             { name: "plugins.bundle.config", key: PACKAGE_NAME },
             ConfigCard,
