@@ -170,12 +170,13 @@ const plugin = {
             const route = loadRoutes()[role];
             const label = String(args.description ?? "").trim();
             const roleLabel = `${role} · ${routeText(route)} · ${label}`;
+            const routedPrompt = `【实际路由：${role} · ${routeText(route)}】\n${String(args.prompt ?? "")}`;
             process.stderr.write(
               `caseos-dispatch-gate: 强制 ${role} 子代理 ${routeText(route)}\n`,
             );
             const request = {
               label: roleLabel,
-              prompt: [{ type: "text", text: String(args.prompt ?? "") }],
+              prompt: [{ type: "text", text: routedPrompt }],
               parent: exec.agent,
               agentPreset: SUBAGENT_PRESET,
               agentOptions: {

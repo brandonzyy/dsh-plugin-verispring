@@ -34,6 +34,7 @@ if (!configText.includes("delete tool.persona") || !configText.includes("delete 
 if (!clientText.includes("modelConfigForm?.subscribe") || !clientText.includes("catalogStore?.reload()")) fail("模型目录未配置动态刷新");
 const dispatchText = readFileSync(join(root, "gates/dispatch-gate.js"), "utf8");
 if (!dispatchText.includes("${role} · ${routeText(route)} · ${label}")) fail("子代理显示标题未包含实际模型路由");
+if (!dispatchText.includes("【实际路由：${role} · ${routeText(route)}】")) fail("子代理任务未携带实际模型路由元信息");
 
 const sourceFiles = [
   "client.js",
