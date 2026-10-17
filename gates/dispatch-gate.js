@@ -200,6 +200,88 @@ const plugin = {
     const leaderScoutStarted = new WeakSet();
     const leaderToolInstalling = new WeakSet();
 
+    const executeRouted = async (args, exec, rtc) => {
+      const session = exec.agent?.session;
+      const state = stateOf(session);
+      const recovered = state.scoutStarted || leaderScoutStarted.has(exec.agent)
+        || hasChildAgent(ctx.agents, session, exec.agent);
+      if (!state.scoutStarted && recovered) writeScoutStarted(session, true, stateDir);
+      const role = recovered ? "executor" : "scout";
+      routes = loadRoutes(configFile);
+      const route = routes[role];
+      const label = String(args.description ?? "").trim();
+      const roleLabel = `${routeText(route)} · ${role} · ${label}`;
+      const routedPrompt = `【实际路由：${role} · ${routeText(route)}】\n${String(args.prompt ?? "")}`;
+      process.stderr.write(`caseos-dispatch-gate: 强制 ${role} 子代理 ${routeText(route)}\n`);
+      const request = {
+        label: roleLabel,
+        prompt: [{ type: "text", text: routedPrompt }],
+        parent: exec.agent,
+        agentPreset: SUBAGENT_PRESET,
+        agentOptions: { provider: route.provider, model: route.model, reasoningEffort: route.reasoningEffort },
+        maxDepth: 1,
+      };
+      const parentId = sessionIdOf(session);
+      queueRouteLabel(parentId, roleLabel);
+      let result;
+      try {
+        if (args.run_in_background === false) {
+          const run = await rtc.subagents.start("spawn", { ...request, signal: exec.signal });
+          try {
+            const runResult = await run.result;
+            result = { kind: "foreground", runId: run.id, output: runResult.output };
+            renameChildTitleAfterAutoTitle(ctx, run.id, roleLabel);
+          } finally {
+            await Promise.resolve(run.dispose?.()).catch(() => {});
+          }
+        } else {
+          const child = await rtc.subagents.startContinuable({ provider: "spawn", label: roleLabel, request, signal: exec.signal });
+          renameChildTitleAfterAutoTitle(ctx, child.childId, roleLabel);
+          result = { kind: "continuable", subagentId: child.childId };
+        }
+      } catch (error) {
+        takeRouteLabel(parentId);
+        throw error;
+      }
+      if (role === "scout") {
+        leaderScoutStarted.add(exec.agent);
+        writeScoutStarted(session, true, stateDir);
+      }
+      return result;
+    };
+
+    const staticSubagentBase = {
+      name: BASE_SUBAGENT_TOOL,
+      description: SLIM_DESC.subagent,
+      parameters: {
+        type: "object",
+        properties: {
+          cwd: { type: "string" },
+          description: { type: "string" },
+          prompt: { type: "string" },
+          run_in_background: { type: "boolean" },
+        },
+        required: ["description", "prompt"],
+      },
+      output: {
+        schema: { type: "object", additionalProperties: true },
+        render: (_args, value) => [{ type: "text", text: `started subagent ${value.subagentId}` }],
+      },
+    };
+    const staticRoutedTool = {
+      ...staticSubagentBase,
+      name: LEADER_SUBAGENT_TOOL,
+      __caseosRouted: true,
+      async execute(args, exec) { return executeRouted(args, exec, ctx.root); },
+    };
+    try {
+      ctx.root.tools.register(staticRoutedTool);
+      globalLeaderToolInstalled = true;
+      debug("static-global-register-ok");
+    } catch (error) {
+      debug(`static-global-register-fail ${String(error)}`);
+    }
+
     // 子代理的 provider/model/角色是运行时契约，不能依赖模型是否记得在 tool call 里填写。
     // 官方 tool-subagent 先以 subagent-base 挂载，领导层只暴露本插件的 subagent 入口；
     // 这样不在官方同名工具作用域上重复注册，角色由会话事件推导（首笔=测绘，其后=执行）。
@@ -210,6 +292,12 @@ const plugin = {
       leaderToolInstalling.add(agent);
       try {
         await agent.ctx.inject(["tools", "subagents"], (rtc) => {
+        if (globalLeaderToolInstalled) {
+          try { rtc.tools.restrict({ deny: [BASE_SUBAGENT_TOOL] }); }
+          catch (error) { debug(`base-hide-fail agent=${agent.id} ${String(error)}`); }
+          leaderToolInstalled.add(agent);
+          return;
+        }
         // 按领导自己的视图取官方基座；它只作为执行实现，不直接暴露给模型。
         const current = rtc.tools.get(BASE_SUBAGENT_TOOL, agent);
         if (!current) { debug(`base-missing agent=${agent.id}`); return; }
@@ -219,81 +307,10 @@ const plugin = {
           leaderToolInstalled.add(agent);
           return;
         }
-        const wrapped = {
-          ...current,
-          name: LEADER_SUBAGENT_TOOL,
-          __caseosRouted: true,
+        const wrapped = { ...current, name: LEADER_SUBAGENT_TOOL, __caseosRouted: true,
           description: SLIM_DESC.subagent ?? current.description,
           parameters: slimSchema(current.parameters ?? {}),
-          async execute(args, exec) {
-            const session = exec.agent?.session;
-            const state = stateOf(session);
-            // 会话恢复时状态文件可能尚未写入或路径曾发生迁移；已有直接子代理
-            // 就意味着测绘阶段已经完成，不能再次使用测绘路由。
-            const recovered = state.scoutStarted || leaderScoutStarted.has(exec.agent)
-              || hasChildAgent(ctx.agents, session, exec.agent);
-            if (!state.scoutStarted && recovered) {
-              writeScoutStarted(session, true, stateDir);
-            }
-            const role = recovered ? "executor" : "scout";
-            // 配置保存与派遣之间可能跨越不同的宿主 fiber；每次派遣直接读取文件，
-            // 确保保存后的路由无需依赖事件总线或重启即可生效。
-            routes = loadRoutes(configFile);
-            const route = routes[role];
-            const label = String(args.description ?? "").trim();
-            const roleLabel = `${routeText(route)} · ${role} · ${label}`;
-            const routedPrompt = `【实际路由：${role} · ${routeText(route)}】\n${String(args.prompt ?? "")}`;
-            process.stderr.write(
-              `caseos-dispatch-gate: 强制 ${role} 子代理 ${routeText(route)}\n`,
-            );
-            const request = {
-              label: roleLabel,
-              prompt: [{ type: "text", text: routedPrompt }],
-              parent: exec.agent,
-              agentPreset: SUBAGENT_PRESET,
-              agentOptions: {
-                provider: route.provider,
-                model: route.model,
-                reasoningEffort: route.reasoningEffort,
-              },
-              maxDepth: 1,
-            };
-            const parentId = sessionIdOf(session);
-            queueRouteLabel(parentId, roleLabel);
-            let result;
-            try {
-              if (args.run_in_background === false) {
-                // 前台：等待交付后返回（headless/单线程驱动依赖这一点拿到结果再收回合）。
-                const run = await rtc.subagents.start("spawn", { ...request, signal: exec.signal });
-                try {
-                  const runResult = await run.result;
-                  result = { kind: "foreground", runId: run.id, output: runResult.output };
-                  renameChildTitleAfterAutoTitle(ctx, run.id, roleLabel);
-                } finally {
-                  await Promise.resolve(run.dispose?.()).catch(() => {});
-                }
-              } else {
-                const child = await rtc.subagents.startContinuable({
-                  provider: "spawn",
-                  label: roleLabel,
-                  request,
-                  signal: exec.signal,
-                });
-                renameChildTitleAfterAutoTitle(ctx, child.childId, roleLabel);
-                result = { kind: "continuable", subagentId: child.childId };
-              }
-            } catch (error) {
-              takeRouteLabel(parentId);
-              throw error;
-            }
-            // 常驻标记只在 spawn 成功后落位：spawn 失败不能把本会话污染成 executor。
-            if (role === "scout") {
-              leaderScoutStarted.add(exec.agent);
-              writeScoutStarted(session, true, stateDir);
-            }
-            return result;
-          },
-        };
+          execute: (args, exec) => executeRouted(args, exec, rtc) };
         let registered = globalLeaderToolInstalled;
         if (!registered) {
           try {
