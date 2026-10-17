@@ -26,19 +26,20 @@ it — pass `run_in_background: false` to `subagent` to wait in the foreground f
 
 | Role | Mounted on | Trigger → summary cap |
 |---|---|---|
-| Main session (leader) | compaction group of the `standard` preset | ~40k → 4k tokens |
-| Scout/executor subagents | compaction group of the `verispring-subagent` preset | ~60k → 6k tokens |
+| Main session (leader) | compaction group of the `standard` preset | 40% of the context window (~400k on a 1M window) → summary capped at 40k tokens |
+| Scout/executor subagents | compaction group of the `verispring-subagent` preset | 60% of the context window (~600k) → summary capped at 60k tokens |
 
 Both policies prune oversized tool results first (a result over 8192 characters keeps its first
 4096 and last 1024), then condense the safely balanced history with DSH's structured template; no
-verbatim tail is kept, and context overflow retries automatically.
+verbatim tail is kept, and context overflow retries automatically. The summary length is chosen
+by the model from a fixed template; the cap only bounds it, and real summaries usually run far shorter.
 
 Subagents on `verispring-subagent`: the harness spawn request has no preset field and a child
 inherits its parent's preset by default; dispatch-gate switches the child inside its creation
 window (`agent/created`, before the first prompt) and records an `agent-preset/selected` event,
 so a cold resume recomposes from the session log. The headless one-shot runner
 (`dsh --profile … "<task>"`) composes no preset for the main session, so the main session does
-not get the `standard` 40k policy — only a root-level `compaction-basic` if the profile enables
+not get the `standard` 400k policy — only a root-level `compaction-basic` if the profile enables
 one; subagents are unaffected.
 
 ## Install

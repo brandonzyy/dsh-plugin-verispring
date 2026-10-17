@@ -25,16 +25,17 @@ Verispring 三角色会话架构 + 本地知识图谱 manon，大幅度优化主
 
 | 角色 | 挂载位置 | 触发 → 摘要上限 |
 |---|---|---|
-| 主会话（领导） | `standard` preset 的 compaction 组 | 约 40k → 4k token |
-| 测绘/执行子代理 | `verispring-subagent` preset 的 compaction 组 | 约 60k → 6k token |
+| 主会话（领导） | `standard` preset 的 compaction 组 | 上下文窗口 40%（1M 窗口即约 400k）→ 摘要上限 40k token |
+| 测绘/执行子代理 | `verispring-subagent` preset 的 compaction 组 | 上下文窗口 60%（约 600k）→ 摘要上限 60k token |
 
 两条策略都先剪枝超大工具结果（单条超过 8192 字符保留首 4096、尾 1024），再按 DSH 结构化模板
-合并可安全压缩的历史，不额外保留原文尾部；上下文溢出时自动重试。
+合并可安全压缩的历史，不额外保留原文尾部；上下文溢出时自动重试。摘要长度由模型按固定模板决定，
+上限只是封顶，实际摘要通常远短于上限。
 
 子代理挂 `verispring-subagent`：harness 的 spawn 请求没有 preset 字段，子代理默认继承父会话
 preset；dispatch-gate 在子代理创建窗口（`agent/created`，早于首个 prompt）把它切过去并写入
 `agent-preset/selected` 事件，冷恢复时按会话记录重新组合。headless 一次性驱动器
-（`dsh --profile … "<任务>"`）不为主会话组合任何 preset，主会话不吃 `standard` 的 40k 策略，
+（`dsh --profile … "<任务>"`）不为主会话组合任何 preset，主会话不吃 `standard` 的 400k 策略，
 只受 profile 根层启用的 `compaction-basic`（若有）约束；子代理不受影响。
 
 ## 安装

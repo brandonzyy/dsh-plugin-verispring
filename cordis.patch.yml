@@ -1,5 +1,6 @@
 # dsh-verispring-architecture —— 三角色会话架构（领导 / 测绘智能体 / 执行智能体）
-# 主会话与子代理分别覆盖各自 preset 的 compaction-basic：主会话 40k→4k，子代理 60k→6k。
+# 主会话与子代理分别覆盖各自 preset 的 compaction-basic：主会话 400k→40k，子代理 600k→60k
+# （上下文窗口 1M 的 40% / 60% 触发；maxTokens 是摘要输出上限）。
 # 两条策略都复用 DSH 的 token meter、工具结果剪枝、结构化摘要与溢出恢复。
 # 子代理挂 verispring-subagent preset：harness 的 spawn 请求不带 preset 字段、子代理默认继承
 # 父会话 preset，由 dispatch-gate 在子代理创建窗口（首个 prompt 之前）切换并记入会话日志。
@@ -153,9 +154,9 @@
             name: '@deepseek-ai/dsh-compaction-basic'
             config:
               auto: true
-              thresholdRatio: 0.04
+              thresholdRatio: 0.4
               headroomTokens: 0
-              maxTokens: 4096
+              maxTokens: 40960
               retainTokens: 0
           - id: command-compact
             name: '@deepseek-ai/dsh-command-compact'
@@ -352,9 +353,9 @@
                 name: '@deepseek-ai/dsh-compaction-basic'
                 config:
                   auto: true
-                  thresholdRatio: 0.06
+                  thresholdRatio: 0.6
                   headroomTokens: 0
-                  maxTokens: 6144
+                  maxTokens: 61440
                   retainTokens: 0
               - id: command-compact
                 name: '@deepseek-ai/dsh-command-compact'
