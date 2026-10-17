@@ -41,7 +41,9 @@ if (!dispatchText.includes("renameChildTitleAfterAutoTitle(ctx, child.childId, r
 if (!clientText.includes("conversation.composer.dock")) fail("客户端未注册子代理路由展示栏");
 if (!clientText.includes("`${provider} · ${model} · ${effort}`")) fail("客户端路由展示栏未使用简化格式");
 if (!clientText.includes('background: "transparent"')) fail("客户端路由展示栏仍使用卡片背景");
-if (!clientText.includes("padding: 0")) fail("客户端路由展示栏仍使用卡片内边距");
+if (!clientText.includes('padding: "1px 8px"')) fail("客户端路由展示栏未对齐统计项内边距");
+if (!clientText.includes('alignItems: "center"')) fail("客户端路由展示栏未垂直居中");
+if (!clientText.includes('fontVariantNumeric: "tabular-nums"')) fail("客户端路由展示栏未对齐统计项字体样式");
 
 const sourceFiles = [
   "client.js",
