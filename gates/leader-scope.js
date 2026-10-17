@@ -11,7 +11,7 @@
 // - CASEOS_SCOUT=0 关闭分工条款中的测绘部分。
 const LEADER_ALLOW = new Set([
   "bash", "edit", "write", "read", "read_image",
-  "subagent", "send_message", "interrupt_agent", "list_agents",
+  "subagent", "subagent-base", "send_message", "interrupt_agent", "list_agents",
 ]);
 
 // 派遣面工具的瘦身文案。subagent 的遮蔽注册由 dispatch-gate 完成（路由执行体在它那，

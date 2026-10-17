@@ -19,6 +19,8 @@ const SPEC_FRAGMENT = "specs/子代理派遣规范.md";
 const GATE_TOOLS = new Set(["subagent", "subagent_fork"]);
 const MAP_FILE = ".project-map.md";
 const SUBAGENT_PRESET = "verispring-subagent";
+const BASE_SUBAGENT_TOOL = "subagent-base";
+const LEADER_SUBAGENT_TOOL = "subagent";
 const ROUTES_UPDATED_EVENT = "verispring/routes-updated";
 const RESET_FILE = `/tmp/dsh-caseos-scout-reset-${process.pid}`;
 const DEFAULT_ROUTES = {
@@ -193,16 +195,16 @@ const plugin = {
     const leaderToolInstalling = new WeakSet();
 
     // 子代理的 provider/model/角色是运行时契约，不能依赖模型是否记得在 tool call 里填写。
-    // 领导会话的 subagent 工具在这里被替换成唯一的 spawn 入口：角色由会话事件推导
-    // （首笔=测绘，其后=执行），路由按角色取面板配置。
+    // 官方 tool-subagent 先以 subagent-base 挂载，领导层只暴露本插件的 subagent 入口；
+    // 这样不在官方同名工具作用域上重复注册，角色由会话事件推导（首笔=测绘，其后=执行）。
     const installLeaderTool = async (agent) => {
       if (!agent || agent.session?.header?.origin === "subagent") return;
       if (leaderToolInstalled.has(agent) || leaderToolInstalling.has(agent)) return;
       leaderToolInstalling.add(agent);
       try {
         await agent.ctx.inject(["tools", "subagents"], (rtc) => {
-        // 按领导自己的视图取：桌面把模型可见工具全放在 preset 层，全局视图里没有 subagent。
-        const current = rtc.tools.get("subagent", agent);
+        // 按领导自己的视图取官方基座；它只作为执行实现，不直接暴露给模型。
+        const current = rtc.tools.get(BASE_SUBAGENT_TOOL, agent);
         if (!current) return;
         // 领导层的 subagent 只此一处注册：瘦身文案来自 leader-scope，执行体是本文件的路由强制。
         // 其他插件（如 leader-scope）不得再注册同名工具，否则同层重复注册会抛错。
@@ -212,6 +214,7 @@ const plugin = {
         }
         const wrapped = {
           ...current,
+          name: LEADER_SUBAGENT_TOOL,
           __caseosRouted: true,
           description: SLIM_DESC.subagent ?? current.description,
           parameters: slimSchema(current.parameters ?? {}),
@@ -286,6 +289,8 @@ const plugin = {
         };
         try {
           rtc.tools.register(wrapped);
+          // 基座只供本插件保留，领导模型只看到路由入口；本层自己的注册仍可见。
+          rtc.tools.restrict({ deny: [BASE_SUBAGENT_TOOL] });
           leaderToolInstalled.add(agent);
           process.stderr.write("caseos-dispatch-gate: 领导 subagent 入口已绑定强制路由\n");
         } catch (error) {
@@ -315,10 +320,24 @@ const plugin = {
       }
     };
 
+    const hideBaseSubagentTool = async (agent) => {
+      if (!agent) return;
+      try {
+        await agent.ctx.inject(["tools"], (rtc) => {
+          if (rtc.tools.get(BASE_SUBAGENT_TOOL, agent) !== void 0) {
+            rtc.tools.restrict({ deny: [BASE_SUBAGENT_TOOL] });
+          }
+        });
+      } catch (error) {
+        process.stderr.write(`caseos-dispatch-gate: 子代理基座工具隐藏失败: ${String(error)}\n`);
+      }
+    };
+
     for (const agent of ctx.agents.list()) void installLeaderTool(agent);
     ctx.on("agent/created", async ({ agent }) => {
       if (agent?.session?.header?.origin === "subagent") {
         await composeSubagentPreset(agent);
+        await hideBaseSubagentTool(agent);
         const title = takeRouteLabel(agent.session.header.parentSession);
         const sessionTitle = ctx.sessionTitle ?? ctx.get("sessionTitle");
         if (title && sessionTitle) {
