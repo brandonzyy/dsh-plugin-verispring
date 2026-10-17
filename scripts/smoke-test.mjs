@@ -36,7 +36,7 @@ const dispatchText = readFileSync(join(root, "gates/dispatch-gate.js"), "utf8");
 if (!dispatchText.includes("${routeText(route)} · ${role} · ${label}")) fail("子代理显示标题未包含实际模型路由");
 if (!dispatchText.includes("【实际路由：${role} · ${routeText(route)}】")) fail("子代理任务未携带实际模型路由元信息");
 if (!dispatchText.includes("sessionTitle.rename(agent.session, title)")) fail("子代理标题未调用 DSH sessionTitle.rename");
-if (!dispatchText.includes("renameChildTitle(ctx, child.childId, roleLabel)")) fail("子代理启动完成后未写入持久标题");
+if (!dispatchText.includes("renameChildTitleAfterAutoTitle(ctx, child.childId, roleLabel)")) fail("子代理启动完成后未延迟写入持久标题");
 
 const sourceFiles = [
   "client.js",
