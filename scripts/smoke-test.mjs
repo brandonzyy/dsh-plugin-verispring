@@ -30,6 +30,7 @@ if (!patchText.includes("agentPreset: verispring-subagent")) fail("tool-subagent
 if (/^\s+persona:\s/m.test(patchText)) fail("cordis.patch.yml 仍包含已废弃的 persona 配置");
 if (/^\s+toolFilter:\s/m.test(patchText)) fail("cordis.patch.yml 仍包含已废弃的 toolFilter 配置");
 if (patchText.includes("{{cwd}}")) fail("cordis.patch.yml 仍引用 DSH 0.2.1-rc.1 不再注册的 cwd 变量");
+if (!patchText.includes("id: llm-deepseek") || !patchText.includes("name: deepseek-flash") || !patchText.includes("name: deepseek-v4-pro")) fail("官方 DeepSeek 模型显示名未使用准确标识");
 if (!configText.includes("delete tool.persona") || !configText.includes("delete tool.toolFilter")) fail("profile patch 迁移未清理旧字段");
 if (!clientText.includes("modelConfigForm?.subscribe") || !clientText.includes("catalogStore?.reload()")) fail("模型目录未配置动态刷新");
 const dispatchText = readFileSync(join(root, "gates/dispatch-gate.js"), "utf8");
