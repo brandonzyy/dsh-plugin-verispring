@@ -233,11 +233,24 @@ window.__ModuleLoader__.load({
       return model === "deepseek-flash" ? "deepseek flash" : model;
     }
 
+    function routeFromSubagentLabel(label) {
+      const text = String(label ?? "").trim();
+      const route = text.split(" · ", 1)[0];
+      const match = /^([^/]+)\/([^@]+)(?:@(.+))?$/.exec(route);
+      if (!match) return undefined;
+      return {
+        provider: match[1],
+        model: match[2],
+        ...(match[3] ? { reasoningEffort: match[3] } : {}),
+      };
+    }
+
     function SubagentRouteBar({ useSession, useProjection }) {
       const session = useSession(value => value);
+      const identity = useProjection("subagent");
       const projection = useProjection("modelSelection");
       if (!session?.subagent) return null;
-      const selection = projection?.next ?? projection?.selection ?? projection;
+      const selection = routeFromSubagentLabel(identity?.label) ?? (projection?.next ?? projection?.selection ?? projection);
       const provider = routeProviderLabel(selection?.provider || "未知渠道");
       const model = routeModelLabel(selection?.model || "未知模型");
       const effort = selection?.reasoningEffort || "未标注";

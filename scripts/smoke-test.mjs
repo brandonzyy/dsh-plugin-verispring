@@ -34,6 +34,7 @@ if (!patchText.includes("id: llm-deepseek") || !patchText.includes("name: deepse
 if (!configText.includes("delete tool.persona") || !configText.includes("delete tool.toolFilter")) fail("profile patch 迁移未清理旧字段");
 if (!clientText.includes("modelConfigForm?.subscribe") || !clientText.includes("catalogStore?.reload()")) fail("模型目录未配置动态刷新");
 if (!clientText.includes('return String(model.id || model.name || "")')) fail("插件配置页模型未使用原始模型 ID 显示");
+if (!clientText.includes('useProjection("subagent")') || !clientText.includes("routeFromSubagentLabel")) fail("子代理路由栏未读取官方 subagent 身份投影");
 const dispatchText = readFileSync(join(root, "gates/dispatch-gate.js"), "utf8");
 const manonText = readFileSync(join(root, "gates/manon-bridge.js"), "utf8");
 const codestyleText = readFileSync(join(root, "gates/codestyle-gate.js"), "utf8");
