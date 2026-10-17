@@ -143,9 +143,12 @@ tree-sitter 语言包按需动态加载，缺包只降级该语言不崩。密�
 
 ## 兼容性
 
-`peerDependencies` 钉 `@deepseek-ai/cordis` `4.0.4 || ~4.0.5-alpha.1`（对应 dsh 0.2.0-rc.2 与
-0.2.1-alpha.2）。版本不满足时安装被拒；确要强装走官方豁免流程
+`peerDependencies` 钉 `@deepseek-ai/cordis` `4.0.4 || ~4.0.5-alpha.1`，`engines.dsh` 覆盖
+dsh 0.2.0-rc.2 至 0.2.1-rc.1。版本不满足时安装被拒；确要强装走官方豁免流程
 （`dsh plugin --profile <p> allow-version <pkg@ver> --dsh-version <runtime> --accept-risk`）。
+
+升级 dsh 后运行 `pnpm smoke`，它检查版本声明、源码语法和插件入口。设置 `DSH_BIN` 与
+`DSH_SMOKE_PROFILE` 后，会再执行官方 `--dump-config` 组合检查，确认派遣门禁、配置入口和子代理 preset 均已装配。
 
 ## 依赖与升级边界
 

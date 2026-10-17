@@ -168,9 +168,15 @@ the plugin-pinned `verispring`/`deepseek-flash` route):
 
 ## Compatibility
 
-`peerDependencies` pins `@deepseek-ai/cordis` `4.0.4 || ~4.0.5-alpha.1` — covering dsh
-0.2.0-rc.2 and 0.2.1-alpha.2. Incompatible installs are rejected up front; the official
+`peerDependencies` pins `@deepseek-ai/cordis` `4.0.4 || ~4.0.5-alpha.1`, and `engines.dsh`
+covers dsh 0.2.0-rc.2 through 0.2.1-rc.1. Incompatible installs are rejected up front; the official
 exemption flow exists for force-installs.
+
+## Upgrade smoke check
+
+Run `pnpm smoke` after a dsh upgrade for manifest and syntax checks. Set `DSH_BIN` and
+`DSH_SMOKE_PROFILE` to add an official `--dump-config` composition check against an isolated
+profile; the check must find the dispatch gate, configuration entry and subagent preset.
 
 ## Dependencies and upgrade surface
 
