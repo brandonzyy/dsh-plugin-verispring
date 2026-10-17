@@ -199,6 +199,23 @@ const plugin = {
     // 作为当前进程内的第二份测绘完成事实。
     const leaderScoutStarted = new WeakSet();
     const leaderToolInstalling = new WeakSet();
+    const childRoutePlans = new Map();
+
+    const applyChildRoute = (agent, plan) => {
+      if (!agent || !plan) return;
+      childRoutePlans.set(agent.id, plan);
+      try {
+        ctx.agents.selectForNextRequest(agent, {
+          provider: plan.route.provider,
+          model: plan.route.model,
+          ...(plan.route.reasoningEffort ? { reasoningEffort: plan.route.reasoningEffort } : {}),
+        });
+        debug(`selection agent=${agent.id} role=${plan.role} route=${routeText(plan.route)}`);
+      } catch (error) {
+        debug(`selection-fail agent=${agent.id} ${String(error)}`);
+        process.stderr.write(`caseos-dispatch-gate: 子代理模型选择写入失败: ${String(error)}\n`);
+      }
+    };
 
     const executeRouted = async (args, exec, rtc) => {
       debug(`execute agent=${exec.agent?.id} description=${String(args.description ?? "")}`);
@@ -229,6 +246,7 @@ const plugin = {
       try {
         if (args.run_in_background === false) {
           const run = await rtc.subagents.start("spawn", { ...request, signal: exec.signal });
+          applyChildRoute(ctx.agents.get(run.id), { label: roleLabel, route, role });
           try {
             const runResult = await run.result;
             result = { kind: "foreground", runId: run.id, output: runResult.output };
@@ -238,6 +256,7 @@ const plugin = {
           }
         } else {
           const child = await rtc.subagents.startContinuable({ provider: "spawn", label: roleLabel, request, signal: exec.signal });
+          applyChildRoute(ctx.agents.get(child.childId), { label: roleLabel, route, role });
           renameChildTitleAfterAutoTitle(ctx, child.childId, roleLabel);
           result = { kind: "continuable", subagentId: child.childId };
         }
@@ -381,19 +400,7 @@ const plugin = {
       debug(`created agent=${agent?.id} subagent=${agent?.session?.header?.origin === "subagent"}`);
       if (agent?.session?.header?.origin === "subagent") {
         const plan = takeRoutePlan(agent.session.header.parentSession);
-        if (plan) {
-          try {
-            ctx.agents.selectForNextRequest(agent, {
-              provider: plan.route.provider,
-              model: plan.route.model,
-              ...(plan.route.reasoningEffort ? { reasoningEffort: plan.route.reasoningEffort } : {}),
-            });
-            debug(`selection agent=${agent.id} role=${plan.role} route=${routeText(plan.route)}`);
-          } catch (error) {
-            debug(`selection-fail agent=${agent.id} ${String(error)}`);
-            process.stderr.write(`caseos-dispatch-gate: 子代理模型选择写入失败: ${String(error)}\n`);
-          }
-        }
+        applyChildRoute(agent, plan);
         await composeSubagentPreset(agent);
         await hideBaseSubagentTool(agent);
         const title = plan?.label;
@@ -409,6 +416,7 @@ const plugin = {
     // 回合前再绑定一次，确保模型拿到的是本插件的强制路由入口，而不是原始工具。
     ctx.root.on("agent/pre-step", async ({ agent }, next) => {
       debug(`pre-step agent=${agent?.id}`);
+      if (agent?.session?.header?.origin === "subagent") applyChildRoute(agent, childRoutePlans.get(agent.id));
       await installLeaderTool(agent);
       return next();
     });
