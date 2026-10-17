@@ -189,6 +189,7 @@ const plugin = {
       `caseos-dispatch-gate: plugin activated (测绘: ${routeText(routes.scout)}; 执行: ${routeText(routes.executor)})\n`,
     );
     const leaderToolInstalled = new WeakSet();
+    let globalLeaderToolInstalled = false;
     // 桌面恢复/切换 fiber 时 session 可能被重新包装；领导 agent 身份更稳定，
     // 作为当前进程内的第二份测绘完成事实。
     const leaderScoutStarted = new WeakSet();
@@ -287,14 +288,28 @@ const plugin = {
             return result;
           },
         };
-        try {
-          rtc.tools.register(wrapped);
-          // 基座只供本插件保留，领导模型只看到路由入口；本层自己的注册仍可见。
-          rtc.tools.restrict({ deny: [BASE_SUBAGENT_TOOL] });
+        let registered = globalLeaderToolInstalled;
+        if (!registered) {
+          try {
+            ctx.tools.register(wrapped);
+            globalLeaderToolInstalled = true;
+            registered = true;
+            process.stderr.write("caseos-dispatch-gate: 全局 subagent 入口已绑定强制路由\n");
+          } catch (error) {
+            try {
+              rtc.tools.register(wrapped);
+              registered = true;
+              process.stderr.write("caseos-dispatch-gate: 领导 subagent 入口已绑定强制路由\n");
+            } catch (scopedError) {
+              process.stderr.write(`caseos-dispatch-gate: subagent 入口注册失败: ${String(scopedError)}; 全局尝试: ${String(error)}\n`);
+            }
+          }
+        }
+        if (registered) {
+          // 基座只供本插件保留，领导模型只看到路由入口。
+          try { rtc.tools.restrict({ deny: [BASE_SUBAGENT_TOOL] }); }
+          catch (error) { process.stderr.write(`caseos-dispatch-gate: 官方基座隐藏失败: ${String(error)}\n`); }
           leaderToolInstalled.add(agent);
-          process.stderr.write("caseos-dispatch-gate: 领导 subagent 入口已绑定强制路由\n");
-        } catch (error) {
-          process.stderr.write(`caseos-dispatch-gate: 领导 subagent 注册失败（同名工具已被其他插件占用）: ${String(error)}\n`);
         }
         });
       } catch (error) {
@@ -324,9 +339,9 @@ const plugin = {
       if (!agent) return;
       try {
         await agent.ctx.inject(["tools"], (rtc) => {
-          if (rtc.tools.get(BASE_SUBAGENT_TOOL, agent) !== void 0) {
-            rtc.tools.restrict({ deny: [BASE_SUBAGENT_TOOL] });
-          }
+          const deny = [BASE_SUBAGENT_TOOL, LEADER_SUBAGENT_TOOL]
+            .filter((name) => rtc.tools.get(name, agent) !== void 0);
+          if (deny.length) rtc.tools.restrict({ deny });
         });
       } catch (error) {
         process.stderr.write(`caseos-dispatch-gate: 子代理基座工具隐藏失败: ${String(error)}\n`);
