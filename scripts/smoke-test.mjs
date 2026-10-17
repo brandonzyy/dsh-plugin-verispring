@@ -42,6 +42,7 @@ if (!clientText.includes("conversation.composer.dock")) fail("客户端未注册
 if (!clientText.includes("角色：")) fail("客户端路由展示栏未包含角色字段");
 if (!clientText.includes("渠道：")) fail("客户端路由展示栏未包含渠道字段");
 if (!clientText.includes("思考强度：")) fail("客户端路由展示栏未包含思考强度字段");
+if (!clientText.includes("subagentCatalog")) fail("客户端路由展示栏未读取子代理目录");
 
 const sourceFiles = [
   "client.js",

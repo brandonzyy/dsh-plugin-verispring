@@ -226,7 +226,7 @@ window.__ModuleLoader__.load({
       return "子代理";
     }
 
-    function SubagentRouteBar({ useSession, useSessions, useProjection }) {
+    function SubagentRouteBar({ useSession, useSessions, useProjection, resolveRole }) {
       const session = useSession(value => value);
       const sessionId = session?.sessionId;
       const title = useSessions(value => sessionId ? value.byId[sessionId]?.displayTitle ?? "" : "");
@@ -236,8 +236,9 @@ window.__ModuleLoader__.load({
       const provider = selection?.provider || "未知渠道";
       const model = selection?.model || "未知模型";
       const effort = selection?.reasoningEffort || "未标注";
+      const role = resolveRole?.(sessionId) || routeRole(title);
       return React.createElement("div", { style: routeBarStyle, role: "status" },
-        `角色：${routeRole(title)} · 渠道：${provider} · 模型：${model} · 思考强度：${effort}`,
+        `角色：${role} · 渠道：${provider} · 模型：${model} · 思考强度：${effort}`,
       );
     }
 
@@ -519,13 +520,24 @@ window.__ModuleLoader__.load({
     }
 
     const plugin = {
-      inject: ["slots", "configForms", "remote", "remote.session", "remote.credentials", "remote.llm"],
+      inject: ["slots", "sessions", "configForms", "remote", "remote.session", "remote.credentials", "remote.llm"],
       apply(ctx) {
         window.__VSP_CLIENT__.applied = true;
         ctx.slots.inject("conversation.composer.dock", () => ctx.slots.register({
           name: "conversation.composer.dock",
           id: "verispring-subagent-route",
           order: -100,
+          inject: (sessionId) => ({
+            resolveRole: () => {
+              const address = ctx.sessions.subagentAddress(sessionId);
+              const parent = address ? ctx.sessions.binding(address.parentSessionId) : undefined;
+              const entries = parent?.session.projections.faceOf("subagentCatalog").getSnapshot();
+              const index = Array.isArray(entries) ? entries.findIndex(entry => entry?.id === sessionId) : -1;
+              if (index === 0) return "测绘智能体";
+              if (index > 0) return "执行智能体";
+              return undefined;
+            },
+          }),
         }, SubagentRouteBar));
         try {
           clientRemote = ctx.remote;
