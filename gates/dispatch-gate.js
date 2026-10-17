@@ -169,7 +169,7 @@ const plugin = {
             const role = sessionState(session).scoutStarted ? "executor" : "scout";
             const route = loadRoutes()[role];
             const label = String(args.description ?? "").trim();
-            const roleLabel = `${role} · ${routeText(route)} · ${label}`;
+            const roleLabel = `${routeText(route)} · ${role} · ${label}`;
             const routedPrompt = `【实际路由：${role} · ${routeText(route)}】\n${String(args.prompt ?? "")}`;
             process.stderr.write(
               `caseos-dispatch-gate: 强制 ${role} 子代理 ${routeText(route)}\n`,
