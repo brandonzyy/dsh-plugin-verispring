@@ -49,8 +49,8 @@ window.__ModuleLoader__.load({
     };
     const menuValueStyle = { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" };
     const menuChevronStyle = { flex: "none", opacity: 0.65 };
-    const modelGridStyle = { display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 12, alignItems: "start" };
-    const modelCardStyle = { minWidth: 0, padding: 12, border: "0.5px solid var(--dsw-alias-border-l2)", borderRadius: "var(--dsw-radius-lg)", background: "var(--dsw-alias-bg-layer-2)" };
+    const modelGridStyle = { display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 12, alignItems: "stretch" };
+    const modelCardStyle = { minWidth: 0, height: "100%", boxSizing: "border-box", display: "flex", flexDirection: "column", padding: 12, border: "0.5px solid var(--dsw-alias-border-l2)", borderRadius: "var(--dsw-radius-lg)", background: "var(--dsw-alias-bg-layer-2)" };
     const modelHeadingStyle = { display: "flex", alignItems: "baseline", gap: 8, minWidth: 0, margin: "0 0 4px" };
     const modelAdviceStyle = { overflow: "hidden", color: "var(--dsw-alias-label-tertiary)", fontSize: 12, fontWeight: 400, whiteSpace: "nowrap", textOverflow: "ellipsis" };
     const credentialFieldStyle = { display: "flex", flexDirection: "column", gap: 6, padding: "2px 0 8px" };
@@ -418,8 +418,8 @@ window.__ModuleLoader__.load({
           React.createElement("span", { style: { flex: "none", color: "var(--dsw-alias-label-primary)", fontSize: 14 } }, "Embedding"),
           React.createElement("span", { style: modelAdviceStyle, title: "更换模型后需重新 sync 重建向量" }, "更换模型后需重新 sync 重建向量"),
         ),
-        textField("embeddingUrl", "端点", "向量嵌入服务地址", read("embeddingUrl"), disabled, edit),
-        textField("embeddingModel", "模型", "只填写模型名", read("embeddingModel"), disabled, edit),
+        textField("embeddingUrl", "端点", "", read("embeddingUrl"), disabled, edit),
+        textField("embeddingModel", "模型", "", read("embeddingModel"), disabled, edit),
         embeddingKeyField({ configured: embeddingCredential.configured, value: embeddingKeyDraft, disabled: !embeddingCredential.writable || saving, onEdit: setEmbeddingKeyDraft }),
       );
       const modelCard = (title, advice, providerKey, modelKey, effortKey) => React.createElement("section", { style: modelCardStyle },
