@@ -18,9 +18,10 @@ Verispring three-role session architecture plus a bundled local knowledge graph 
 The bundle patch also configures the subagent tool: `backgroundMode: continuable`, `maxDepth: 1`,
 and the executor persona; both presets turn `modelSelectionSettings` off on `tool-subagent`
 (routes are enforced per role, so model selection has no effect, and when it is on the `subagent`
-tool registers into each session's own layer where the routing wrapper cannot shadow it). In
-headless/CLI runs the process exits with the turn and background subagents are terminated with
-it — pass `run_in_background: false` to `subagent` to wait in the foreground for the delivery.
+tool registers into each session's own layer where the routing wrapper cannot shadow it). The
+dispatch entry uses DSH's official activation API and returns a child id immediately; use the
+child continuation tools for subsequent messages. In headless/CLI runs the process exits with
+the turn, so child work is not retained after the process ends.
 
 ## Context compaction (per role)
 

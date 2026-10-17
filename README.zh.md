@@ -18,8 +18,8 @@ Verispring 三角色会话架构 + 本地知识图谱 manon，大幅度优化主
 组合包 patch 还把子代理工具配置为：`backgroundMode: continuable`（后台可续派遣，`send_message`
 纠偏）、`maxDepth: 1`（不派孙代理）、执行层 persona；两个 preset 的 `tool-subagent` 关闭
 `modelSelectionSettings`（路由按角色强制注入，模型选择无效；开启时 `subagent` 工具注册进每个
-会话自己的层，路由包装无法遮蔽）。headless/CLI 场景进程随回合退出，后台子代理会被终止——派
-`subagent` 时传 `run_in_background: false` 即前台等待交付。
+会话自己的层，路由包装无法遮蔽）。派遣入口使用 DSH 官方 activation API，立即返回子代理 ID；
+后续消息通过子代理续接工具发送。headless/CLI 场景进程随回合退出，子代理工作不会在进程结束后保留。
 
 ## 上下文压缩（分角色）
 
