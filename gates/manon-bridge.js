@@ -12,7 +12,7 @@
 const KG_BIN_ENV = "MANON_KG_BIN";
 const SPEC = "Manon调用规则.md";
 
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -77,7 +77,7 @@ function dumpsEnvironment(command) {
 }
 
 const plugin = {
-  inject: ["systemPrompt", "tools", "profileContext"],
+  inject: ["systemPrompt", "tools", "profileContext", "sessionTitle"],
   apply(ctx) {
     const home = ctx.profileContext?.home ?? process.env.DSH_HOME ?? `${homedir()}/.dsh`;
     const sourcePrefix =
@@ -115,17 +115,45 @@ const plugin = {
       return undefined;
     });
     if (!kgOk) return;
+    // 角色化注入（设计：manon 是测绘专责，领导和执行都不直接调用）：
+    // - 测绘：完整命令面 + source 调用铁则 + 维护纪律；
+    // - 领导：只保留"图谱事实找测绘"，命令面与密钥前缀都不给；
+    // - 执行：一行说明（图谱事实从任务书拿，缺了在回报里提）。
+    const roleOf = (scope) => {
+      try {
+        const header = scope?.session?.header;
+        if (header?.origin !== "subagent" && header?.parentSession === void 0) return "leader";
+        const id = header?.id ?? header?.sessionId;
+        if (id) {
+          try {
+            const role = JSON.parse(readFileSync(`${home}/caseos/session-state/${id}.json`, "utf8")).role;
+            if (role === "scout" || role === "executor") return role;
+          } catch {}
+        }
+        const title = ctx.sessionTitle?.get?.(scope.session)?.title ?? "";
+        if (title.includes(" · scout · ")) return "scout";
+      } catch {}
+      return "executor";
+    };
     ctx.systemPrompt.section({
       name: "verispring:manon-kg",
       order: ctx.systemPrompt.getSectionOrder("TOOL_SUBAGENT"),
-      text: () =>
-        `本地图谱：${kg}（存储在 <项目>/.manon/，随仓库走；组件版首次运行自动建运行环境，需联网一次）。` +
-        `命令面：sync（增量建图，--full 全量）、query "词" -j（检索）、deep-query "问题"（多轮规划问答）、` +
-        `graph、impact、health、status。` +
-        `调用铁则：dsh 会剥掉子进程里 KEY/TOKEN 形状的环境变量，直接运行必报缺密钥——必须让 bash 命令自带密钥，` +
-        `统一用这个前缀：\`bash -c '${sourcePrefix}<子命令>'\`（例：${sourcePrefix}${kg} sync）。` +
-        `维护纪律：常驻测绘兵（scout）进仓先 sync 并把入口表落盘为仓库根 .project-map.md；其余会话只读查询，不 clear。` +
-        `语义与陷阱详见 ${home}/specs/${SPEC}，动手前先读。`,
+      text: (context) => {
+        const role = roleOf(context.scope);
+        if (role === "leader") {
+          return `本地图谱（manon，存储在 <项目>/.manon/）由常驻测绘智能体专责：sync 建图、入口表、语义查询都是它的活。你要图谱事实（结构、调用链、入口坐标）就 send_message 问测绘或写进任务书让它回报，不要自己运行 manon-kg。`;
+        }
+        if (role === "executor") {
+          return `本地图谱（<项目>/.manon/）由常驻测绘专责维护，你不直接调用 manon-kg；任务书没给而你又需要图谱事实时，在回报里写明缺失，由领导转测绘补齐。`;
+        }
+        return `本地图谱：${kg}（存储在 <项目>/.manon/，随仓库走；组件版首次运行自动建运行环境，需联网一次）。` +
+          `命令面：sync（增量建图，--full 全量）、query "词" -j（检索，默认已瘦身：紧凑字段+条数上限，全量加 --full）、` +
+          `deep-query "问题"（多轮规划问答）、graph、impact、health、status。图谱由你专责：领导与执行不直接调用。` +
+          `调用铁则：dsh 会剥掉子进程里 KEY/TOKEN 形状的环境变量，直接运行必报缺密钥——必须让 bash 命令自带密钥，` +
+          `统一用这个前缀：\`bash -c '${sourcePrefix}<子命令>'\`（例：${sourcePrefix}${kg} sync）。` +
+          `维护纪律：进仓先 sync 并把入口表落盘为仓库根 .project-map.md；main 前进后被派遣拦截时做增量校对并回报，` +
+          `由领导重写地图登记新基准。不 clear。语义与陷阱详见 ${home}/specs/Manon调用规则.md，动手前先读。`;
+      },
     });
   },
 };

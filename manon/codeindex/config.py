@@ -58,7 +58,14 @@ DEFAULT_EXCLUDE = [
     "**/node_modules/**",
     "**/.git/**",
 ]
-DEFAULT_LANGUAGES = ["python"]
+# 原生默认即全主流语言：任何仓开箱 sync 就是全语言索引，不做"检测到才算"的窄化。
+# 检测（quick_detect_languages）限深 5 层、限 500 文件，深路径语言（如 vendor 深处的
+# TS）会漏检，曾导致图谱只覆盖 Python——所以这里给全集，缺包语言自动降级不崩。
+# 与 requirements.txt 冻结的 tree-sitter 包一一对应，全部开箱可用。
+DEFAULT_LANGUAGES = [
+    "python", "typescript", "tsx", "javascript", "java", "php",
+    "go", "rust", "c", "cpp", "c_sharp", "ruby", "lua", "bash",
+]
 DEFAULT_PARALLEL_WORKERS = 4
 DEFAULT_BATCH_SIZE = 50
 
@@ -526,6 +533,10 @@ class Config:
         # Default: scan everything, rely on exclude rules
         include = ["."]
 
+        # 原生默认全主流语言：检测结果只用于补充（如运行时新装了语言包），不做窄化——
+        # 检测限深 5 层、限 500 文件，深路径语言会漏检，漏检即丢覆盖。
+        effective = set(DEFAULT_LANGUAGES) | set(languages)
+
         # Smart exclude based on detected languages
         exclude = DEFAULT_EXCLUDE.copy()
 
@@ -546,4 +557,4 @@ class Config:
                 "**/target/**", "**/.gradle/**", "**/.m2/**",
             ])
 
-        return cls(include=include, exclude=exclude, languages=list(languages))
+        return cls(include=include, exclude=exclude, languages=sorted(effective))

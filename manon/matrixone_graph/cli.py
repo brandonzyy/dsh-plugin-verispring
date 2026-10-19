@@ -240,6 +240,49 @@ def _hits_to_log(result) -> dict:
     }
 
 
+# query 默认输出瘦身：紧凑字段 + 条数上限。全量 payload 曾一次灌 5 万字符进会话上下文，
+# 是执行层不愿碰图谱的直接原因之一；`--full` 保留原行为作逃生口。
+_SLIM_DESC_CHARS = 160
+_SLIM_CHUNK_CHARS = 200
+_SLIM_MAX_ENTITIES = 40
+_SLIM_MAX_RELATIONS = 60
+
+
+def _slim_entity(d: dict) -> dict:
+    out = {k: d[k] for k in ("id", "kind", "name", "file_path", "line_start", "line_end", "score") if k in d}
+    for key, cap in (("description", _SLIM_DESC_CHARS), ("signature", _SLIM_DESC_CHARS)):
+        value = d.get(key)
+        if value:
+            out[key] = value[:cap] + ("…" if len(value) > cap else "")
+    return out
+
+
+def _slim_relation(r: dict) -> dict:
+    return {k: r.get(k) for k in ("src_id", "kind", "tgt_id") if k in r}
+
+
+def _slim_chunk(c: dict) -> dict:
+    out = {k: c[k] for k in ("id", "symbol_name", "file_path", "line_start", "line_end", "score") if k in c}
+    content = c.get("content")
+    if content:
+        out["content"] = content[:_SLIM_CHUNK_CHARS] + ("…" if len(content) > _SLIM_CHUNK_CHARS else "")
+    return out
+
+
+def _slim_result_payload(result) -> dict:
+    entities = result.entities[:_SLIM_MAX_ENTITIES]
+    relations = result.relations[:_SLIM_MAX_RELATIONS]
+    return {
+        "entities": [_slim_entity(e) for e in entities],
+        "relations": [_slim_relation(r) for r in relations],
+        "chunks": [_slim_chunk(c) for c in result.chunks],
+        "truncated": {
+            "entities": max(0, len(result.entities) - len(entities)),
+            "relations": max(0, len(result.relations) - len(relations)),
+        },
+    }
+
+
 @kg.command("deep-query")
 @click.argument("question")
 @click.option("--max-rounds", default=3, type=int, help="LLM 引导的追加查询轮数上限")
@@ -478,8 +521,9 @@ def sync(full: bool, json_output: bool):
 @click.argument("text")
 @click.option("--top-k", default=10, type=int, help="Number of results")
 @click.option("--depth", default=1, type=int, help="Graph traversal depth")
-@click.option("-j", "--json-output", is_flag=True, help="Output raw JSON")
-def query(text: str, top_k: int, depth: int, json_output: bool):
+@click.option("-j", "--json-output", is_flag=True, help="Output raw JSON (slim by default)")
+@click.option("--full", is_flag=True, help="输出完整 payload（不瘦身、不截断）")
+def query(text: str, top_k: int, depth: int, json_output: bool, full: bool):
     """语义查询知识图谱（需要 MANON_EMBEDDING_API_KEY，先 kg sync 建向量）."""
     import click
 
@@ -508,14 +552,34 @@ def query(text: str, top_k: int, depth: int, json_output: bool):
     result = _with_retry(lambda: _do())
 
     if json_output:
-        click.echo(json.dumps({
+        payload = {
             "entities": result.entities, "relations": result.relations,
             "chunks": result.chunks,
-        }, ensure_ascii=False, indent=2))
+        } if full else _slim_result_payload(result)
+        click.echo(json.dumps(payload, ensure_ascii=False, indent=2))
     elif result.context:
-        console.print(result.context)
+        text_out = result.context if full else _slim_context(result)
+        console.print(text_out)
     else:
         console.print("[yellow]No results found.[/yellow]")
+
+
+def _slim_context(result) -> str:
+    """非 JSON 输出的同源瘦身：沿用 pipeline 的 context 组装，但按 slim 上限截断条目。"""
+    lines = []
+    for e in result.entities[:_SLIM_MAX_ENTITIES]:
+        loc = f"{e.get('file_path', '')}:{e.get('line_start', '')}" if e.get("file_path") else ""
+        lines.append(f"- {e.get('id', '')} [{e.get('kind', '')}] {loc} score={e.get('score', '')}")
+    for r in result.relations[:_SLIM_MAX_RELATIONS]:
+        lines.append(f"  {r.get('src_id', '')} -{r.get('kind', '')}-> {r.get('tgt_id', '')}")
+    for c in result.chunks:
+        loc = f"{c.get('file_path', '')}:{c.get('line_start', '')}-{c.get('line_end', '')}"
+        lines.append(f"  chunk {loc} score={c.get('score', '')}")
+    dropped = len(result.entities) - min(len(result.entities), _SLIM_MAX_ENTITIES) \
+        + len(result.relations) - min(len(result.relations), _SLIM_MAX_RELATIONS)
+    if dropped > 0:
+        lines.append(f"(…另有 {dropped} 条未展示；需要全量加 --full)")
+    return "\n".join(lines)
 
 
 @kg.command()

@@ -76,7 +76,7 @@ const plugin = {
       text: (context) =>
         isSubagent(context.scope)
           ? ""
-          : "分工（强制，无规模例外）：一切执行类工作——读码、改码、跑测试与门禁、查 Manon 图谱、检索——一律派 subagent 完成；你只指挥、复核与验收，不亲自改码。子代理后台运行，运行中可 send_message 纠偏、interrupt_agent 叫停。" +
+          : "分工（强制，无规模例外）：一切执行类工作——读码、改码、跑测试与门禁、检索——一律派 subagent 完成；Manon 图谱是常驻测绘的专责工具（sync/query/deep-query 都由它做），你要图谱事实就问测绘。你只指挥、复核与验收，不亲自改码。子代理后台运行，运行中可 send_message 纠偏、interrupt_agent 叫停。" +
             scoutClause +
             "回执与验收（强制）：测绘/执行子代理完成任务时会第一时间自动送来回执（含收尾报告）并唤醒你，测绘的回报也以消息直达，无需任何等待动作。因此：派遣完成后直接结束本回合等回执；禁止用 sleep 循环、bash 停顿、只读占位子代理或反复 list_agents 来轮询等待。给出最终答复前，所有已派工作必须已回执并经你验收；若某项回执远超预期时长仍未到，用一次 list_agents 查状态，必要时 interrupt_agent 叫停后重派。",
     });
