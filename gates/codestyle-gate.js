@@ -8,6 +8,7 @@ const MARKER = "# 代码写作规范";
 const SPEC_FRAGMENT = "specs/代码写作规范.md";
 
 import { homedir } from "node:os";
+import { monitorEvent } from "./monitor-log.js";
 const SHAPE_REASON =
   "提交门禁要求使用 `git commit -F <提交信息文件> -- <显式路径...>`；禁止 -a/-am、-m 或省略显式路径。";
 
@@ -15,12 +16,49 @@ const SHAPE_REASON =
 // 否则 `git -C commit status`（目录名恰为 commit）会把选项值误判成子命令。
 const GIT_OPTS_WITH_VALUE = new Set(["-c", "-C", "--exec-path", "--git-dir", "--work-tree", "--namespace", "--super-prefix"]);
 
+// 常见包装命令：`timeout 1500 git commit`、`env FOO=1 git commit` 这类必须穿透到内层 git，
+// 否则提交门禁对它们完全失明（实测 caseos 里执行者就用 timeout 给 commit 兜底）。
+const COMMIT_WRAPPERS = new Set(["timeout", "nice", "env", "nohup", "stdbuf", "command", "time"]);
+const WRAPPER_FLAGS_WITH_VALUE = new Set(["-u", "-S", "-n", "--adjustment", "-k", "--kill-after", "-s", "--signal"]);
+
+// 跳过 git 之前的包装命令及其参数，返回可能是 git 的下标。
+function skipWrapperTokens(tokens, i) {
+  while (i < tokens.length && COMMIT_WRAPPERS.has(tokens[i])) {
+    const wrapper = tokens[i];
+    i++;
+    let durationConsumed = false;
+    while (i < tokens.length) {
+      const t = tokens[i];
+      if (t.startsWith("-")) {
+        const flagTakesValue = WRAPPER_FLAGS_WITH_VALUE.has(t) &&
+          i + 1 < tokens.length && tokens[i + 1] !== "git" && !COMMIT_WRAPPERS.has(tokens[i + 1]);
+        i += flagTakesValue ? 2 : 1;
+        continue;
+      }
+      if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(t)) { i++; continue; }
+      // timeout 的时长只消费一个裸令牌，否则 `timeout 1500 bash -c "git commit…"` 会把 bash 吞掉
+      if (wrapper === "timeout" && !durationConsumed && t !== "git" && !COMMIT_WRAPPERS.has(t)) {
+        durationConsumed = true;
+        i++;
+        continue;
+      }
+      break;
+    }
+  }
+  return i;
+}
+
+function nextGitIndex(tokens) {
+  let i = 0;
+  while (i < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[i])) i++;
+  return skipWrapperTokens(tokens, i);
+}
+
 // 复合命令按 shell 分隔符切段后逐段判定；bash -c 的内层命令递归。
 function isGitCommitCommand(command) {
   for (const segment of String(command).split(/(?:&&|\|\||;|\n|\(|\))/)) {
     const tokens = segment.trim().replace(/^[('"` ]+/, "").split(/\s+/).filter(Boolean);
-    let i = 0;
-    while (i < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[i])) i++;
+    const i = nextGitIndex(tokens);
     if (i >= tokens.length) continue;
     if (tokens[i] === "bash" || tokens[i] === "sh") {
       const joined = tokens.slice(i).join(" ");
@@ -29,19 +67,19 @@ function isGitCommitCommand(command) {
       continue;
     }
     if (tokens[i] !== "git") continue;
-    i++;
-    while (i < tokens.length) {
-      const t = tokens[i];
-      if (GIT_OPTS_WITH_VALUE.has(t)) { i += 2; continue; }
-      if (t.startsWith("-")) { i++; continue; }
+    let j = i + 1;
+    while (j < tokens.length) {
+      const t = tokens[j];
+      if (GIT_OPTS_WITH_VALUE.has(t)) { j += 2; continue; }
+      if (t.startsWith("-")) { j++; continue; }
       break;
     }
-    if (tokens[i] === "bash" || tokens[i] === "sh") {
-      const inner = /-c\s+(.+)$/s.exec(tokens.slice(i).join(" "));
+    if (tokens[j] === "bash" || tokens[j] === "sh") {
+      const inner = /-c\s+(.+)$/s.exec(tokens.slice(j).join(" "));
       if (inner) return hasSafeCommitShape(inner[1].replace(/^['"]|['"]$/g, ""));
       continue;
     }
-    if (tokens[i] === "commit") return true;
+    if (tokens[j] === "commit") return true;
   }
   return false;
 }
@@ -49,18 +87,17 @@ function isGitCommitCommand(command) {
 function hasSafeCommitShape(command) {
   for (const segment of String(command).split(/(?:&&|\|\||;|\n|\(|\))/)) {
     const tokens = segment.trim().replace(/^[('"` ]+/, "").split(/\s+/).filter(Boolean);
-    let i = 0;
-    while (i < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[i])) i++;
+    const i = nextGitIndex(tokens);
     if (tokens[i] !== "git") continue;
-    i++;
-    while (i < tokens.length) {
-      const t = tokens[i];
-      if (GIT_OPTS_WITH_VALUE.has(t)) { i += 2; continue; }
-      if (t.startsWith("-")) { i++; continue; }
+    let j = i + 1;
+    while (j < tokens.length) {
+      const t = tokens[j];
+      if (GIT_OPTS_WITH_VALUE.has(t)) { j += 2; continue; }
+      if (t.startsWith("-")) { j++; continue; }
       break;
     }
-    if (tokens[i] !== "commit") continue;
-    const args = tokens.slice(i + 1);
+    if (tokens[j] !== "commit") continue;
+    const args = tokens.slice(j + 1);
     const separator = args.indexOf("--");
     const messageIndex = args.findIndex((token) => token === "-F" || token === "--file");
     return separator >= 0 && messageIndex >= 0 && messageIndex + 1 < separator && separator + 1 < args.length &&
@@ -103,11 +140,23 @@ const plugin = {
         command = typeof exec.arguments?.command === "string" ? exec.arguments.command : "";
       } catch {}
       if (!isGitCommitCommand(command)) return undefined;
-      if (!hasSafeCommitShape(command)) return SHAPE_REASON;
+      const deny = (reason) => {
+        monitorEvent(dshHome, {
+          kind: "gate-deny",
+          gate: "codestyle",
+          tool: exec.name,
+          session: exec.agent?.session?.header?.id,
+          reason: reason.slice(0, 160),
+        });
+        return reason;
+      };
+      if (!hasSafeCommitShape(command)) return deny(SHAPE_REASON);
       if (readSessions.get(exec.agent?.session)) return undefined;
-      return denyReason;
+      return deny(denyReason);
     });
   },
 };
+
+export { isGitCommitCommand, hasSafeCommitShape };
 
 export default plugin;

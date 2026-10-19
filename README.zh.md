@@ -8,12 +8,18 @@ Verispring 三角色会话架构 + 本地知识图谱 manon，大幅度优化主
 | # | 门禁 | 行为 |
 |---|---|---|
 | 1 | 派遣规范门 | `subagent` / `subagent_fork` 前本会话必须出现过《子代理派遣规范》内容（读结果含规范首行标记即记为已读；状态持久化在会话日志里，跨进程重启不丢） |
-| 2 | scout 常驻 | 每会话首笔派遣由运行时定为测绘（description 只是展示标签）；测绘常驻后重复派遣拒绝，指路 `send_message` 复用；逃生口 `touch /tmp/dsh-caseos-scout-reset-<pid>`（拒绝信息里带路径），重置动作同样持久化 |
-| 3 | 地图前置 | 非测绘派遣要求 `<会话工作区>/.project-map.md` 存在（`.git`/`.manon` 在场才认定项目根，否则 fail-open） |
+| 2 | scout 常驻 | 每会话首笔派遣由运行时定为测绘（description 只是展示标签）；测绘常驻后重复派遣拒绝，指路 `send_message` 复用；逃生口 `touch /tmp/dsh-caseos-scout-reset-<pid>`（拒绝信息里带路径），重置动作同样持久化。子代理角色 spawn 时落盘（`session-state/<子会话id>.json`），重载后按落盘角色与标题恢复，测绘不再被静默重归类为执行 |
+| 3 | 地图前置 + 新鲜度 | 非测绘派遣要求 `<会话工作区>/.project-map.md` 存在（`.git`/`.manon` 在场才认定项目根，否则 fail-open）；且 main 自上次地图登记后又前进过时拒绝执行派遣，指路测绘增量校对 + 重写地图登记新基准（`write` 该文件即登记当前 HEAD；首建前与 `CASEOS_SCOUT=0` 时 fail-open） |
 | 4 | 模型钉死 | 路由在运行时按角色强制注入：首笔派遣走面板测绘路由，其后走执行路由；调用里显式写的 `provider`/`model` 一律忽略。`subagent_fork` 一律拒绝 |
-| 5 | 提交门 | `git commit` 前必须先读 `~/.dsh/specs/代码写作规范.md` |
-| 6 | 领导面限定 | 领导会话工具面收缩到复核五件（`bash`/`edit`/`write`/`read`/`read_image`）+ 派遣面（`subagent`/`send_message`/`interrupt_agent`/`list_agents`），名单与领导视图里实际存在的工具取交集（桌面工具在 preset 层，headless 在根层），派遣工具以瘦身定义遮蔽；测绘/执行子代理用 `verispring-subagent` preset 的全量工具面，测绘随派遣请求硬禁 `edit`/`write`。逃生开关 `CASEOS_SCOUT=0` 关闭分工条款中的测绘部分 |
+| 5 | 提交门 | `git commit` 前必须先读 `~/.dsh/specs/代码写作规范.md`；提交形状强制 `-F 文件 -- 显式路径`，`timeout`/`env`/`nice`/`nohup`/`stdbuf` 等包装命令穿透识别 |
+| 6 | 领导面限定 | 领导会话工具面收缩到复核五件（`bash`/`edit`/`write`/`read`/`read_image`）+ 派遣面（`subagent`/`send_message`/`interrupt_agent`/`list_agents`），名单与领导视图里实际存在的工具取交集（桌面工具在 preset 层，headless 在根层），派遣工具以瘦身定义遮蔽；`subagent-base` 在 root 层无条件隐藏（路由执行体异常时模型无路可绕）。测绘/执行子代理用 `verispring-subagent` preset 的全量工具面，测绘随派遣请求硬禁 `edit`/`write`。逃生开关 `CASEOS_SCOUT=0` 关闭分工条款中的测绘部分 |
 | 7 | manon 桥接 | 解析本地图谱 CLI（`MANON_KG_BIN` > 组件自带 `manon/manon-kg` > 旧地 `~/manon/manon-kg`），存在则向所有会话注入精简用法：命令面、存储位置、scout 维护纪律、语义详见 `~/.dsh/specs/Manon调用规则.md`。**承重墙是调用铁则**：dsh 子进程服务会把 KEY/TOKEN 形状的环境变量从子进程剥掉（防泄漏），直接跑 `manon-kg sync` 必报缺密钥——注入的调用式让 bash 命令先 `source ~/.dsh/manon.env` 再执行（清洗只剥第一层，孙进程自由继承）。密钥值不经过也不打印 |
+| 8 | 密钥卫生 | 凭据/环境文件（`manon.env`、`verispring.env`、项目 `.env*`）禁止 read、禁止用 `cat`/`sed` 等命令输出（按命令段判定，受控 source 与 manon 输出管道不误伤）；无参数 `env`/`printenv`、`ps eww`、`/proc/*/environ`、无 `--format` 的 `docker inspect` 这类整环境倾倒一律拦截 |
+| 9 | 运行监控 | 角色漂移、门禁拦截、scout 重置、子代理 start/end（角色 + 路由 + 停止原因）追加落盘 `~/.dsh/verispring-monitor.jsonl`，事后审计无需解压会话日志 |
+
+## 回执制（不轮询）
+
+子代理完成任务时 DSH 会把结算回执（含收尾报告）注入领导收件箱并唤醒领导回合；测绘的回报以消息直达。领导系统提示已改为：派遣后直接结束回合等回执，禁止 sleep 循环、占位子代理或反复 `list_agents` 轮询；全部回执验收后才给最终答复。
 
 组合包 patch 还把子代理工具配置为：`backgroundMode: continuable`（后台可续派遣，`send_message`
 纠偏）、`maxDepth: 1`（不派孙代理）、执行层 persona；两个 preset 的 `tool-subagent` 关闭

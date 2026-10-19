@@ -16,8 +16,14 @@ import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { monitorEvent } from "./monitor-log.js";
 
 const SECRET_FILES = new Set(["manon.env", "verispring.env"]);
+// 项目侧环境文件（值会连 key 一起进会话日志）：.env、*.env、.env.local 等；
+// example/template/sample 是给仓库看的占位，放行。
+const ENV_FILE_RE = /(?:^|\/)[A-Za-z0-9._-]*\.env(?:\.[A-Za-z0-9_-]+)?$/;
+const ENV_FILE_EXEMPT = /(?:example|template|sample|dist)\.?$/i;
+const READER_VERB_RE = /(?<![\w.])(?:cat|head|tail|less|more|sed|awk|cut|grep|rg|strings|xxd|base64|jq)\b/;
 
 function shellDoubleQuote(value) {
   return `"${String(value).replaceAll("\\", "\\\\").replaceAll("\"", "\\\"").replaceAll("$", "\\$").replaceAll("`", "\\`")}"`;
@@ -26,13 +32,48 @@ function shellDoubleQuote(value) {
 function isSecretFile(value) {
   if (typeof value !== "string") return false;
   const normalized = value.replaceAll("\\", "/");
-  return SECRET_FILES.has(normalized.split("/").at(-1));
+  const base = normalized.split("/").at(-1);
+  if (SECRET_FILES.has(base)) return true;
+  return ENV_FILE_RE.test(base) && !ENV_FILE_EXEMPT.test(base);
 }
 
+function segmentsOf(command) {
+  return String(command ?? "").split(/(?:&&|\|\||;|\||\n)/);
+}
+
+// 判定改为按命令段：读取动词与密钥文件名必须出现在同一段才算读取。
+// 这样受控调用式（[ -f ... ] && source 的段没有读取动词）和给 manon-kg 输出接管道
+// （manon-kg query … | head，该段没有密钥文件名）都不再误伤；`cat manon.env`、
+// `sed … demo-executor.env` 依然拦截。
 function readsSecretFile(command) {
+  for (const segment of segmentsOf(command)) {
+    if (!READER_VERB_RE.test(segment)) continue;
+    if ([...SECRET_FILES].some((name) => segment.includes(name))) return true;
+    const match = /([A-Za-z0-9._/-]*\.env(?:\.[A-Za-z0-9_-]+)?)/.exec(segment);
+    if (match && !ENV_FILE_EXEMPT.test(match[1])) return true;
+  }
+  return false;
+}
+
+// 整环境倾倒：无参数的 env/printenv（含 sudo、docker exec、$() 内；env 只带赋值也视为
+// 倾倒）、ps 的 e/eww 旗标、/proc/*/environ、无 --format 的 docker inspect（整个 Env
+// 数组都会进结果）。
+function dumpsEnvironment(command) {
   const text = String(command ?? "");
-  if (!/(?<![\w.])(?:cat|head|tail|sed|awk|cut|env|printenv|grep|rg)\b/.test(text)) return false;
-  return [...SECRET_FILES].some((name) => text.includes(name));
+  for (const segment of segmentsOf(text)) {
+    const tokens = segment.trim().split(/\s+/).filter(Boolean);
+    for (let i = 0; i < tokens.length; i++) {
+      if (tokens[i] === "env" || tokens[i] === "printenv") {
+        const rest = tokens.slice(i + 1);
+        const isDump = rest.length === 0 || rest.every((token) => /^[A-Za-z_][A-Za-z0-9_]*=/.test(token));
+        if (isDump) return true;
+      }
+    }
+    if (/(^|\s)ps\s/.test(segment) && /(?:^|\s)\S*(?:eww|wwE)\S*/.test(segment)) return true;
+    if (/\/proc\/\d+\/environ\b/.test(segment)) return true;
+    if (/\bdocker\s+(?:compose\s+)?inspect\b/.test(segment) && !segment.includes("--format")) return true;
+  }
+  return false;
 }
 
 const plugin = {
@@ -47,12 +88,29 @@ const plugin = {
     const kg = process.env[KG_BIN_ENV] ?? (existsSync(bundled) ? bundled : legacy);
     const kgOk = existsSync(kg);
     process.stderr.write(`manon-bridge: activated; kg=${kg}${kgOk ? "" : " (missing -> 用法注入跳过)"}\n`);
+    const deny = (exec, rule, reason) => {
+      monitorEvent(home, {
+        kind: "gate-deny",
+        gate: "manon-bridge",
+        rule,
+        tool: exec.name,
+        session: exec.agent?.session?.header?.id,
+        reason: reason.slice(0, 160),
+      });
+      return reason;
+    };
     ctx.tools.guard((exec) => {
       if (exec.name === "read" && isSecretFile(exec.arguments?.path ?? exec.arguments?.file ?? exec.arguments?.file_path)) {
-        return "凭据文件只允许由受控 manon 调用式 source；禁止用 read 读取并写入会话日志。";
+        return deny(exec, "secret-file", "凭据/环境文件只允许由受控调用式 source 注入；禁止用 read 读取——内容会原样写进会话日志。");
       }
-      if (exec.name === "bash" && readsSecretFile(exec.arguments?.command)) {
-        return "凭据文件禁止用命令输出；只允许在 manon 调用式中 source 后执行目标子命令。";
+      if (exec.name === "bash") {
+        const command = exec.arguments?.command;
+        if (readsSecretFile(command)) {
+          return deny(exec, "secret-file", "凭据/环境文件禁止用命令输出；只允许在受控调用式里 source 后执行目标子命令。");
+        }
+        if (dumpsEnvironment(command)) {
+          return deny(exec, "env-dump", "这条命令会把整个环境（含密钥）倾倒进会话日志。请只查具体变量：`docker exec <容器> printenv <变量名>`；查看镜像配置用 `docker inspect --format`；看进程列表用 `ps aux`（不带 e/eww）。");
+        }
       }
       return undefined;
     });
@@ -72,5 +130,5 @@ const plugin = {
   },
 };
 
-export { readsSecretFile };
+export { readsSecretFile, dumpsEnvironment, isSecretFile };
 export default plugin;
