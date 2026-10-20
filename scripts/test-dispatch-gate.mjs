@@ -698,13 +698,13 @@ test("派遣回执保留 started subagent 前缀并附路由与角色，测绘�
   const takeover = await harness.dispatch({ description: "随便写", prompt: "增量校对" });
   const takeoverText = harness.receipt(takeover);
   assert.ok(takeoverText.startsWith(`started subagent ${takeover.subagentId}`), `前缀必须原样保留：${takeoverText}`);
-  assert.match(takeoverText, /（路由：verispring\/deepseek-flash@high · 角色：scout）/);
+  assert.match(takeoverText, /（路由：verispring-ds\/deepseek-flash@high · 角色：scout）/);
   assert.match(takeoverText, /已接替不可达测绘 scout-A/);
 
   const executor = await harness.dispatch({ description: "改代码", prompt: "把 a 改成 b" });
   const executorText = harness.receipt(executor);
   assert.ok(executorText.startsWith(`started subagent ${executor.subagentId}`));
-  assert.match(executorText, /（路由：verispring\/deepseek-flash@high · 角色：executor）/);
+  assert.match(executorText, /（路由：verispring-ds\/deepseek-flash@high · 角色：executor）/);
   assert.doesNotMatch(executorText, /已接替不可达测绘/);
 });
 
