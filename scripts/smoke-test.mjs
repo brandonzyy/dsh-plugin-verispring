@@ -52,7 +52,7 @@ if (!codestyleText.includes("ctx.profileContext?.home") || !codestyleText.includ
 if (!dispatchText.includes("${routeText(route)} · ${role} · ${label}")) fail("子代理显示标题未包含实际模型路由");
 if (!dispatchText.includes("【实际路由：${role} · ${routeText(route)}】")) fail("子代理任务未携带实际模型路由元信息");
 if (!dispatchText.includes("sessionTitle.rename(agent.session, title)")) fail("子代理标题未调用 DSH sessionTitle.rename");
-if (!dispatchText.includes("ctx.sessionTitle ?? ctx.get(\"sessionTitle\")")) fail("子代理未使用官方 sessionTitle 服务");
+if (!dispatchText.includes('get("sessionTitle")')) fail("子代理未使用官方 sessionTitle 服务");
 if (!dispatchText.includes("renameChildTitleAfterAutoTitle(live, child.childId, roleLabel)")) fail("子代理启动完成后未延迟写入持久标题");
 if (dispatchText.includes("hasChildAgent(ctx.agents") || dispatchText.includes("applyChildRoute(ctx.agents.get")) fail("派遣执行体仍在使用 apply 闭包上下文（重载后 inactive context 事故根源）");
 if (!clientText.includes("conversation.composer.dock")) fail("客户端未注册子代理路由展示栏");
