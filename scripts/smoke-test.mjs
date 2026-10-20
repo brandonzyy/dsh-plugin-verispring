@@ -73,6 +73,13 @@ for (const file of sourceFiles) {
   catch (error) { fail(String(error)); }
 }
 
+// ask_scout / 结构增量转交 / 检查点续接的运行时实现必须被组合配置装载，否则三条闭环
+// 只在提示词里存在；它的 node --check 由上面按 gates/*.js 展开的检查覆盖。
+if (!sourceFiles.includes(join("gates", "scout-relay.js"))) fail("gates/scout-relay.js 未进入语法检查面");
+if (!patchText.includes("id: caseos-scout-relay") || !patchText.includes("'./gates/scout-relay.js'")) {
+  fail("cordis.patch.yml 未注册 caseos-scout-relay 门禁");
+}
+
 const dsh = process.env.DSH_BIN;
 const profile = process.env.DSH_SMOKE_PROFILE;
 if (dsh && profile) {

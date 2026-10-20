@@ -449,6 +449,8 @@
       name: './gates/leader-scope.js'
     - id: caseos-manon-bridge
       name: './gates/manon-bridge.js'
+    - id: caseos-scout-relay
+      name: './gates/scout-relay.js'
     # 配置面板：Config schema 提供宿主表单服务；client 组合包页渲染并把模型位落盘到执法面
     - id: verispring-config
       name: './gates/verispring-config.js'
