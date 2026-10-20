@@ -447,6 +447,10 @@
       name: './gates/codestyle-gate.js'
     - id: caseos-leader-scope
       name: './gates/leader-scope.js'
+    # 回执制与「领导不亲自改码」的运行时拒绝；守卫内部按 exec.agent 自判领导会话，
+    # 子代理会话不受限，所以只挂这一处（子代理 preset 不再挂），CASEOS_LEADER_GUARD=0 关闭。
+    - id: caseos-leader-guard
+      name: './gates/leader-guard.js'
     - id: caseos-manon-bridge
       name: './gates/manon-bridge.js'
     # 配置面板：Config schema 提供宿主表单服务；client 组合包页渲染并把模型位落盘到执法面
