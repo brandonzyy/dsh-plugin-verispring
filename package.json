@@ -30,7 +30,8 @@
     "./manon-bridge": "./gates/manon-bridge.js",
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json",
-    "./client": "./client.js"
+    "./client": "./client.js",
+    "./deepseek-gateway": "./gates/deepseek-gateway.js"
   },
   "files": [
     "icon.svg",
