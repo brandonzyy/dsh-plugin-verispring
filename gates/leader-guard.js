@@ -1,9 +1,16 @@
-// 领导会话的代码级门禁：把「回执制、不轮询」与「领导不亲自执行」从提示词约束
-// 变成运行时拒绝。只对领导会话（根会话 agent）生效，子代理会话不受限；
-// CASEOS_LEADER_GUARD=0 在装配时整体关闭。
+// 领导会话的代码级门禁：
+// - 拒绝类（不变）：有子代理运行时的 sleep 与循环等待、同一回合第二次 list_agents——轮询
+//   等待是回执制明令禁止的行为，只能拦；
+// - 提示类（v1.3.66 起）：edit/write 写出白名单、bash 里的变更命令（git 变更、包管理、
+//   原地编辑、递归删除、工作区重定向）不再拒绝，改为在工具结果后追加一段给模型的提示
+//   （宿主 tools/post-execute 的 additionalContexts），同一回合只提示一次，落 monitor
+//   leader-write-hint（规则名 + 摘要）。写码该由执行子代理承担，但领导的验收、地图、报告
+//   与小修正不该被硬拦——拒绝只会逼着绕路。
+// 只对领导会话（根会话 agent）生效，子代理会话不受限；CASEOS_LEADER_GUARD=0 整体关闭。
 // 运行中的子代理以宿主注册表为准（与 list_agents 读同一 status 字段）；归属认运行时
 // owner 与持久 session 血缘两条。事件计数不可用：subagent/start 的监听器只收到子代理
 // 身份，父代理只作为 dispatch 接收者出现，拿不到它去归属。
+import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { monitorEvent } from "./monitor-log.js";
@@ -20,7 +27,20 @@ const GIT_MUTATIONS = new Set(["commit", "push", "merge", "rebase", "cherry-pick
 const GIT_STASH_READ_ONLY = new Set(["list", "show"]);
 const GIT_OPTIONS_WITH_VALUE = new Set(["-C", "-c", "--git-dir", "--work-tree", "--namespace"]);
 const WRAPPERS = new Set(["sudo", "time", "nohup", "command", "exec", "env"]);
-const WHITELIST_TEXT = [".project-map.md", "路径含 /reports/", "~/.dsh/AGENTS.md"];
+// 提示文案：写给模型看的分工提示，不再作为拒绝。
+const HINT_TEXT =
+  "提示：有明确边界的代码和写作任务，请交给执行子代理（subagent）；领导自己只做小修正、地图、报告和验收所需的写入";
+const HINT_SOURCE = { kind: "verispring-leader-write-hint", form: "notice" };
+
+// 提示消息与宿主 createUserMessage 同形：id/role/content/source 是会话日志的校验面。
+function hintMessage(text, summary) {
+  return {
+    id: randomUUID(),
+    role: "user",
+    content: [{ type: "text", text }],
+    source: { ...HINT_SOURCE, summary },
+  };
+}
 
 function argsOf(exec) {
   try {
@@ -266,10 +286,9 @@ const plugin = {
       agentInstructions: new Set([resolve(join(home, "AGENTS.md")), resolve(homedir(), ".dsh", "AGENTS.md")]),
       writePrefixes: configuredWritePrefixes(),
     };
-    const writeReason =
-      `领导不亲自改码：请派执行子代理（subagent）完成；白名单：${[...WHITELIST_TEXT, ...policy.writePrefixes].join("、")}`;
     const turns = new WeakMap();
     const lastListTurn = new WeakMap();
+    const hintedTurn = new WeakMap();
     // 回合边界 = 领导会话自己的 turn/start：用户消息与回执唤醒都会开新回合，
     // 运行中子代理开停不会（否则中途派遣会把限流白白重置）。
     ctx.on("session/event", (session, event) => {
@@ -287,14 +306,57 @@ const plugin = {
       });
       return reason;
     };
-    // 服务从活上下文现取（面板改配置会重跑 apply，apply 闭包里的旧作用域会失活）。
+    // 服务从活上下文现取（面板改配置会重跑 apply，apply 闭包里的旧作用域会失活）；属性读取
+    // 只在声明过 agents 的作用域上合法，先 get() 再退回属性。
     const liveAgents = (exec) => {
+      const scope = exec?.agent?.ctx;
       try {
-        return exec?.agent?.ctx?.agents ?? ctx.agents;
+        const value = scope?.get?.("agents");
+        if (value !== void 0) return value;
+      } catch {}
+      try {
+        return scope?.agents ?? ctx.agents;
       } catch {
         return ctx.agents;
       }
     };
+    // 提示判定与拒绝判定同源：同一个规则函数，只是处置从「拒绝」改成「提示」。
+    const hintRule = (exec) => {
+      const args = argsOf(exec);
+      if (exec.name === "edit" || exec.name === "write") {
+        const path = args.file_path ?? args.path ?? args.file;
+        if (allowsWrite(path, policy)) return undefined;
+        return { rule: "write-whitelist", summary: String(path ?? "(无路径)") };
+      }
+      if (exec.name !== "bash") return undefined;
+      const command = typeof args.command === "string" ? args.command : "";
+      const rule = bashMutationRule(command);
+      return rule === void 0 ? undefined : { rule, summary: command };
+    };
+    // 提示的非阻断路径：宿主 tools/post-execute 的 additionalContexts 会作为下一条用户消息
+    // 追加进上下文，调用本身照常执行。同一回合只提示一次（首个命中的写入才提示）。
+    ctx.on("tools/post-execute", async (exec, result, next) => {
+      const downstream = await next();
+      if (!isLeaderAgent(exec?.agent)) return downstream;
+      const hint = hintRule(exec);
+      if (!hint) return downstream;
+      const session = exec.agent.session;
+      const turn = turns.get(session) ?? 0;
+      if (hintedTurn.get(session) === turn) return downstream;
+      hintedTurn.set(session, turn);
+      monitorEvent(home, {
+        kind: "leader-write-hint",
+        gate: "leader-guard",
+        rule: hint.rule,
+        tool: exec.name,
+        session: exec.agent?.session?.header?.id,
+        summary: hint.summary.slice(0, SUMMARY_LIMIT),
+      });
+      return {
+        ...downstream,
+        additionalContexts: [hintMessage(HINT_TEXT, hint.rule), ...(downstream.additionalContexts ?? [])],
+      };
+    });
     ctx.tools.guard((exec) => {
       if (!isLeaderAgent(exec?.agent)) return undefined;
       const args = argsOf(exec);
@@ -305,17 +367,10 @@ const plugin = {
         lastListTurn.set(session, turn);
         return undefined;
       }
-      if (exec.name === "edit" || exec.name === "write") {
-        const path = args.file_path ?? args.path ?? args.file;
-        if (allowsWrite(path, policy)) return undefined;
-        return deny(exec, "write-whitelist", writeReason, String(path ?? "(无路径)"));
-      }
       if (exec.name !== "bash") return undefined;
-      const command = typeof args.command === "string" ? args.command : "";
-      const mutation = bashMutationRule(command);
-      if (mutation !== undefined) return deny(exec, mutation, writeReason, command);
       const running = runningChildCount(liveAgents(exec), exec.agent);
       if (running === 0) return undefined;
+      const command = typeof args.command === "string" ? args.command : "";
       const pauseReason = `有子代理在运行（${running} 个）：${PAUSE_TEXT}`;
       if (sleepsInLoop(command)) return deny(exec, "sleep-in-loop", pauseReason, command);
       if (sleepSecondsOf(command) > SLEEP_LIMIT_SECONDS) return deny(exec, "sleep-long", pauseReason, command);

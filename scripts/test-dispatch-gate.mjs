@@ -100,57 +100,87 @@ function makeHarness(options = {}) {
   };
   services.subagents = subagents;
 
-  // root 层：静态入口；options.scopedOnly 时模拟"全局注册不可用"，只能挂在会话层。
-  const rootTools = new Map();
-  const ctx = {
+  // root 层服务：tools 用 root 注册表。
+  const rootTools = { get: (name) => rootToolsOf.get(name) };
+  const rootToolsOf = new Map();
+  const rootToolsService = {
+    guard: (callback) => guards.push(callback),
+    register: (definition) => {
+      if (options.scopedOnly) throw new Error('cannot get required service "tools" in inactive context');
+      rootToolsOf.set(definition.name, definition);
+    },
+    get: (name) => rootToolsOf.get(name),
+    // 宿主语义：root 层没有 scope，restrict 必抛；门禁不得依赖它。
+    restrict: () => {
+      throw new Error('cannot get required service "tools" in inactive context');
+    },
+  };
+  // 宿主 cordis 语义（cordis/lib/index.js 的 ReflectService.handler.get）：未在该作用域
+  // inject 链里声明的服务，属性访问抛 cannot get property "<name>" without inject；get()
+  // 不要求 inject。领导/子代理作用域继承 agent-loop 的 inject（agents、tools、sessions…），
+  // 但不含 subagents 与 sessionController——直取 .subagents 就是线上故障 1 的形态。
+  const agentInject = options.agentInject ?? ["agents", "tools", "sessions", "sessionTitle", "sessionProjections"];
+  const serviceCtx = (own, injected, overrides = {}) => new Proxy(own, {
+    get(target, prop, receiver) {
+      if (Reflect.has(target, prop)) return Reflect.get(target, prop, receiver);
+      if (typeof prop !== "string") return void 0;
+      const value = overrides[prop] ?? services[prop];
+      if (value === void 0) return void 0;
+      if (injected.includes(prop)) return value;
+      throw new Error(`cannot get property "${prop}" without inject`);
+    },
+  });
+  const ctx = serviceCtx({
     profileContext: { home },
     get: (name) => services[name],
     on: (name, callback) => listeners.set(name, [...(listeners.get(name) ?? []), callback]),
-    tools: {
-      guard: (callback) => guards.push(callback),
-      register: (definition) => {
-        if (options.scopedOnly) throw new Error('cannot get required service "tools" in inactive context');
-        rootTools.set(definition.name, definition);
-      },
-      get: (name) => rootTools.get(name),
-      // 宿主语义：root 层没有 scope，restrict 必抛；门禁不得依赖它。
-      restrict: () => {
-        throw new Error('cannot get required service "tools" in inactive context');
-      },
-    },
-  };
+    tools: rootToolsService,
+    // root 也是真 Context：inject 会给出一个声明了依赖的子作用域。
+    inject: (names, callback) => callback(serviceCtx({
+      get: (name) => services[name],
+    }, [...new Set([...Object.keys(services), ...names])])),
+  }, Object.keys(services));
   ctx.root = ctx;
   ctx.root.on = ctx.on;
 
   // 会话层注入面：安装领导入口时宿主给的 rtc（scoped tools + subagents）。
   const scopedTools = new Map();
   const scopedRestricted = [];
-  const scopedSubagents = {
-    startActivation: async (spec) => {
-      calls.activation.push(spec);
-      if (options.scopedStartActivation) return options.scopedStartActivation(spec);
-      return { childId: `scoped-${harnessSeq}-${calls.activation.length}` };
-    },
+  const scopedToolsService = {
+    get: (name) => scopedTools.get(name),
+    register: (definition) => scopedTools.set(definition.name, definition),
+    restrict: (spec) => scopedRestricted.push(spec),
   };
-  const rtc = {
-    tools: {
-      get: (name) => scopedTools.get(name),
-      register: (definition) => scopedTools.set(definition.name, definition),
-      restrict: (spec) => scopedRestricted.push(spec),
+  // 安装时那一次注入得到的 rtc 代表"闭包 ctx"：面板重载后它所属的 fiber 已释放，再注入
+  // 就是 CordisError（cannot create effect on inactive context）。派遣必须换活作用域重试。
+  let injections = 0;
+  const staleSubagents = {
+    startActivation: async () => {
+      throw new Error('cannot get required service "subagents" in inactive context');
     },
-    subagents: scopedSubagents,
   };
 
   plugin.apply(ctx);
 
-  const liveCtx = {
-    agents,
-    subagents,
-    sessionController,
-    get: (name) => services[name],
+  // 领导作用域（agent.ctx）：注入链来自 agent-loop（没有 subagents / sessionController），
+  // 属性直取 subagents 会抛 without inject；get() 照常可读——线上故障 1 就在这一层。
+  const liveCtx = serviceCtx({
     root: ctx,
-    inject: (_names, callback) => callback(rtc),
-  };
+    get: (name) => services[name],
+    inject: (names, callback) => {
+      const stale = options.scopedStartActivation !== void 0 && injections++ === 0;
+      const injected = serviceCtx({
+        root: ctx,
+        get: (name) => services[name],
+        // 注入作用域在宿主里是领导作用域的子 fiber：祖先声明过的依赖照样能取。
+        ...(stale ? {
+          subagents: staleSubagents,
+          inject: () => { throw new Error("cannot create effect on inactive context"); },
+        } : {}),
+      }, [...new Set([...agentInject, ...names])], { tools: scopedToolsService });
+      return callback(injected);
+    },
+  }, agentInject);
   const leader = { id: sessionId, session, ctx: liveCtx };
   const routedTool = () => rootTools.get("subagent") ?? scopedTools.get("subagent");
   const stateDir = `${home}/caseos/session-state`;

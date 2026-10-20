@@ -40,10 +40,19 @@ const dispatchText = readFileSync(join(root, "gates/dispatch-gate.js"), "utf8");
 const manonText = readFileSync(join(root, "gates/manon-bridge.js"), "utf8");
 const codestyleText = readFileSync(join(root, "gates/codestyle-gate.js"), "utf8");
 const { readsSecretFile } = await import(join(root, "gates/manon-bridge.js"));
+const verispringConfig = await import(join(root, "gates/verispring-config.js"));
+if (typeof verispringConfig.apply !== "function" || !Array.isArray(verispringConfig.inject)) {
+  fail("verispring-config 导入后缺少 apply/inject 导出");
+}
 if (!dispatchText.includes("ctx.profileContext?.home") || !dispatchText.includes("process.env.DSH_HOME") || !dispatchText.includes("specPath")) fail("派遣门禁未使用 DSH profile home");
 if (!dispatchText.includes("startActivation") || dispatchText.includes("startContinuable")) fail("子代理必须使用 DSH 官方 startActivation 接口");
 if (!dispatchText.includes('verispring/routes-updated') || !configText.includes('verispring/routes-updated')) fail("配置保存未触发派遣路由热更新");
 if (!configText.includes("process.env.DSH_HOME")) fail("配置同步未使用 DSH_HOME 回退");
+// link: 安装时插件真目录可能没有 node_modules，裸 import 会在真宿主上让整条目 import 失败；
+// schemastery 必须按候选路径动态解析。
+if (/^\s*import\s[^;]*from\s+["']@deepseek-ai\/schemastery["']/m.test(configText)) fail("verispring-config 仍用裸 import 加载 schemastery（link: 安装下会 ERR_MODULE_NOT_FOUND）");
+if (!configText.includes("loadSchemastery") || !configText.includes("pathToFileURL")) fail("verispring-config 未按候选路径解析 schemastery");
+if (!configText.includes("SCHEMASTERY_INSTALL_HINT")) fail("verispring-config 缺少 schemastery 解析失败的可操作提示");
 if (!manonText.includes("ctx.profileContext?.home") || !manonText.includes("sourcePrefix")) fail("Manon 调用前缀未使用 DSH profile home");
 if (!manonText.includes("(?<![\\w.])")) fail("Manon 密钥文件名检测缺少词首边界");
 if (readsSecretFile("bash -c 'source ~/.dsh/manon.env; manon-kg sync'")) fail("Manon source 调用式被误判为读取密钥");

@@ -6,23 +6,127 @@
 //   3 deep-query / embedding -> ~/.dsh/manon.env 键值 upsert（bridge 注入的 source 调用式
 //                     让 manon-kg 子进程读到；manon-kg 侧 MANON_DEEPQUERY_* / MANON_EMBEDDING_*）
 // 主会话由 DSH 原生模型选择器管理，不由本插件面板覆盖。
-import z from "@deepseek-ai/schemastery";
-import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
-export const Config = z.object({
-  scoutProvider: z.string().description("测绘智能体渠道").default("verispring").volatile(),
-  scoutModel: z.string().description("测绘智能体模型").default("deepseek-flash").volatile(),
-  scoutEffort: z.string().description("测绘智能体思考强度（默认 High）").default("high").volatile(),
-  executorProvider: z.string().description("执行智能体渠道").default("verispring").volatile(),
-  executorModel: z.string().description("执行智能体模型").default("deepseek-flash").volatile(),
-  executorEffort: z.string().description("执行智能体思考强度（默认 High）").default("high").volatile(),
-  deepQueryProvider: z.string().description("Manon Deep Query 渠道").default("verispring").volatile(),
-  deepQueryModel: z.string().description("Manon Deep Query 模型").default("deepseek-flash").volatile(),
-  deepQueryEffort: z.string().description("Manon Deep Query 思考强度（默认 Off）").default("off").volatile(),
-  embeddingUrl: z.string().description("embedding 端点").default("https://api.siliconflow.cn/v1").volatile(),
-  embeddingModel: z.string().description("embedding 模型（更换后需重新 sync 重建向量）").default("BAAI/bge-m3").volatile(),
-});
+// schemastery 必须按候选路径解析，不能用裸 import。`link:` 安装时插件目录是 profile 里
+// 的一个符号链接，而 Node 解析裸标识符从 realpath（仓库真目录）出发按父目录上溯——仓库
+// 自己没有 node_modules 时必定 ERR_MODULE_NOT_FOUND，整条目 import 失败，设置页显示
+// 「配置服务暂不可用」。按锚点顺序试：插件自身目录（真实安装或仓库自带依赖）→ profile
+// 目录（link: 安装时依赖由 profile 声明）→ 宿主入口目录（桌面 app / CLI 安装树）。
+const SCHEMASTERY = "@deepseek-ai/schemastery";
+const SCHEMASTERY_INSTALL_HINT =
+  "请在 profile 目录执行 `dsh plugin --profile <name> add @deepseek-ai/schemastery`" +
+  "（或在本仓库执行 pnpm install 装上依赖）后重启";
+
+function packageRoots(anchor) {
+  const roots = [];
+  let dir = resolve(anchor);
+  for (;;) {
+    roots.push(join(dir, "node_modules"));
+    const parent = dirname(dir);
+    if (parent === dir) return roots;
+    dir = parent;
+  }
+}
+
+// profile 目录的候选：--profile 参数最准；桌面 app 启动时命令行里没有它，故再扫一遍
+// $DSH_HOME/profiles 下的全部目录；DSH_PROFILE / DSH_PROFILE_DIR 由宿主注入时优先。
+// 自己声明了 schemastery 依赖的 profile 排在其他 profile 之前——只有没人声明时才借用
+// 邻居 profile 的那份，避免误用别处的旧版本。
+function profileRoots() {
+  const home = process.env.DSH_HOME ?? `${homedir()}/.dsh`;
+  const profiles = join(home, "profiles");
+  const preferred = [];
+  const others = [];
+  if (process.env.DSH_PROFILE_DIR) preferred.push(process.env.DSH_PROFILE_DIR);
+  const names = [];
+  if (process.env.DSH_PROFILE) names.push(process.env.DSH_PROFILE);
+  const argv = process.argv;
+  for (let index = 0; index < argv.length; index += 1) {
+    if (argv[index] === "--profile" && argv[index + 1] !== undefined) names.push(argv[index + 1]);
+  }
+  for (const name of names) if (name) preferred.push(join(profiles, name));
+  preferred.push(profiles);
+  others.push(profiles);
+  try { for (const name of readdirSync(profiles).sort()) others.push(join(profiles, name)); } catch {}
+  const declared = (dir) => {
+    try {
+      const fields = JSON.parse(readFileSync(join(dir, "package.json"), "utf8"));
+      return SCHEMASTERY in { ...fields.dependencies, ...fields.devDependencies };
+    } catch { return false; }
+  };
+  const all = [...new Set([...preferred, ...others])];
+  return [
+    ...all.filter((dir) => dir !== profiles && declared(dir)),
+    ...all.filter((dir) => dir === profiles || !declared(dir)),
+  ];
+}
+
+// package.json 的 "exports" 可能只给出 import 条件；缺失时回落 module/main。
+function schemasteryEntry(root) {
+  const packageDir = join(root, SCHEMASTERY);
+  const manifest = join(packageDir, "package.json");
+  if (!existsSync(manifest)) return undefined;
+  let fields;
+  try { fields = JSON.parse(readFileSync(manifest, "utf8")); } catch { return undefined; }
+  const exported = fields.exports?.["."];
+  const target = typeof exported === "string" ? exported : (exported?.import ?? exported?.default) ?? fields.module ?? fields.main;
+  if (typeof target !== "string") return undefined;
+  const file = join(packageDir, target);
+  return existsSync(file) ? file : undefined;
+}
+
+async function loadSchemastery() {
+  const errors = [];
+  const tried = new Set();
+  const anchors = [
+    ...packageRoots(dirname(fileURLToPath(import.meta.url))),
+    ...profileRoots().flatMap(packageRoots),
+    ...(process.argv[1] === undefined ? [] : packageRoots(dirname(process.argv[1]))),
+  ];
+  for (const root of anchors) {
+    const file = schemasteryEntry(root);
+    if (file === undefined || tried.has(file)) continue;
+    tried.add(file);
+    try {
+      const module = await import(pathToFileURL(file).href);
+      if (typeof module.default?.object === "function") return module.default;
+      errors.push(`${file}: 导出不含 schemastery 默认导出`);
+    } catch (error) {
+      errors.push(`${file}: ${String(error).split("\n")[0]}`);
+    }
+  }
+  process.stderr.write(
+    `verispring-config: 无法解析 ${SCHEMASTERY}，设置页将不可用（路由同步与门禁照常）。${SCHEMASTERY_INSTALL_HINT}。\n` +
+    errors.map((line) => `  - ${line}`).join("\n") + "\n",
+  );
+  return undefined;
+}
+
+// 解析失败只降级面板，绝不连坐 apply：apply 负责把路由落盘，一旦整条目 import 失败，
+// 派遣门禁读到的是旧路由。
+const z = await loadSchemastery();
+
+function buildConfig(z) {
+  return z.object({
+    scoutProvider: z.string().description("测绘智能体渠道").default("verispring").volatile(),
+    scoutModel: z.string().description("测绘智能体模型").default("deepseek-flash").volatile(),
+    scoutEffort: z.string().description("测绘智能体思考强度（默认 High）").default("high").volatile(),
+    executorProvider: z.string().description("执行智能体渠道").default("verispring").volatile(),
+    executorModel: z.string().description("执行智能体模型").default("deepseek-flash").volatile(),
+    executorEffort: z.string().description("执行智能体思考强度（默认 High）").default("high").volatile(),
+    deepQueryProvider: z.string().description("Manon Deep Query 渠道").default("verispring").volatile(),
+    deepQueryModel: z.string().description("Manon Deep Query 模型").default("deepseek-flash").volatile(),
+    deepQueryEffort: z.string().description("Manon Deep Query 思考强度（默认 Off）").default("off").volatile(),
+    embeddingUrl: z.string().description("embedding 端点").default("https://api.siliconflow.cn/v1").volatile(),
+    embeddingModel: z.string().description("embedding 模型（更换后需重新 sync 重建向量）").default("BAAI/bge-m3").volatile(),
+  });
+}
+
+export const Config = z === undefined ? undefined : buildConfig(z);
 
 export const inject = ["configEditor", "credentials"];
 

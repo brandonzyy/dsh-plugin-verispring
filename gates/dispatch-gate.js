@@ -287,9 +287,68 @@ function saveMapBaseline(dshHome, cwd, commit) {
   }
 }
 
-// 宿主 agents 服务只在活跃 fiber 上解析；失活作用域读取会抛 inactive context。
+// 作用域已不可用的两种形态：宿主的 agents 服务只在活跃 fiber 上解析（inactive context），
+// 而宿主 cordis 只允许在声明过 inject 的作用域上属性取服务（cannot get property "<name>"
+// without inject）。两者都说明「这个作用域取不到服务」，换下一个作用域重试即可。
 function isInactiveContext(error) {
-  return /inactive context/i.test(String(error?.message ?? error));
+  return /inactive context|without inject/i.test(String(error?.message ?? error));
+}
+
+// 取宿主服务的唯一读法：作用域 `get()` 不要求 inject 声明，是宿主给的正当入口；属性读取
+// 只在声明过该依赖的作用域上合法。两者都可能因作用域失活/未声明而抛，最终回落 root。
+function serviceOf(scope, name, root) {
+  try {
+    const value = scope?.get?.(name);
+    if (value !== void 0) return value;
+  } catch {}
+  for (const candidate of [scope, root]) {
+    try {
+      const value = candidate?.[name];
+      if (value !== void 0) return value;
+    } catch {}
+  }
+  return void 0;
+}
+
+// 派遣的唯一启动取法：作用域的 `inject` 面（cordis 的依赖声明；未声明的属性读取会被宿主
+// 直接拒绝）。派遣发生在领导/子代理作用域上，这些作用域继承 agent-loop 的 inject（tools、
+// agents 一类），subagents 不在其中——v1.3.65 的 `liveCtx.subagents.startActivation` 因此让
+// 全部派遣失败。这里建一个只注入所需服务的临时作用域，取到服务即调用，随后释放，不长期
+// 持有任何作用域。
+function withInjected(scope, names, run) {
+  return new Promise((resolve, reject) => {
+    let fiber;
+    let settled = false;
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      if (error === undefined) resolve(value);
+      else reject(error);
+      try { Promise.resolve(fiber?.dispose?.()).catch(() => {}); } catch {}
+    };
+    // 服务缺失时宿主的注入作用域根本不会启动、回调永不执行：先判在不在，缺了当场失败。
+    let present;
+    try { present = scope?.get?.(names[0]); } catch { present = void 0; }
+    if (present === void 0) {
+      finish(new Error(`cannot get property "${names[0]}" without inject`));
+      return;
+    }
+    if (typeof scope?.inject !== "function") {
+      finish(new Error(`cannot get property "${names[0]}" without inject`));
+      return;
+    }
+    try {
+      fiber = scope.inject(names, (rtc) => {
+        Promise.resolve()
+          .then(() => run(rtc))
+          .then((value) => finish(undefined, value), (error) => finish(error));
+      });
+    } catch (error) {
+      finish(error);
+      return;
+    }
+    Promise.resolve(fiber).catch((error) => finish(error));
+  });
 }
 
 function routeText(route) {
@@ -484,7 +543,10 @@ function renameChildTitleAfterAutoTitle(ctx, childId, title) {
 }
 
 const plugin = {
-  inject: ["tools", "agents", "sessionController", "sessionTitle", "profileContext"],
+  // subagents 故意不在这里：它是每笔派遣现注入的服务（见 withInjected），声明成插件依赖会让
+  // 整个门禁在缺少该服务的宿主上永不激活。sessionController 同理——它只用于写子代理模型
+  // 选择，缺了照常派遣（applyChildRoute 已容错），不该拖住派遣门禁本身。
+  inject: ["tools", "agents", "sessionTitle", "profileContext"],
   apply(ctx) {
     const dshHome = ctx.profileContext?.home ?? process.env.DSH_HOME ?? `${homedir()}/.dsh`;
     const configFile = `${dshHome}/verispring.json`;
@@ -556,9 +618,10 @@ const plugin = {
       childRoutePlans.set(agent.id, plan);
       writeChildRole(stateDir, agent.session, plan.role);
       try {
-        // 写路由的服务从活上下文取（调用方给的就是 liveOf/注入面的 ctx），不碰 apply 闭包 ctx。
-        const controller = (live ?? liveOf(agent)).sessionController;
-        controller.agents.selectForNextRequest(agent, {
+        // 服务从活上下文现取（get 优先，属性只在声明过的层上合法）：sessionController 不在
+        // 领导作用域的 inject 链里，直取属性就会抛 without inject。
+        const controller = serviceOf(live ?? liveOf(agent), "sessionController", ctx.root);
+        controller?.agents?.selectForNextRequest(agent, {
           provider: plan.route.provider,
           model: plan.route.model,
           ...(plan.route.reasoningEffort ? { reasoningEffort: plan.route.reasoningEffort } : {}),
@@ -631,7 +694,7 @@ const plugin = {
         child: child.childId,
         label: label.slice(0, 120),
       });
-      applyChildRoute(live.agents?.get(child.childId), { label: roleLabel, route, role }, live);
+      applyChildRoute(serviceOf(live, "agents", ctx.root)?.get(child.childId), { label: roleLabel, route, role }, live);
       renameChildTitleAfterAutoTitle(live, child.childId, roleLabel);
       if (role === "scout") {
         rememberScoutOwner(child.childId, sessionId, stateDir);
@@ -648,17 +711,25 @@ const plugin = {
       };
     };
 
-    // startActivation 是唯一启动入口；inactive context 说明本次用的 ctx 已失活，改从活上下文
-    // 重取服务重试一次（宿主 agents 服务只在活跃 fiber 上解析）。
+    // startActivation 是唯一启动入口。服务只能经注入拿：领导/子代理作用域的 inject 链里没有
+    // subagents，属性直取会被宿主以 "cannot get property "subagents" without inject" 拒绝
+    // （v1.3.65 全部派遣失败的原因）。先按本次调用给的作用域注入，失败（作用域失活或服务
+    // 缺失）再换 exec.agent.ctx / root 重试一次。
     const startActivation = async (liveCtx, exec, spec) => {
-      try {
-        return await liveCtx.subagents.startActivation(spec);
-      } catch (error) {
-        if (!isInactiveContext(error)) throw error;
-        const fallback = exec.agent?.ctx ?? liveCtx.root;
-        if (fallback === liveCtx) throw error;
-        return await fallback.subagents.startActivation(spec);
+      const attempts = [];
+      for (const scope of [liveCtx, exec.agent?.ctx, liveCtx?.root]) {
+        if (scope !== void 0 && !attempts.includes(scope)) attempts.push(scope);
       }
+      let last;
+      for (const scope of attempts) {
+        try {
+          return await withInjected(scope, ["subagents"], (rtc) => rtc.subagents.startActivation(spec));
+        } catch (error) {
+          last = error;
+          if (!isInactiveContext(error)) throw error;
+        }
+      }
+      throw last ?? new Error('cannot get property "subagents" without inject');
     };
 
     const staticSubagentBase = {
