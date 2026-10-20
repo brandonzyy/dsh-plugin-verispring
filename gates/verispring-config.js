@@ -160,7 +160,20 @@ export function apply(ctx, config) {
       entry.options.id === "tool-subagent" ||
       findNestedPluginConfig(entry.options.config, "tool-subagent") || findNestedPluginConfig(inherited, "tool-subagent"));
     const entry = row?.entry;
-    if (entry) {
+    // 只做一次性装配引导：tool-subagent 缺 agentPreset 时才写入 preset。每笔派遣的
+    // 渠道/模型/思考强度由 dispatch-gate 按角色从 verispring.json 运行时覆盖，preset
+    // 里的 agentOptions 从不参与实际路由——而 editor.edit 会重组合 delegation 子树、
+    // 换掉 subagents 管理器实例，进行中会话的常驻测绘与全部子代理随之失活（判例
+    // 2026-10-20：换一次模型，旧 scout 即不可用，连官方 subagent-base 都抛
+    // inactive context）。所以模型/思考强度变更绝不走这里。
+    const needsBootstrap = (() => {
+      if (!entry) return false;
+      const existing = entry.options.id === "tool-subagent"
+        ? entry.options.config
+        : findNestedPluginConfig(entry.options.config, "tool-subagent");
+      return existing?.agentPreset !== "verispring-subagent";
+    })();
+    if (needsBootstrap) {
       const current = JSON.parse(JSON.stringify(entry.options.config ?? {}));
       const inherited = JSON.parse(JSON.stringify(row.inherited ?? {}));
       const next = entry.options.id === "tool-subagent" || findNestedPluginConfig(current, "tool-subagent") ? current : inherited;
@@ -181,7 +194,7 @@ export function apply(ctx, config) {
       }
     } else process.stderr.write("verispring-config: 未找到包含 tool-subagent 的 preset 配置\n");
     const patchPath = ctx.profileContext?.patchPath;
-    if (patchPath) syncToolSubagentPatch(patchPath, {
+    if (patchPath && needsBootstrap) syncToolSubagentPatch(patchPath, {
       provider: executorProvider,
       model: executorModel,
       reasoningEffort: executorEffort,
