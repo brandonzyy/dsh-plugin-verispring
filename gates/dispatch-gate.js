@@ -225,6 +225,12 @@ function sessionState(session, stateDir) {
 }
 
 const pendingRoutePlans = new Map();
+// 跨重载状态：面板改一次模型配置，cordis 就重跑一次 apply、旧作用域失活。这些状态
+// 必须放在模块层才能跨重载延续（WeakSet 按对象、Map 按 id，重载不丢）。
+const leaderScoutStarted = new WeakSet();
+const leaderToolInstalled = new WeakSet();
+const leaderToolInstalling = new WeakSet();
+const childRoutePlans = new Map();
 
 function queueRoutePlan(parent, plan) {
   if (!parent) return;
@@ -287,15 +293,9 @@ const plugin = {
     process.stderr.write(
       `caseos-dispatch-gate: plugin activated (测绘: ${routeText(routes.scout)}; 执行: ${routeText(routes.executor)})\n`,
     );
-    const leaderToolInstalled = new WeakSet();
     let globalLeaderToolInstalled = false;
-    // 桌面恢复/切换 fiber 时 session 可能被重新包装；领导 agent 身份更稳定，
-    // 作为当前进程内的第二份测绘完成事实。
-    const leaderScoutStarted = new WeakSet();
-    const leaderToolInstalling = new WeakSet();
-    const childRoutePlans = new Map();
 
-    const applyChildRoute = (agent, plan) => {
+    const applyChildRoute = (agent, plan, live) => {
       if (!agent || !plan) {
         return;
       }
@@ -309,7 +309,8 @@ const plugin = {
       childRoutePlans.set(agent.id, plan);
       writeChildRole(stateDir, agent.session, plan.role);
       try {
-        ctx.sessionController.agents.selectForNextRequest(agent, {
+        const controller = (live ?? ctx).sessionController;
+        controller.agents.selectForNextRequest(agent, {
           provider: plan.route.provider,
           model: plan.route.model,
           ...(plan.route.reasoningEffort ? { reasoningEffort: plan.route.reasoningEffort } : {}),
@@ -320,10 +321,15 @@ const plugin = {
     };
 
     const executeRouted = async (args, exec, rtc) => {
+      // 重载安全（v1.3.61）：面板改模型配置会重跑 apply、旧作用域失活，而已注册的派遣
+      // 入口（root 静态入口 + 各会话层的瘦身入口）持有的可能是旧作用域。服务一律从
+      // 活上下文现取——rtc 恒为活上下文（静态入口传 root，会话层入口传随注入的
+      // agent.ctx），绝不碰 apply 闭包的 ctx，否则就是 inactive context 事故。
+      const live = rtc ?? exec.agent?.ctx ?? ctx.root;
       const session = exec.agent?.session;
       const state = stateOf(session);
       const recovered = state.scoutStarted || leaderScoutStarted.has(exec.agent)
-        || hasChildAgent(ctx.agents, session, exec.agent);
+        || hasChildAgent(live.agents, session, exec.agent);
       if (!state.scoutStarted && recovered) writeScoutStarted(session, true, stateDir);
       const role = recovered ? "executor" : "scout";
       routes = loadRoutes(configFile);
@@ -357,8 +363,8 @@ const plugin = {
           signal: exec.signal,
           delivery: "parent",
         });
-        applyChildRoute(ctx.agents.get(child.childId), { label: roleLabel, route, role });
-        renameChildTitleAfterAutoTitle(ctx, child.childId, roleLabel);
+        applyChildRoute(live.agents?.get(child.childId), { label: roleLabel, route, role }, live);
+        renameChildTitleAfterAutoTitle(live, child.childId, roleLabel);
         if (role === "scout") {
           leaderScoutStarted.add(exec.agent);
           writeScoutStarted(session, true, stateDir);
@@ -418,6 +424,10 @@ const plugin = {
         // 按领导自己的视图取官方基座；它只作为执行实现，不直接暴露给模型。
         const current = rtc.tools.get(BASE_SUBAGENT_TOOL, agent);
         if (!current) {
+          // root 层已无条件藏掉基座（v1.3.61），这里取不到是正常态：只要会话层已有
+          // 本插件的路由入口（__caseosRouted），派遣就有着落，别再重复装配。
+          const existing = rtc.tools.get(LEADER_SUBAGENT_TOOL, agent);
+          if (existing?.__caseosRouted) leaderToolInstalled.add(agent);
           return;
         }
         // 领导层的 subagent 只此一处注册：瘦身文案来自 leader-scope，执行体是本文件的路由强制。
