@@ -1,4 +1,4 @@
-// Verispring 派遣门禁（六条代码级强制 + 监控）：
+// Verispring 派遣门禁（七条代码级强制 + 监控）：
 // 1 规范门：subagent / subagent_fork 调用前，本会话必须出现过《子代理派遣规范》首行标记
 //   （read/bash 结果内容判定，增量扫描会话事件；会话日志是唯一事实源，跨进程重启不丢）。
 // 2 测绘常驻（按可达性判定）：本会话首笔派遣由运行时定为测绘（description 只是展示标签，
@@ -15,9 +15,10 @@
 // 3 地图前置 + 新鲜度：非测绘派遣要求 <会话工作区>/.project-map.md 存在——cwd 取会话
 //   header 的 cwd（桌面宿主进程目录不是项目根），且 .git 或 .manon 在场才认定项目根，否则
 //   放行（fail-open）。没有地图先派测绘（建图 + 入口表），由领导 write 落盘后重派；
-//   write 该文件时把当前 HEAD 登记为新鲜度基准（caseos/map-baselines.json），此后 main
-//   再前进就拒绝执行派遣，指路测绘增量校对 + 重写地图登记新基准（首建前与 CASEOS_SCOUT=0
-//   时 fail-open）。
+//   write/edit 该文件时把当前 HEAD 登记为新鲜度基准（caseos/map-baselines.json，目标路径
+//   resolve 后比较），此后 main 再前进就拒绝执行派遣，指路测绘增量校对 + 重写地图登记新
+//   基准；地图已在却没有基准同样拒绝（不再 fail-open）。git 读不到 HEAD 与 CASEOS_SCOUT=0
+//   时放行。
 // 4 模型路由：测绘与执行分别读取面板配置（verispring.json），运行时按角色强制注入，
 //   调用里显式写的 provider/model 一律忽略。fork 拒绝（三智能体架构唯一入口是 spawn）。
 // 5 子代理 preset：spawn 通过 agentPreset 显式选择 verispring-subagent；创建事件只负责
@@ -27,11 +28,19 @@
 // 6 监控只写事实：门禁拦截、角色漂移、子代理 start/start-failed/end/error（角色 + 路由 +
 //   子代理 id + 报错 message/code）追加落盘 ~/.dsh/verispring-monitor.jsonl
 //   （gates/monitor-log.js）；start 只在 spawn 成功后才记。
+// 7 任务书与并发（只约束执行派遣）：任务书命中调研型措辞即拒绝（清单见 BRIEF_LINT_TERMS，
+//   CASEOS_BRIEF_LINT=0 关闭）——调研是常驻测绘的职责，执行任务书只写改哪里、改成什么、
+//   怎么验证；同一领导会话里运行中的执行子代理数达上限即拒绝（CASEOS_MAX_EXECUTORS，默认 3；
+//   测绘不计入）。测绘派遣在本次派遣即测绘时直接放行（第 3 条与本节都跳过，建图与调研正是
+//   它要做的事）。这两条与地图门禁的拒绝都记 kind=dispatch-deny 并带规则名，与既有 gate-deny
+//   分开，便于审计哪条规则在拦。派遣回执保留 "started subagent <id>" 前缀原样（宿主与
+//   client.js 的解析契约），追加路由、角色与测绘接替事实。
 // 规范目录按主目录解析（~/.dsh/specs/），搬家无需改码。
 const MARKER = "# 子代理派遣规范";
 const SPEC_FRAGMENT = "specs/子代理派遣规范.md";
 const GATE_TOOLS = new Set(["subagent", "subagent_fork"]);
 const MAP_FILE = ".project-map.md";
+const MAP_WRITE_TOOLS = new Set(["write", "edit"]);
 const SUBAGENT_PRESET = "verispring-subagent";
 const BASE_SUBAGENT_TOOL = "subagent-base";
 const LEADER_SUBAGENT_TOOL = "subagent";
@@ -40,11 +49,32 @@ const DEFAULT_ROUTES = {
   scout: { provider: "verispring", model: "deepseek-flash", reasoningEffort: "high" },
   executor: { provider: "verispring", model: "deepseek-flash", reasoningEffort: "high" },
 };
+// 调研型措辞：执行任务书里出现即拒绝（调研是常驻测绘的职责，执行者只做已查实的事）。
+// 集中一处，环境变量 CASEOS_BRIEF_LINT=0 整表关闭。
+const BRIEF_LINT_TERMS = [
+  "先调研",
+  "调研后再",
+  "先查清",
+  "查清楚再",
+  "先摸清",
+  "读源码确认",
+  "通读",
+  "先读懂",
+  "拿不准先读",
+  "自行调研",
+  "先排查根因再",
+  "investigate first",
+  "research first",
+  "read the source to figure out",
+];
+// 并发上限的缺省值：环境变量 CASEOS_MAX_EXECUTORS 是唯一来源，缺省/非法回落 3。
+const EXECUTOR_CAP_DEFAULT = 3;
 // 用户配置文件（配置面板写入）：{ scout: {...}, executor: {...} }。
 // 读取失败/缺省回落常量，门禁永不因配置文件崩。
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
+import { resolve } from "node:path";
 import { SLIM_DESC, slimSchema } from "./leader-scope.js";
 import { monitorEvent } from "./monitor-log.js";
 
@@ -79,6 +109,57 @@ function loadRoutes(configFile) {
 function isScoutDescription(description) {
   const value = String(description ?? "").trim().toLowerCase();
   return value.startsWith("测绘智能体") || value.startsWith("scout");
+}
+
+// 任务书里的调研型措辞：命中即拒（回填命中词用于拒绝文案）。英文按小写匹配。
+function briefLintTerm(prompt) {
+  const text = String(prompt ?? "").toLowerCase();
+  for (const term of BRIEF_LINT_TERMS) {
+    if (text.includes(term.toLowerCase())) return term;
+  }
+  return void 0;
+}
+
+function briefLintEnabled() {
+  return process.env.CASEOS_BRIEF_LINT !== "0";
+}
+
+// 执行子代理并发上限：环境变量唯一来源，缺省/非法回落默认值（缺省行为明确，不猜用户意图）。
+function executorCapLimit() {
+  const parsed = Number.parseInt(String(process.env.CASEOS_MAX_EXECUTORS ?? "").trim(), 10);
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : EXECUTOR_CAP_DEFAULT;
+}
+
+// 活上下文的 agents 注册表：失活作用域读取会抛 inactive context，读不到就按无运行中子代理
+// 处理（门禁不因读服务失败而崩，与 childPlan 的活 ctx 取法一致）。
+function liveAgentsOf(agent, root) {
+  try {
+    return agent?.ctx?.get?.("agents") ?? root?.get?.("agents");
+  } catch {
+    try {
+      return root?.get?.("agents");
+    } catch {
+      return void 0;
+    }
+  }
+}
+
+// 本领导会话里正在运行的执行子代理：宿主注册表 status 为准，归属认运行时 owner 与持久
+// session 血缘两条（恢复的会话里子代理未必还有 owner）。测绘身份不计入上限——它常驻是常态。
+function runningExecutors(agents, leader, scoutId, stateDir) {
+  const list = typeof agents?.list === "function" ? agents.list() : [];
+  const leaderSession = sessionIdOf(leader?.session);
+  const running = [];
+  for (const candidate of list) {
+    if (!candidate || candidate === leader || candidate.status !== "running") continue;
+    const owned = agents.isOwnedBy?.(candidate.id, leader) === true;
+    const lineage = leaderSession !== void 0 && candidate.session?.header?.parentSession === leaderSession;
+    if (!owned && !lineage) continue;
+    if (candidate.id === scoutId) continue;
+    if (readChildRole(stateDir, candidate.session) === "scout") continue;
+    running.push(candidate.id);
+  }
+  return running;
 }
 
 // 子代理角色持久化：spawn 时落盘（stateDir/<子会话id>.json {version, role}），
@@ -130,11 +211,44 @@ function gitHead(cwd) {
   return void 0;
 }
 
+function gitOutput(cwd, args) {
+  try {
+    return execFileSync("git", ["-C", cwd, ...args], { timeout: 3000, encoding: "utf8" }).trim();
+  } catch {}
+  return void 0;
+}
+
+// 地图过期时的读数：落后提交数与区间改动文件数。任一取不到就省略该段（git 不可判定不猜）。
+function mapDrift(cwd, baseline, head) {
+  const range = `${baseline}..${head}`;
+  const countText = gitOutput(cwd, ["rev-list", "--count", range]);
+  const filesText = gitOutput(cwd, ["diff", "--name-only", range]);
+  const commits = countText === void 0 ? void 0 : Number(countText);
+  return {
+    commits: Number.isInteger(commits) ? commits : void 0,
+    files: filesText === void 0 ? void 0 : filesText.split("\n").filter(Boolean).length,
+  };
+}
+
 const MAP_BASELINES_FILE = "caseos/map-baselines.json";
+
+// 地图目标路径归一：展开 ~、按会话工作区解析相对路径，再与工作区地图比较（write 与 edit
+// 都可能拿到相对路径或 ~ 路径）。
+function mapPathOf(cwd, value) {
+  if (typeof value !== "string" || !value) return void 0;
+  const expanded = value === "~"
+    ? homedir()
+    : value.startsWith("~/") ? `${homedir()}${value.slice(1)}` : value;
+  return resolve(cwd ?? process.cwd(), expanded);
+}
+
+function mapFileOf(cwd) {
+  return resolve(cwd ?? process.cwd(), MAP_FILE);
+}
 
 function loadMapBaseline(dshHome, cwd) {
   try {
-    const commit = JSON.parse(readFileSync(`${dshHome}/${MAP_BASELINES_FILE}`, "utf8"))[cwd]?.commit;
+    const commit = JSON.parse(readFileSync(`${dshHome}/${MAP_BASELINES_FILE}`, "utf8"))[resolve(cwd)]?.commit;
     return typeof commit === "string" && commit ? commit : void 0;
   } catch {}
   return void 0;
@@ -144,7 +258,7 @@ function saveMapBaseline(dshHome, cwd, commit) {
   if (!cwd || !commit) return;
   let all = {};
   try { all = JSON.parse(readFileSync(`${dshHome}/${MAP_BASELINES_FILE}`, "utf8")); } catch {}
-  all[cwd] = { commit, at: new Date().toISOString() };
+  all[resolve(cwd)] = { commit, at: new Date().toISOString() };
   try {
     mkdirSync(`${dshHome}/caseos`, { recursive: true });
     const temp = `${dshHome}/${MAP_BASELINES_FILE}.tmp-${process.pid}`;
@@ -162,6 +276,16 @@ function isInactiveContext(error) {
 
 function routeText(route) {
   return `${route.provider}/${route.model}${route.reasoningEffort ? `@${route.reasoningEffort}` : ""}`;
+}
+
+// 派遣回执：前缀 "started subagent <id>" 是宿主与 client.js 的解析契约，必须原样保留；
+// 路由、角色与测绘接替事实一律追加在后。
+function startedReceipt(value) {
+  const id = value?.subagentId;
+  let text = `started subagent ${id}`;
+  if (value?.route) text += `（路由：${value.route} · 角色：${value.role}）`;
+  if (value?.replacedScoutId) text += `；已接替不可达测绘 ${value.replacedScoutId}`;
+  return text;
 }
 
 function pathMatches(value, dshHome) {
@@ -495,7 +619,15 @@ const plugin = {
         rememberScoutOwner(child.childId, sessionId, stateDir);
         writeScoutState(sessionId, { scoutId: child.childId, unreachable: "" }, stateDir);
       }
-      return { kind: "activation", subagentId: child.childId };
+      // 回执把路由与角色写成事实：宿主与 client.js 只认 "started subagent <id>" 前缀，追加
+      // 内容一律排在后面。测绘接替时补一句被接替的旧测绘 id。
+      return {
+        kind: "activation",
+        subagentId: child.childId,
+        route: routeText(route),
+        role,
+        ...(role === "scout" && scoutIdIn(previous) ? { replacedScoutId: scoutIdIn(previous) } : {}),
+      };
     };
 
     // startActivation 是唯一启动入口；inactive context 说明本次用的 ctx 已失活，改从活上下文
@@ -525,7 +657,7 @@ const plugin = {
       },
       output: {
         schema: { type: "object", additionalProperties: true },
-        render: (_args, value) => [{ type: "text", text: `started subagent ${value.subagentId}` }],
+        render: (_args, value) => [{ type: "text", text: startedReceipt(value) }],
       },
     };
     const staticRoutedTool = {
@@ -575,6 +707,8 @@ const plugin = {
         const wrapped = { ...current, name: LEADER_SUBAGENT_TOOL, __caseosRouted: true,
           description: SLIM_DESC.subagent ?? current.description,
           parameters: slimSchema(current.parameters ?? {}),
+          // 回执文案按本插件的路由事实渲染（会话层入口与全局入口同一份契约）。
+          ...(current.output ? { output: { ...current.output, render: (_args, value) => [{ type: "text", text: startedReceipt(value) }] } } : {}),
           execute: (args, exec) => executeRouted(args, exec, rtc) };
         let registered = globalLeaderToolInstalled;
         if (!registered) {
@@ -721,13 +855,14 @@ const plugin = {
           }
         }
       }
-      // 地图基准登记：领导 write .project-map.md 成功即把当前 HEAD 记为该工作区的新鲜度基准。
-      if (exec.name === "write") {
+      // 地图基准登记：领导 write/edit .project-map.md 成功即把当前 HEAD 记为该工作区的新鲜度
+      // 基准。write 走绝对路径，edit 可能拿到相对路径或 ~ 路径：先归一再与工作区地图比较。
+      if (MAP_WRITE_TOOLS.has(exec.name)) {
         let args = {};
         try { args = exec.arguments ?? {}; } catch {}
-        const target = args.file_path ?? args.path ?? args.file;
         const cwd = exec.agent?.session?.header?.cwd ?? process.cwd();
-        if (typeof target === "string" && target === `${cwd}/${MAP_FILE}`) {
+        const target = mapPathOf(cwd, args.file_path ?? args.path ?? args.file);
+        if (target && target === mapFileOf(cwd)) {
           const head = gitHead(cwd);
           if (head) saveMapBaseline(dshHome, cwd, head);
         }
@@ -736,10 +871,11 @@ const plugin = {
 
     ctx.tools.guard((exec) => {
       if (!GATE_TOOLS.has(exec.name)) return undefined;
-      const deny = (reason) => {
+      const deny = (reason, rule) => {
         monitorEvent(dshHome, {
-          kind: "gate-deny",
+          kind: rule ? "dispatch-deny" : "gate-deny",
           gate: "dispatch",
+          ...(rule ? { rule } : {}),
           tool: exec.name,
           session: sessionIdOf(exec.agent?.session),
           reason: reason.slice(0, 160),
@@ -750,12 +886,13 @@ const plugin = {
         return deny("本插件统一使用 subagent spawn 入口；subagent_fork 不属于三智能体架构。");
       }
       const description = exec.arguments?.description;
+      const prompt = exec.arguments?.prompt;
       const session = exec.agent?.session;
       const state = sessionState(session);
       if (!state.specRead) return deny(denyReason);
       const sessionId = sessionIdOf(session);
       // 可达性决定下一笔派遣的角色：没有可达测绘时这一笔就是测绘（description 只是标签），
-      // 不受地图前置/新鲜度约束——建图正是它要做的事。
+      // 不受地图前置/新鲜度/任务书/并发约束——建图与调研正是它要做的事。
       const activeScout = reachableScoutId(sessionId, stateDir);
       if (!activeScout) return undefined;
       // 有可达测绘时再派测绘才拒绝，判据是可达性与运行期角色，不看 description 前缀。
@@ -766,6 +903,18 @@ const plugin = {
           + "只有它真的不可达（end 非 completed，或 send_message 报 unavailable）时才重派，插件会自动接替并注入地图。",
         );
       }
+      // 以下只约束执行派遣：调研交给常驻测绘，执行任务书只写改哪里、改成什么、怎么验证。
+      if (briefLintEnabled()) {
+        const term = briefLintTerm(prompt);
+        if (term) {
+          process.stderr.write(`caseos-dispatch-gate: 任务书调研措辞拦截（${term}）\n`);
+          return deny(
+            `任务书含调研型措辞『${term}』：调研交给常驻测绘（send_message ${activeScout}），`
+            + "把它查实的事实写进任务书；执行任务书只写改哪里、改成什么、怎么验证",
+            "brief-lint",
+          );
+        }
+      }
       // 地图前置：cwd 取会话工作区（桌面宿主进程目录不是项目根）。
       const cwd = session?.header?.cwd ?? process.cwd();
       const isProjectRoot = existsSync(`${cwd}/.git`) || existsSync(`${cwd}/.manon`);
@@ -774,15 +923,43 @@ const plugin = {
         return deny(`派执行智能体前必须先有项目地图：${cwd}/${MAP_FILE} 不存在。先派测绘智能体（按系统提示的 manon-kg 调用前缀 sync 建图并回报入口表 ≤20 行），用 write 把入口表落盘为该文件，然后重新派遣。`);
       }
       // 地图新鲜度：main 自上次地图登记后又前进过，先让常驻测绘增量校对并重新落盘地图。
-      // 基准在 write .project-map.md 时登记（见 tools/result 监听）；首建前不拦（fail-open），
-      // CASEOS_SCOUT=0（无测绘可用）时同样跳过。
+      // 基准在 write/edit .project-map.md 时登记（见 tools/result 监听）；地图在而基准缺失
+      // 是登记漏了，不再 fail-open——否则陈旧地图会永久放行。git 读不到 HEAD 时仍放行。
       if (isProjectRoot && process.env.CASEOS_SCOUT !== "0") {
         const head = gitHead(cwd);
-        const baseline = loadMapBaseline(dshHome, cwd);
-        if (head && baseline && baseline !== head) {
-          process.stderr.write("caseos-dispatch-gate: 地图过期拦截（HEAD 前进于登记基准）\n");
-          return deny(`项目地图已过期：main 自上次地图登记后又前进了（登记基准 ${baseline.slice(0, 8)} → 当前 HEAD ${head.slice(0, 8)}）。先 send_message 常驻测绘智能体做增量校对（manon-kg sync + 结构增量回报）；收到回报后用 write 更新 ${cwd}/${MAP_FILE}（即使结构无变化也原样落盘一次以登记新基准），然后重新派遣。`);
+        if (head) {
+          const baseline = loadMapBaseline(dshHome, cwd);
+          if (!baseline) {
+            process.stderr.write("caseos-dispatch-gate: 地图无基准拦截（.project-map.md 存在但未登记）\n");
+            return deny(
+              "地图尚无基准登记：请先让测绘增量校对，再用 write 重写 .project-map.md 登记基准",
+              "map-baseline-missing",
+            );
+          }
+          if (baseline !== head) {
+            const drift = mapDrift(cwd, baseline, head);
+            const behind = drift.commits === void 0 ? "" : `落后 ${drift.commits} 个提交`;
+            const files = drift.files === void 0 ? "" : `，区间改动 ${drift.files} 个文件`;
+            const readout = behind ? `（${behind}${files}）` : "";
+            process.stderr.write(`caseos-dispatch-gate: 地图过期拦截（HEAD 前进于登记基准）${readout}\n`);
+            return deny(
+              `项目地图已过期：main 自上次地图登记后又前进了${readout}（登记基准 ${baseline.slice(0, 8)} → 当前 HEAD ${head.slice(0, 8)}）。`
+              + `先 send_message 常驻测绘智能体做增量校对（manon-kg sync + 结构增量回报）；收到回报后用 write 更新 ${cwd}/${MAP_FILE}（即使结构无变化也原样落盘一次以登记新基准），然后重新派遣。`,
+              "map-stale",
+            );
+          }
         }
+      }
+      // 执行子代理并发上限：同一领导会话里运行中的执行子代理已达上限就拒绝，等回执再派。
+      const limit = executorCapLimit();
+      const live = liveAgentsOf(exec.agent, ctx.root);
+      const running = runningExecutors(live, exec.agent, activeScout, stateDir);
+      if (running.length >= limit) {
+        process.stderr.write(`caseos-dispatch-gate: 执行并发上限拦截（${running.length}/${limit}）\n`);
+        return deny(
+          `执行子代理并发已达上限 ${limit}（运行中：${running.join("、")}）：请结束本回合等回执后再派`,
+          "executor-cap",
+        );
       }
       return undefined;
     });

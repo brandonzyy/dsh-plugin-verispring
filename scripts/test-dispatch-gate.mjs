@@ -2,7 +2,10 @@
 // 派遣门禁行为测试：纯 node、无依赖，mock ctx 只提供 apply() 实际用到的服务面。
 // 核心不变量「常驻=可达」：可达测绘重复派遣被拒；end 非 completed 或 send_message 报
 // NOT_RESUMABLE 之后重派自动接替为测绘并注入地图；监控只在启动成功后记 start。
+// 第二组不变量（执行派遣的代码级门禁）：调研型任务书拦截、地图基准登记与新鲜度、
+// 执行子代理并发上限、回执保留 started subagent 前缀并附路由。
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,7 +13,21 @@ import plugin from "../gates/dispatch-gate.js";
 
 const MAP_TEXT = "## 入口表\n- gates/dispatch-gate.js: 派遣门禁\n- scripts/smoke-test.mjs: 冒烟\n";
 const SPEC_TEXT = "# 子代理派遣规范\n";
+const GIT_CONFIG = ["-c", "user.email=gate@test", "-c", "user.name=gate", "-c", "core.hooksPath=/dev/null"];
 let harnessSeq = 0;
+
+// 夹具仓库：门禁的地图新鲜度门用真 git 判定，提交夹具必须走真实 git。
+function git(cwd, args) {
+  return execFileSync("git", ["-C", cwd, ...GIT_CONFIG, ...args], { encoding: "utf8" }).trim();
+}
+
+function commitFile(cwd, name) {
+  writeFileSync(join(cwd, name), `${name}\n`);
+  git(cwd, ["add", "--", name]);
+  const message = join(cwd, ".git", `msg-${name}`);
+  writeFileSync(message, `add ${name}\n`);
+  git(cwd, ["commit", "-q", "-F", message, "--", name]);
+}
 
 function readJsonl(path) {
   try {
@@ -24,7 +41,10 @@ function makeHarness(options = {}) {
   harnessSeq += 1;
   const home = mkdtempSync(join(tmpdir(), "verispring-gate-home-"));
   const cwd = mkdtempSync(join(tmpdir(), "verispring-gate-cwd-"));
-  mkdirSync(`${cwd}/.git`, { recursive: true });
+  if (options.git) {
+    git(cwd, ["init", "-q", "."]);
+    for (let i = 0; i < (options.commits ?? 1); i += 1) commitFile(cwd, `file-${i}.md`);
+  } else mkdirSync(`${cwd}/.git`, { recursive: true });
   if (options.map !== false) writeFileSync(`${cwd}/.project-map.md`, options.map ?? MAP_TEXT);
 
   const sessionId = `session-${harnessSeq}`;
@@ -41,10 +61,22 @@ function makeHarness(options = {}) {
   const guards = [];
   const calls = { activation: [], select: [], rename: [] };
   const childAgents = new Map();
+  const roleFiles = () => `${home}/caseos/session-state`;
+  // 宿主 agents 注册表：运行中与否只看 status，归属由 session 血缘给出（与 leader-guard 同口径）。
+  const seedAgent = ({ id, status = "running", role, parentSession = sessionId, owned = false }) => {
+    const agent = { id, status, session: { header: { id, origin: "subagent", parentSession } } };
+    childAgents.set(id, agent);
+    if (role) {
+      mkdirSync(roleFiles(), { recursive: true });
+      writeFileSync(`${roleFiles()}/${id}.json`, `${JSON.stringify({ version: 1, role })}\n`);
+    }
+    return agent;
+  };
+  for (const entry of options.running ?? []) seedAgent(entry);
   const agents = {
-    list: () => [],
+    list: () => [...childAgents.values()],
     get: (id) => childAgents.get(id),
-    isOwnedBy: () => false,
+    isOwnedBy: (childId, leader) => childAgents.get(childId)?.owned === true && leader !== void 0,
   };
   const sessionTitle = { get: () => void 0, rename: (target, title) => calls.rename.push([target, title]) };
   const sessionController = { agents: { selectForNextRequest: (...args) => calls.select.push(args) } };
@@ -121,12 +153,17 @@ function makeHarness(options = {}) {
   };
   const leader = { id: sessionId, session, ctx: liveCtx };
   const routedTool = () => rootTools.get("subagent") ?? scopedTools.get("subagent");
+  const stateDir = `${home}/caseos/session-state`;
+  const baselineFile = `${home}/caseos/map-baselines.json`;
+  const head = () => git(cwd, ["rev-parse", "HEAD"]);
 
   return {
     leader,
+    cwd,
     scopedTools,
     scopedRestricted,
     calls,
+    seedAgent,
     emit: (name, payload) => {
       for (const callback of listeners.get(name) ?? []) callback(payload);
     },
@@ -139,6 +176,11 @@ function makeHarness(options = {}) {
       }
       return void 0;
     },
+    /** 领导的工具结果（tools/result 广播）：地图基准登记走这条 */
+    toolResult: (name, args, agent = leader) => {
+      const exec = { name, agent, arguments: args };
+      for (const callback of listeners.get("tools/result") ?? []) callback(exec, { isError: false });
+    },
     /** 领导 send_message 的结果（tools/result 广播） */
     sendMessageResult: (agentId, result, agent = leader) => {
       const exec = { name: "send_message", agent, arguments: { agent_id: agentId, message: "继续" } };
@@ -150,14 +192,26 @@ function makeHarness(options = {}) {
     },
     tool: () => routedTool(),
     dispatch: async (args, agent = leader) => routedTool().execute(args, { agent }),
+    /** 回执渲染（宿主与 client.js 读的那段文本） */
+    receipt: (value) => routedTool().output.render({}, value)[0].text,
     /** 直接写一条"上任测绘"状态，模拟跨进程遗留 */
     primeScout: (scoutId) => {
-      mkdirSync(`${home}/caseos/session-state`, { recursive: true });
-      writeFileSync(`${home}/caseos/session-state/${sessionId}.json`, `${JSON.stringify({ version: 1, scoutId })}\n`);
+      mkdirSync(stateDir, { recursive: true });
+      writeFileSync(`${stateDir}/${sessionId}.json`, `${JSON.stringify({ version: 1, scoutId })}\n`);
     },
     scoutState: () => {
       try {
-        return JSON.parse(readFileSync(`${home}/caseos/session-state/${sessionId}.json`, "utf8"));
+        return JSON.parse(readFileSync(`${stateDir}/${sessionId}.json`, "utf8"));
+      } catch {
+        return void 0;
+      }
+    },
+    head,
+    /** 夹具仓库前进一个提交（地图新鲜度门的「main 前进」） */
+    commit: (name) => commitFile(cwd, name),
+    baseline: () => {
+      try {
+        return JSON.parse(readFileSync(baselineFile, "utf8"))[cwd]?.commit;
       } catch {
         return void 0;
       }
@@ -392,6 +446,207 @@ test("测绘身份按状态目录隔离：别的 profile 的同名 id 不会互�
   assert.equal(first.scoutState().scoutUnreachable, "end=error");
   assert.equal(second.scoutState().scoutUnreachable, void 0);
   assert.match(second.guard({ description: "scout: 再派", prompt: "x" }), /scout-shared 仍可达/);
+});
+
+// ---- 执行派遣的代码级门禁：调研措辞、地图基准、并发上限、回执 ----
+
+// 环境变量是唯一来源：每条用例自己设置，退出时恢复，避免串味。
+async function withEnv(vars, fn) {
+  const saved = new Map(Object.keys(vars).map((key) => [key, process.env[key]]));
+  for (const [key, value] of Object.entries(vars)) process.env[key] = value;
+  try {
+    return await fn();
+  } finally {
+    for (const [key, value] of saved) {
+      if (value === void 0) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
+
+test("任务书命中调研型措辞被拒，文案指路常驻测绘并留 dispatch-deny", () => {
+  const harness = makeHarness();
+  harness.primeScout("scout-A");
+
+  const reason = harness.guard({ description: "改代码", prompt: "先调研一下这个模块的现状" });
+  assert.equal(typeof reason, "string");
+  assert.match(reason, /任务书含调研型措辞『先调研』/);
+  assert.match(reason, /send_message scout-A/);
+  assert.match(reason, /执行任务书只写改哪里、改成什么、怎么验证/);
+
+  const line = harness.monitor().find((entry) => entry.kind === "dispatch-deny");
+  assert.ok(line, "每条拒绝都要落 dispatch-deny");
+  assert.equal(line.rule, "brief-lint");
+  assert.equal(line.tool, "subagent");
+  assert.match(line.reason, /先调研/);
+});
+
+test("英文调研措辞同样被拦，执行任务书不误伤", () => {
+  const harness = makeHarness();
+  harness.primeScout("scout-A");
+
+  for (const term of ["investigate first", "research first", "read the source to figure out"]) {
+    assert.match(harness.guard({ description: "改代码", prompt: `please ${term} then edit` }), /调研型措辞/);
+  }
+  for (const term of ["先查清", "查清楚再", "先摸清", "读源码确认", "通读", "先读懂", "拿不准先读", "自行调研", "先排查根因再", "调研后再"]) {
+    assert.match(harness.guard({ description: "改代码", prompt: `请${term}动手` }), /调研型措辞/);
+  }
+  assert.equal(
+    harness.guard({ description: "改代码", prompt: "改 gates/x.js:12，把 a 改成 b，跑 node scripts/test-dispatch-gate.mjs" }),
+    void 0,
+  );
+});
+
+test("测绘派遣含调研措辞仍放行（首笔与接替都不受第 1、3 条约束）", async () => {
+  const harness = makeHarness();
+  assert.equal(harness.guard({ description: "随便写", prompt: "先调研整个仓库并回报入口表" }), void 0);
+
+  const first = await harness.dispatch({ description: "随便写", prompt: "先调研整个仓库并回报入口表" });
+  assert.ok(first.subagentId);
+  assert.match(harness.calls.activation[0].label, / · scout · /);
+});
+
+test("CASEOS_BRIEF_LINT=0 关闭调研措辞拦截", async () => {
+  await withEnv({ CASEOS_BRIEF_LINT: "0" }, async () => {
+    const harness = makeHarness();
+    harness.primeScout("scout-A");
+
+    assert.equal(harness.guard({ description: "改代码", prompt: "先调研一下" }), void 0);
+    assert.equal(harness.monitor().filter((entry) => entry.kind === "dispatch-deny").length, 0);
+  });
+});
+
+test("write 与 edit .project-map.md 都登记基准，相对路径同样认", () => {
+  const harness = makeHarness({ git: true });
+
+  harness.toolResult("edit", { file_path: `${harness.cwd}/.project-map.md` });
+  assert.equal(harness.baseline(), harness.head(), "edit 绝对路径应登记基准");
+
+  harness.commit("next.md");
+  assert.equal(harness.baseline() === harness.head(), false);
+
+  harness.toolResult("write", { file_path: ".project-map.md" });
+  assert.equal(harness.baseline(), harness.head(), "write 相对路径应登记基准");
+
+  harness.commit("again.md");
+  harness.toolResult("edit", { file_path: "./.project-map.md" });
+  assert.equal(harness.baseline(), harness.head(), "edit 的 ./ 相对路径应登记基准");
+
+  // 别的文件不算地图登记：基准不能因此翻新。
+  harness.commit("other.md");
+  harness.toolResult("write", { file_path: `${harness.cwd}/README.md` });
+  assert.equal(harness.baseline() === harness.head(), false);
+});
+
+test("有地图但没有基准登记时拒绝执行派遣，提示先校对再 write 登记", () => {
+  const harness = makeHarness({ git: true });
+  harness.primeScout("scout-A");
+
+  const reason = harness.guard({ description: "改代码", prompt: "把 a 改成 b" });
+  assert.equal(typeof reason, "string");
+  assert.match(reason, /^地图尚无基准登记/);
+  assert.match(reason, /测绘增量校对/);
+  assert.match(reason, /write 重写 \.project-map\.md 登记基准/);
+
+  const line = harness.monitor().find((entry) => entry.kind === "dispatch-deny");
+  assert.equal(line.rule, "map-baseline-missing");
+});
+
+test("无地图时仍走地图前置门禁，不被基准判定抢先", () => {
+  const harness = makeHarness({ git: true, map: false });
+  harness.primeScout("scout-A");
+
+  const reason = harness.guard({ description: "改代码", prompt: "把 a 改成 b" });
+  assert.match(reason, /必须先有项目地图/);
+  assert.equal(harness.monitor().filter((entry) => entry.kind === "dispatch-deny").length, 0, "既有地图前置门禁仍记 gate-deny");
+});
+
+test("地图落后时拒绝并写清落后提交数与区间改动文件数", () => {
+  const harness = makeHarness({ git: true });
+  harness.primeScout("scout-A");
+  harness.toolResult("write", { file_path: `${harness.cwd}/.project-map.md` });
+  assert.equal(harness.guard({ description: "改代码", prompt: "把 a 改成 b" }), void 0, "基准与 HEAD 一致应放行");
+
+  harness.commit("one.md");
+  harness.commit("two.md");
+
+  const reason = harness.guard({ description: "改代码", prompt: "把 a 改成 b" });
+  assert.match(reason, /项目地图已过期/);
+  assert.match(reason, /落后 2 个提交/);
+  assert.match(reason, /区间改动 2 个文件/);
+  assert.match(reason, /send_message 常驻测绘智能体/);
+
+  const line = harness.monitor().find((entry) => entry.kind === "dispatch-deny");
+  assert.equal(line.rule, "map-stale");
+});
+
+test("只新增未跟踪文件不算地图过期（只比较提交）", () => {
+  const harness = makeHarness({ git: true });
+  harness.primeScout("scout-A");
+  harness.toolResult("write", { file_path: `${harness.cwd}/.project-map.md` });
+
+  writeFileSync(`${harness.cwd}/scratch.md`, "未跟踪\n");
+  assert.equal(harness.guard({ description: "改代码", prompt: "把 a 改成 b" }), void 0);
+});
+
+test("运行中 3 个执行子代理时第 4 个被拒，测绘不计入上限", () => {
+  const harness = makeHarness({
+    running: [
+      { id: "exec-1", role: "executor" },
+      { id: "exec-2", role: "executor" },
+      { id: "scout-A", role: "scout" },
+    ],
+  });
+  harness.primeScout("scout-A");
+
+  assert.equal(harness.guard({ description: "改代码", prompt: "把 a 改成 b" }), void 0, "2 执行 + 1 测绘仍在限额内");
+
+  harness.seedAgent({ id: "exec-3", role: "executor" });
+  const reason = harness.guard({ description: "改代码", prompt: "把 a 改成 b" });
+  assert.match(reason, /执行子代理并发已达上限 3/);
+  assert.match(reason, /exec-1、exec-2、exec-3/);
+  assert.match(reason, /请结束本回合等回执后再派/);
+
+  const line = harness.monitor().find((entry) => entry.kind === "dispatch-deny");
+  assert.equal(line.rule, "executor-cap");
+});
+
+test("CASEOS_MAX_EXECUTORS=5 时 4 个运行中执行者仍放行", async () => {
+  await withEnv({ CASEOS_MAX_EXECUTORS: "5" }, async () => {
+    const harness = makeHarness({
+      running: ["exec-1", "exec-2", "exec-3", "exec-4"].map((id) => ({ id, role: "executor" })),
+    });
+    harness.primeScout("scout-A");
+
+    assert.equal(harness.guard({ description: "改代码", prompt: "把 a 改成 b" }), void 0);
+    harness.seedAgent({ id: "exec-5", role: "executor" });
+    assert.match(harness.guard({ description: "改代码", prompt: "把 a 改成 b" }), /并发已达上限 5/);
+  });
+});
+
+test("运行中但不属于本领导会话的子代理不占本会话名额", () => {
+  const harness = makeHarness({ running: [{ id: "foreign-1", role: "executor", parentSession: "session-other" }] });
+  harness.primeScout("scout-A");
+
+  assert.equal(harness.guard({ description: "改代码", prompt: "把 a 改成 b" }), void 0);
+});
+
+test("派遣回执保留 started subagent 前缀并附路由与角色，测绘接替补旧 id", async () => {
+  const harness = makeHarness();
+  harness.primeScout("scout-A");
+  harness.emit("subagent/end", { id: "scout-A", provider: "spawn", stopReason: "error" });
+
+  const takeover = await harness.dispatch({ description: "随便写", prompt: "增量校对" });
+  const takeoverText = harness.receipt(takeover);
+  assert.ok(takeoverText.startsWith(`started subagent ${takeover.subagentId}`), `前缀必须原样保留：${takeoverText}`);
+  assert.match(takeoverText, /（路由：verispring\/deepseek-flash@high · 角色：scout）/);
+  assert.match(takeoverText, /已接替不可达测绘 scout-A/);
+
+  const executor = await harness.dispatch({ description: "改代码", prompt: "把 a 改成 b" });
+  const executorText = harness.receipt(executor);
+  assert.ok(executorText.startsWith(`started subagent ${executor.subagentId}`));
+  assert.match(executorText, /（路由：verispring\/deepseek-flash@high · 角色：executor）/);
+  assert.doesNotMatch(executorText, /已接替不可达测绘/);
 });
 
 let failed = 0;
