@@ -619,38 +619,37 @@ test("只新增未跟踪文件不算地图过期（只比较提交）", () => {
   assert.equal(harness.guard({ description: "改代码", prompt: "把 a 改成 b" }), void 0);
 });
 
-test("运行中 3 个执行子代理时第 4 个被拒，测绘不计入上限", () => {
+test("运行中 8 个执行子代理时第 9 个被拒，测绘不计入上限", () => {
   const harness = makeHarness({
     running: [
-      { id: "exec-1", role: "executor" },
-      { id: "exec-2", role: "executor" },
+      ...[1, 2, 3, 4, 5, 6, 7].map((n) => ({ id: `exec-${n}`, role: "executor" })),
       { id: "scout-A", role: "scout" },
     ],
   });
   harness.primeScout("scout-A");
 
-  assert.equal(harness.guard({ description: "改代码", prompt: "把 a 改成 b" }), void 0, "2 执行 + 1 测绘仍在限额内");
+  assert.equal(harness.guard({ description: "改代码", prompt: "把 a 改成 b" }), void 0, "7 执行 + 1 测绘仍在限额内");
 
-  harness.seedAgent({ id: "exec-3", role: "executor" });
+  harness.seedAgent({ id: "exec-8", role: "executor" });
   const reason = harness.guard({ description: "改代码", prompt: "把 a 改成 b" });
-  assert.match(reason, /执行子代理并发已达上限 3/);
-  assert.match(reason, /exec-1、exec-2、exec-3/);
+  assert.match(reason, /执行子代理并发已达上限 8/);
+  assert.match(reason, /exec-1、exec-2、exec-3、exec-4、exec-5、exec-6、exec-7、exec-8/);
   assert.match(reason, /请结束本回合等回执后再派/);
 
   const line = harness.monitor().find((entry) => entry.kind === "dispatch-deny");
   assert.equal(line.rule, "executor-cap");
 });
 
-test("CASEOS_MAX_EXECUTORS=5 时 4 个运行中执行者仍放行", async () => {
-  await withEnv({ CASEOS_MAX_EXECUTORS: "5" }, async () => {
-    const harness = makeHarness({
-      running: ["exec-1", "exec-2", "exec-3", "exec-4"].map((id) => ({ id, role: "executor" })),
-    });
+test("CASEOS_MAX_EXECUTORS=2 时 1 个运行中执行者放行、2 个运行中时第 3 个被拒", async () => {
+  await withEnv({ CASEOS_MAX_EXECUTORS: "2" }, async () => {
+    const harness = makeHarness({ running: [{ id: "exec-1", role: "executor" }] });
     harness.primeScout("scout-A");
 
     assert.equal(harness.guard({ description: "改代码", prompt: "把 a 改成 b" }), void 0);
-    harness.seedAgent({ id: "exec-5", role: "executor" });
-    assert.match(harness.guard({ description: "改代码", prompt: "把 a 改成 b" }), /并发已达上限 5/);
+    harness.seedAgent({ id: "exec-2", role: "executor" });
+    const reason = harness.guard({ description: "改代码", prompt: "把 a 改成 b" });
+    assert.match(reason, /并发已达上限 2/);
+    assert.match(reason, /exec-1、exec-2/);
   });
 });
 

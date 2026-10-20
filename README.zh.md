@@ -10,7 +10,7 @@ Verispring 三角色会话架构 + 本地知识图谱 manon，大幅度优化主
 | 1 | 派遣规范门 | `subagent` / `subagent_fork` 前本会话必须出现过《子代理派遣规范》内容（读结果含规范首行标记即记为已读；状态持久化在会话日志里，跨进程重启不丢） |
 | 2 | scout 常驻（按可达性） | 每会话首笔派遣由运行时定为测绘（description 只是展示标签）。权威事实是**可达性**，不是 description 前缀：可达测绘还在时再派测绘一律拒绝，指路 `send_message` 复用（测绘应询结束显示 finished/inactive 属正常，`send_message` 会冷恢复它）；它真的不可达后（`end` 停止原因非 `completed`，或 `send_message` 报 unavailable），下一笔派遣自动接替为测绘并重新注入地图。子代理角色 spawn 时落盘（`session-state/<子会话id>.json`），重载后按落盘角色与标题恢复 |
 | 3 | 地图前置 + 基准 | 非测绘派遣要求 `<会话工作区>/.project-map.md` 存在（`.git`/`.manon` 在场才认定项目根，否则 fail-open）；对该文件的 `write`/`edit` 成功即把当前 HEAD 登记为地图基准，HEAD 前进过基准就拒绝执行派遣（指路测绘增量校对 + 用 `write` 整文件重写登记新基准）。地图在而基准缺失同样拒绝，不再 fail-open——陈旧地图不会永久放行。仅 `CASEOS_SCOUT=0` 或读不到 HEAD 时放行 |
-| 4 | 任务书闸 + 并发上限 | 执行任务书是成果描述，不是调研请求：含调研型措辞（`gates/dispatch-gate.js` 的 `BRIEF_LINT_TERMS`）即拒绝并指路 `send_message` 测绘——**带否定的说法豁免**（命中词前 6 个字符内有否定词，如「不要通读实现」「禁止先调研」）。同一领导会话里运行中的执行子代理有上限（缺省 3），超限拒绝并提示结束回合等回执。两者各有开关（`CASEOS_BRIEF_LINT=0`、`CASEOS_MAX_EXECUTORS`） |
+| 4 | 任务书闸 + 并发上限 | 执行任务书是成果描述，不是调研请求：含调研型措辞（`gates/dispatch-gate.js` 的 `BRIEF_LINT_TERMS`）即拒绝并指路 `send_message` 测绘——**带否定的说法豁免**（命中词前 6 个字符内有否定词，如「不要通读实现」「禁止先调研」）。同一领导会话里运行中的执行子代理有上限（缺省 8），超限拒绝并提示结束回合等回执。两者各有开关（`CASEOS_BRIEF_LINT=0`、`CASEOS_MAX_EXECUTORS`） |
 | 5 | 模型钉死 | 路由在运行时按角色强制注入：首笔派遣走面板测绘路由，其后走执行路由；调用里显式写的 `provider`/`model` 一律忽略。`subagent_fork` 一律拒绝 |
 | 6 | 提交门 | `git commit` 前必须先读 `~/.dsh/specs/代码写作规范.md`；提交形状强制 `-F 文件 -- 显式路径`，`timeout`/`env`/`nice`/`nohup`/`stdbuf` 等包装命令穿透识别 |
 | 7 | 领导面限定 | 领导会话工具面收缩到复核五件（`bash`/`edit`/`write`/`read`/`read_image`）+ 派遣面（`subagent`/`send_message`/`interrupt_agent`/`list_agents`），名单与领导视图里实际存在的工具取交集（桌面工具在 preset 层，headless 在根层），派遣工具以瘦身定义遮蔽；`subagent-base` 在 root 层无条件隐藏（路由执行体异常时模型无路可绕）。测绘/执行子代理用 `verispring-subagent` preset 的全量工具面，测绘随派遣请求硬禁 `edit`/`write`。逃生开关 `CASEOS_SCOUT=0` 关闭分工条款中的测绘部分 |
@@ -26,7 +26,7 @@ Verispring 三角色会话架构 + 本地知识图谱 manon，大幅度优化主
 |---|---|---|
 | `CASEOS_SCOUT` | 开 | `0` 关闭分工条款中的测绘部分与地图新鲜度/基准判定 |
 | `CASEOS_BRIEF_LINT` | 开 | `0` 关闭执行任务书的调研措辞拦截 |
-| `CASEOS_MAX_EXECUTORS` | `3` | 每领导会话运行中执行子代理上限（`0` 等于禁止一切执行派遣） |
+| `CASEOS_MAX_EXECUTORS` | `8` | 每领导会话运行中执行子代理上限（`0` 等于禁止一切执行派遣）。插件上限 8 与宿主 `maxActiveSubagents` 的缺省值 8 同值（测绘也计入宿主名额），因此测绘在运行时第 8 个执行者可能被宿主以 `ACTIVATION_LIMIT_REACHED` 拒绝 |
 | `CASEOS_LEADER_GUARD` | 开 | `0` 在装配时关闭领导守卫 |
 | `CASEOS_LEADER_WRITE_ALLOW` | 空 | 以 `:` 分隔的额外可写路径前缀（领导 `edit`/`write`） |
 | `CASEOS_SCOUT_RELAY` | 开 | `0` 不注册 `ask_scout`，且停止转交、检查点与提示注入 |

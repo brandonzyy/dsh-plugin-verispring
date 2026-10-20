@@ -30,7 +30,7 @@
 //   （gates/monitor-log.js）；start 只在 spawn 成功后才记。
 // 7 任务书与并发（只约束执行派遣）：任务书命中调研型措辞即拒绝（清单见 BRIEF_LINT_TERMS，
 //   CASEOS_BRIEF_LINT=0 关闭）——调研是常驻测绘的职责，执行任务书只写改哪里、改成什么、
-//   怎么验证；同一领导会话里运行中的执行子代理数达上限即拒绝（CASEOS_MAX_EXECUTORS，默认 3；
+//   怎么验证；同一领导会话里运行中的执行子代理数达上限即拒绝（CASEOS_MAX_EXECUTORS，默认 8；
 //   测绘不计入）。测绘派遣在本次派遣即测绘时直接放行（第 3 条与本节都跳过，建图与调研正是
 //   它要做的事）。这两条与地图门禁的拒绝都记 kind=dispatch-deny 并带规则名，与既有 gate-deny
 //   分开，便于审计哪条规则在拦。派遣回执保留 "started subagent <id>" 前缀原样（宿主与
@@ -67,8 +67,8 @@ const BRIEF_LINT_TERMS = [
   "research first",
   "read the source to figure out",
 ];
-// 并发上限的缺省值：环境变量 CASEOS_MAX_EXECUTORS 是唯一来源，缺省/非法回落 3。
-const EXECUTOR_CAP_DEFAULT = 3;
+// 并发上限的缺省值：环境变量 CASEOS_MAX_EXECUTORS 是唯一来源，缺省/非法回落 8。
+const EXECUTOR_CAP_DEFAULT = 8;
 // 用户配置文件（配置面板写入）：{ scout: {...}, executor: {...} }。
 // 读取失败/缺省回落常量，门禁永不因配置文件崩。
 import { execFileSync } from "node:child_process";
