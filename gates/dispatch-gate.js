@@ -537,7 +537,21 @@ const plugin = {
     // 新建主会话的首个回合可能在 agent/created 返回后立刻开始；在正式生成
     // 回合前再绑定一次，确保模型拿到的是本插件的强制路由入口，而不是原始工具。
     ctx.root.on("agent/pre-step", async ({ agent }, next) => {
-      if (agent?.session?.header?.origin === "subagent") applyChildRoute(agent, childRoutePlans.get(agent.id) ?? childPlan(agent));
+      if (agent?.session?.header?.origin === "subagent") {
+        const cached = childRoutePlans.get(agent.id) ?? childPlan(agent);
+        if (cached) {
+          // 角色终身不变（缓存/落盘为准），路由每回合现读面板配置：模型变更对进行中的
+          // 常驻测绘与执行子代理下一回合即生效，不必重派、不必重启。
+          const route = loadRoutes(configFile)[cached.role] ?? cached.route;
+          if (routeText(route) !== routeText(cached.route)) {
+            const suffix = cached.label.split(" · ").slice(2).join(" · ");
+            const label = `${routeText(route)} · ${cached.role}${suffix ? ` · ${suffix}` : ""}`;
+            monitorEvent(dshHome, { kind: "child-route-updated", agent: agent.id, role: cached.role, to: routeText(route) });
+            applyChildRoute(agent, { ...cached, route, label }, ctx);
+            renameChildTitleAfterAutoTitle(ctx, agent.id, label);
+          } else applyChildRoute(agent, cached, ctx);
+        }
+      }
       await installLeaderTool(agent);
       return next();
     });
