@@ -49,6 +49,11 @@ if (!manonText.includes("(?<![\\w.])")) fail("Manon 密钥文件名检测缺少�
 if (readsSecretFile("bash -c 'source ~/.dsh/manon.env; manon-kg sync'")) fail("Manon source 调用式被误判为读取密钥");
 if (!readsSecretFile("cat ~/.dsh/manon.env")) fail("Manon 明文读取密钥未被拦截");
 if (!codestyleText.includes("ctx.profileContext?.home") || !codestyleText.includes("specPath")) fail("提交门禁未使用 DSH profile home");
+const leaderGuardText = readFileSync(join(root, "gates/leader-guard.js"), "utf8");
+if (!patchText.includes("id: caseos-leader-guard") || !patchText.includes("name: './gates/leader-guard.js'")) fail("cordis.patch.yml 未注册 leader-guard 门禁");
+if (!leaderGuardText.includes("CASEOS_LEADER_GUARD") || !leaderGuardText.includes("CASEOS_LEADER_WRITE_ALLOW")) fail("leader-guard 未实现关闭开关与写白名单环境变量");
+if (!leaderGuardText.includes("leader-guard-deny") || !leaderGuardText.includes("monitorEvent")) fail("leader-guard 拒绝未落监控");
+if (!leaderGuardText.includes("ctx.tools.guard")) fail("leader-guard 未通过宿主 guard 拒绝工具调用");
 if (!dispatchText.includes("${routeText(route)} · ${role} · ${label}")) fail("子代理显示标题未包含实际模型路由");
 if (!dispatchText.includes("【实际路由：${role} · ${routeText(route)}】")) fail("子代理任务未携带实际模型路由元信息");
 if (!dispatchText.includes("sessionTitle.rename(agent.session, title)")) fail("子代理标题未调用 DSH sessionTitle.rename");
@@ -68,6 +73,7 @@ const sourceFiles = [
     .filter((name) => name.endsWith(".js"))
     .map((name) => join("gates", name)),
 ];
+if (!sourceFiles.includes(join("gates", "leader-guard.js"))) fail("gates/leader-guard.js 不在语法检查清单里");
 for (const file of sourceFiles) {
   try { run(process.execPath, ["--check", file]); }
   catch (error) { fail(String(error)); }
