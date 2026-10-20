@@ -69,7 +69,7 @@ const plugin = {
     const scoutClause =
       process.env.CASEOS_SCOUT === "0"
         ? ""
-        : "常驻测绘智能体：派执行任务前，先确保有一个 description 以“测绘智能体”开头的只读智能体常驻（它被硬禁改码）。测绘智能体只派遣一次，之后 send_message 复用；重复派遣与无地图派遣（仓库根没有 .project-map.md）会被插件拒绝。产出=入口表 ≤20 行，由你用 write 落盘为仓库根 .project-map.md；仓库已有该文件时测绘智能体只做增量校对。执行任务书的定位与事实先 send_message 问它，执行完成后让它把新结构事实并入地图。";
+        : "常驻测绘智能体：派执行任务前，先确保有一个只读智能体常驻（它被硬禁改码）；它的 description 以“测绘智能体”或“scout:”开头均可，识别以运行时角色为准。测绘应询结束显示 finished/inactive 是正常的，send_message 即可续接；测绘不可达时直接重派，插件会自动接替并注入地图。产出=入口表 ≤20 行，由你用 write 落盘为仓库根 .project-map.md；仓库已有该文件时测绘智能体只做增量校对。执行任务书的定位与事实先 send_message 问它，执行完成后让它把新结构事实并入地图。";
     ctx.systemPrompt.section({
       name: "caseos:leader-dispatch",
       order: ctx.systemPrompt.getSectionOrder("TOOL_SUBAGENT"),
