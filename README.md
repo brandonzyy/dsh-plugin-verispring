@@ -111,10 +111,13 @@ injected invocation.
 - **Spec files**: `~/.dsh/specs/子代理派遣规范.md` and `~/.dsh/specs/代码写作规范.md`
   (resolved against the home directory). Missing specs mean the corresponding gate keeps
   denying with directions — by design: every denial must be satisfiable.
-- **Model route**: the profile needs a `verispring` provider with a `deepseek-flash`
-  model (via `llm-pi-ai` or an equivalent adapter). For another gateway, update
-  `agentOptions` in `cordis.patch.yml` and `DEFAULT_ROUTES` in
-  `gates/dispatch-gate.js`, keeping the two in sync (a saved panel wins via `~/.dsh/verispring.json`).
+- **Model route**: the profile needs a `verispring-ds` provider with a `deepseek-flash`
+  model, registered by the `verispring-deepseek` entry in the bundled `cordis.patch.yml`
+  through this plugin's `deepseek-gateway` (it reuses the `dsh-llm-deepseek` adapter, which
+  is what makes the effort level travel as `output_config.effort`). The bundled
+  `agentOptions` and `DEFAULT_ROUTES` in `gates/dispatch-gate.js` use the same route —
+  keep them in sync (a saved panel wins via `~/.dsh/verispring.json`). For another gateway,
+  change those two places plus the plugin's `baseURL`.
 - **manon (optional)**: bundled — no local install needed. Keys live in `~/.dsh/manon.env`
   (`MANON_EMBEDDING_API_KEY`, sync embeddings) and `~/.dsh/verispring.env`
   (`VERISPRING_API_KEY`, deep-query fallback); the injected invocation sources both files
@@ -160,8 +163,13 @@ Three agent route slots are configurable in the plugin panel; the main session u
 | Manon Deep Query | choose the verispring provider, model, and effort in the panel; key falls back to `VERISPRING_API_KEY` | **DeepSeek Flash + off** (shipped as recommended); saving writes `~/.dsh/manon.env` and the sourced invocation uses it. |
 | embedding | env: `MANON_EMBEDDING_URL` / `MANON_EMBEDDING_MODEL` / `MANON_EMBEDDING_API_KEY` (defaults to SiliconFlow `BAAI/bge-m3`) | the built-in bge-m3 is the recommendation; switching requires a re-sync to rebuild vectors |
 
-Minimal main-session + gateway config (goes into the profile's `cordis.patch.yml`; pairs with
-the plugin-pinned `verispring`/`deepseek-flash` route):
+Main-session gateway config (goes into the profile's `cordis.patch.yml`). `verispring` =
+leader-side `claude-opus-5-5` (pi-ai, adaptive thinking); `verispring-ds` = every
+`deepseek-flash` dispatch, registered by the bundled `verispring-deepseek` entry through
+`deepseek-gateway` (which reuses `dsh-llm-deepseek`, so the effort level actually travels as
+`output_config.effort`). That insert ships with the package — do **not** insert it again in
+the profile (same id collides); the profile only needs to provide the pi-ai `verispring`
+channel:
 
 ```yaml
 - id: llm-pi-ai
@@ -172,11 +180,15 @@ the plugin-pinned `verispring`/`deepseek-flash` route):
         apiKeyEnv: VERISPRING_API_KEY
         api: anthropic-messages
         baseURL: https://api.verispring.cn
+        streamIdleTimeoutMs: 600000
         models:
           - id: claude-opus-5-5
             name: Claude Opus 5.5
             contextWindow: 1000000
             maxTokens: 128000
+            input:
+              - text
+              - image
             compat:
               forceAdaptiveThinking: true
             reasoningEfforts:
@@ -185,20 +197,19 @@ the plugin-pinned `verispring`/`deepseek-flash` route):
               high: high
               xhigh: xhigh
               max: max
-          - id: deepseek-flash
-            name: DeepSeek Flash
-            contextWindow: 1000000
-            maxTokens: 384000
-            reasoningEfforts:
-              'off': null
-              low: low
-              high: high
-              max: max
+
 - id: agent-default-model
   config:
     provider: verispring
     model: claude-opus-5-5
 ```
+
+The gateway's anthropic exit emits a duplicate `message_start` for short replies with
+thinking enabled; `llm-deepseek` fails hard on it with `MALFORMED_RESPONSE` (pi-ai only
+updates usage, so the pi-ai route never surfaced it). Until the gateway is fixed, the bundled
+`verispring-deepseek` entry carries `dedupeDuplicateMessageStart: true`: it drops only the
+duplicate `message_start` frames for that endpoint and streams everything else through.
+Remove that switch once the gateway fix ships and re-tests green.
 
 > **Exclusive discounts**: contact the package author — **20% off Claude, 50% off DeepSeek Flash**; WeChat: `jinyong0716`.
 
