@@ -55,12 +55,18 @@ function makeHarness(options = {}) {
   };
 
   const services = { agents: { get: (id) => agentsMap.get(id), list: () => [...agentsMap.values()] }, subagents };
+  // systemPrompt 段落：收集注入文案，按 scope 现算（与 leader-scope 同写法）。
+  const sections = new Map();
 
   const ctx = {
     profileContext: { home },
     get: (name) => services[name],
     on: (name, callback) => listeners.set(name, [...(listeners.get(name) ?? []), callback]),
     tools: { register: (definition) => registeredTools.set(definition.name, definition) },
+    systemPrompt: {
+      getSectionOrder: () => 100,
+      section: (definition) => sections.set(definition.name, definition),
+    },
   };
   ctx.root = ctx;
   ctx.root.on = ctx.on;
@@ -124,6 +130,8 @@ function makeHarness(options = {}) {
     checkpoint: (childId) => readJson(`${checkpointDir}/${childId}.json`),
     monitor: () => readJsonl(`${home}/verispring-monitor.jsonl`),
     preExecuteCount: () => (listeners.get("tools/pre-execute") ?? []).length,
+    /** 子代理提示段：按 scope 现算，返回注入正文（领导/测绘为空串）。 */
+    locator: (scope) => sections.get("caseos:scout-relay")?.text({ scope }),
   };
 }
 
@@ -406,6 +414,34 @@ test("无检查点或别的会话的检查点都不拦截 send_message", async (
   assert.equal(harness.sent.length, 0);
 });
 
+test("执行者提示注入：有可达测绘指 ask_scout，无可达测绘改为写进汇报，领导与测绘为空", () => {
+  const harness = makeHarness();
+  harness.primeScout("scout-A");
+  const scout = harness.childAgent("scout-A");
+  harness.primeRole("scout-A", "scout");
+  const executor = harness.childAgent("exec-1");
+
+  const withScout = harness.locator(executor);
+  assert.match(withScout, /ask_scout 问常驻测绘 scout-A/);
+  assert.match(withScout, /不要自己通读实现/);
+  assert.match(withScout, /结构增量/);
+  assert.match(withScout, /没有就写「无」/);
+  assert.ok(withScout.split("\n").length <= 4, "注入不超过 4 行");
+
+  // 测绘自己与领导不注入
+  assert.equal(harness.locator(scout), "");
+  assert.equal(harness.locator(harness.leader), "");
+
+  // 无可达测绘：同一段改用「写进汇报」
+  const lonely = makeHarness();
+  const lonelyExec = lonely.childAgent("exec-noscout");
+  const without = lonely.locator(lonelyExec);
+  assert.match(without, /没有可达测绘/);
+  assert.match(without, /写进汇报/);
+  assert.doesNotMatch(without, /ask_scout 问常驻测绘/);
+  assert.match(without, /结构增量/);
+});
+
 test("CASEOS_SCOUT_RELAY=0 时工具、转交、检查点、注入全部不生效", async () => {
   const harness = makeHarness({ relay: false });
   harness.primeScout("scout-A");
@@ -414,6 +450,7 @@ test("CASEOS_SCOUT_RELAY=0 时工具、转交、检查点、注入全部不生�
 
   assert.equal(harness.tools().has("ask_scout"), false);
   assert.equal(harness.preExecuteCount(), 0);
+  assert.equal(harness.locator(child), void 0, "关闭后不得注入提示段");
 
   await harness.emit("subagent/end", {
     id: child.id,

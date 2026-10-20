@@ -15,7 +15,9 @@ const SUMMARY_LIMIT = 200;
 const PAUSE_TEXT = "请结束本回合等回执，回执会自动唤醒本会话；不要用 sleep/循环等待";
 const REPEAT_REASON = "本回合已查过状态；请结束回合等回执";
 const SLEEP_UNITS = new Map([["s", 1], ["m", 60], ["h", 3600], ["d", 86400]]);
-const GIT_MUTATIONS = new Set(["commit", "push", "merge", "rebase", "cherry-pick", "restore", "stash"]);
+const GIT_MUTATIONS = new Set(["commit", "push", "merge", "rebase", "cherry-pick", "restore"]);
+// stash 的只读子命令放行（查现场用）；push/pop/apply/drop/clear 与裸 stash 照旧算改动。
+const GIT_STASH_READ_ONLY = new Set(["list", "show"]);
 const GIT_OPTIONS_WITH_VALUE = new Set(["-C", "-c", "--git-dir", "--work-tree", "--namespace"]);
 const WRAPPERS = new Set(["sudo", "time", "nohup", "command", "exec", "env"]);
 const WHITELIST_TEXT = [".project-map.md", "路径含 /reports/", "~/.dsh/AGENTS.md"];
@@ -132,8 +134,14 @@ function gitMutation(tokens) {
   }
   const subcommand = tokens[index];
   if (subcommand === undefined) return false;
-  if (GIT_MUTATIONS.has(subcommand)) return true;
   const rest = tokens.slice(index + 1);
+  if (subcommand === "stash") {
+    // 裸 `git stash` 等于 stash push（改动工作区）；只放行 list/show 两个只读子命令，
+    // `stash@{n}` 这类引用不是子命令，跳过。
+    const action = rest.find((token) => !token.startsWith("-") && !/^stash@\{/.test(token));
+    return !GIT_STASH_READ_ONLY.has(action);
+  }
+  if (GIT_MUTATIONS.has(subcommand)) return true;
   if (subcommand === "reset") return rest.includes("--hard");
   if (subcommand === "checkout") return rest.includes("--");
   return false;

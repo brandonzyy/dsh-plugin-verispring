@@ -123,6 +123,21 @@ check("git commit 被拒、git diff --stat 放行", () => {
   allow(running().call("bash", { command: "git diff --stat 3e44ecf" }), "git diff --stat");
   allow(running().call("bash", { command: "git status --short && git log --oneline -1" }), "git status/log");
 });
+check("git stash list/show 放行，其余 stash 子命令被拒", () => {
+  allow(running().call("bash", { command: "git stash list" }), "git stash list");
+  allow(running().call("bash", { command: "git stash show -p stash@{0}" }), "git stash show");
+  allow(running().call("bash", { command: "git -C /repo stash list" }), "git -C stash list");
+  for (const command of [
+    "git stash",
+    "git stash push -m wip",
+    "git stash pop",
+    "git stash apply stash@{0}",
+    "git stash drop stash@{0}",
+    "git stash clear",
+  ]) {
+    denyWith(running().call("bash", { command }), "领导不亲自改码");
+  }
+});
 check("sed -i / perl -i / rm -rf 被拒", () => {
   denyWith(running().call("bash", { command: "sed -i '' 's/a/b/' gates/x.js" }), "领导不亲自改码");
   denyWith(running().call("bash", { command: "perl -pi -e 's/a/b/' gates/x.js" }), "领导不亲自改码");

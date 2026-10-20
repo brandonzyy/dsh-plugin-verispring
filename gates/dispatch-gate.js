@@ -111,11 +111,29 @@ function isScoutDescription(description) {
   return value.startsWith("测绘智能体") || value.startsWith("scout");
 }
 
+// 否定豁免：命中词前 6 个字符以内出现否定词，就是在要求「别这么做」，不构成命中
+// （「不要通读实现」「禁止先调研」「do not investigate first」都应放行）。距离按否定词
+// 结尾到命中词开头算，多字否定词（do not）才不会因自身长度被挤出窗口。同一词出现
+// 多次时任一处未被否定即拒。
+const BRIEF_LINT_NEGATIONS = ["不", "禁止", "勿", "别", "无需", "不要", "不必", "严禁", "don't", "don’t", "do not", "never"];
+const BRIEF_LINT_NEGATION_WINDOW = 6;
+
+function negatedAt(text, at) {
+  const head = text.slice(0, at);
+  return BRIEF_LINT_NEGATIONS.some((negation) => {
+    const found = head.lastIndexOf(negation);
+    return found !== -1 && at - (found + negation.length) <= BRIEF_LINT_NEGATION_WINDOW;
+  });
+}
+
 // 任务书里的调研型措辞：命中即拒（回填命中词用于拒绝文案）。英文按小写匹配。
 function briefLintTerm(prompt) {
   const text = String(prompt ?? "").toLowerCase();
   for (const term of BRIEF_LINT_TERMS) {
-    if (text.includes(term.toLowerCase())) return term;
+    const needle = term.toLowerCase();
+    for (let at = text.indexOf(needle); at !== -1; at = text.indexOf(needle, at + needle.length)) {
+      if (!negatedAt(text, at)) return term;
+    }
   }
   return void 0;
 }

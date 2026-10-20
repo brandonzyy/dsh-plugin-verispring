@@ -226,7 +226,7 @@ function errorTextOf(info) {
 
 export default {
   name: "caseos-scout-relay",
-  inject: ["tools", "agents", "subagents", "profileContext"],
+  inject: ["tools", "agents", "subagents", "profileContext", "systemPrompt"],
   apply(ctx) {
     // 整体开关：关掉即不注册工具、不挂监听，运行时回到纯提示词行为。
     if (process.env[RELAY_ENV] === "0") return;
@@ -416,6 +416,36 @@ export default {
     } catch (error) {
       process.stderr.write(`caseos-scout-relay: ${TOOL_NAME} 注册失败: ${String(error)}\n`);
     }
+
+    // ---- 非测绘子代理的定位纪律 ------------------------------------------
+    // 提示词只解释运行时已有的两条闭环（ask_scout、结构增量自动转交），判定在代码里。
+    // 无可达测绘时同一段改成「写进汇报」，免得执行者去等一个不存在的测绘。
+    const headerOf = (scope) => {
+      try {
+        return scope?.session?.header ?? {};
+      } catch {
+        return {};
+      }
+    };
+    const locatorText = (scope) => {
+      const header = headerOf(scope);
+      if (header.origin !== "subagent" && header.parentSession === void 0) return "";
+      if (childRole(stateDir, header.id) === "scout") return "";
+      const scoutId = header.parentSession ? reachableScoutId(stateDir, header.parentSession) : void 0;
+      const ask = scoutId
+        ? `定位与事实用 ask_scout 问常驻测绘 ${scoutId}，不要自己通读实现；读码只用于核对它给出的事实。`
+        : "当前没有可达测绘：定位与事实问题写进汇报交领导处理，不要为此通读实现。";
+      return [
+        ask,
+        "收尾汇报必须单独一段「结构增量」：新增/移动/改名/删除的符号与入口，带 路径:行号；没有就写「无」。",
+        "该段由插件自动转给测绘，你不需要自己通知测绘。",
+      ].join("\n");
+    };
+    ctx.systemPrompt.section({
+      name: "caseos:scout-relay",
+      order: ctx.systemPrompt.getSectionOrder("TOOL_SUBAGENT"),
+      text: (context) => locatorText(context.scope),
+    });
 
     // ---- P4 + P5：子代理收尾事实 ----------------------------------------
     // agent/error 与 subagent/end 分两条事件到达：错误正文先落这里，end 时取用。

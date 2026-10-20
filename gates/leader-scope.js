@@ -66,19 +66,21 @@ const plugin = {
     };
 
     // 领导可见的分工声明（子代理渲染为空）。这是派遣行为的承重墙，措辞弱化即回退亲做。
+    // 条款只解释「为什么会被拒」，判定在代码里（leader-guard / dispatch-gate / scout-relay），
+    // 文与码冲突时以码为准——这里不写任何代码没实现的解锁动作。
     const scoutClause =
       process.env.CASEOS_SCOUT === "0"
         ? ""
-        : "常驻测绘智能体：派执行任务前，先确保有一个只读智能体常驻（它被硬禁改码）；它的 description 以“测绘智能体”或“scout:”开头均可，识别以运行时角色为准。测绘应询结束显示 finished/inactive 是正常的，send_message 即可续接；测绘不可达时直接重派，插件会自动接替并注入地图。产出=入口表 ≤20 行，由你用 write 落盘为仓库根 .project-map.md；仓库已有该文件时测绘智能体只做增量校对。执行任务书的定位与事实先 send_message 问它，执行完成后让它把新结构事实并入地图。";
+        : "常驻测绘智能体：派执行任务前，先确保有一个只读智能体常驻（它被硬禁改码）；它的 description 以“测绘智能体”或“scout:”开头均可，识别以运行时角色为准。测绘应询结束显示 finished/inactive 是正常的，send_message 即可续接；测绘不可达时直接重派，插件会自动接替并注入地图。产出=入口表 ≤20 行，由你用 write 落盘为仓库根 .project-map.md；仓库已有该文件时测绘智能体只做增量校对。执行任务书的定位与事实先 send_message 问它（执行者也可用 ask_scout 直接问）。";
     ctx.systemPrompt.section({
       name: "caseos:leader-dispatch",
       order: ctx.systemPrompt.getSectionOrder("TOOL_SUBAGENT"),
       text: (context) =>
         isSubagent(context.scope)
           ? ""
-          : "分工（强制，无规模例外）：一切执行类工作——读码、改码、跑测试与门禁、检索——一律派 subagent 完成；Manon 图谱是常驻测绘的专责工具（sync/query/deep-query 都由它做），你要图谱事实就问测绘。你只指挥、复核与验收，不亲自改码。子代理后台运行，运行中可 send_message 纠偏、interrupt_agent 叫停。" +
+          : "分工（强制，无规模例外）：一切执行类工作——读码、改码、跑测试与门禁、检索——一律派 subagent 完成；Manon 图谱是常驻测绘的专责工具（sync/query/deep-query 都由它做），你要图谱事实就问测绘。你只指挥、复核与验收，不亲自改码。" +
             scoutClause +
-            "回执与验收（强制）：测绘/执行子代理完成任务时会第一时间自动送来回执（含收尾报告）并唤醒你，测绘的回报也以消息直达，无需任何等待动作。因此：派遣完成后直接结束本回合等回执；禁止用 sleep 循环、bash 停顿、只读占位子代理或反复 list_agents 来轮询等待。给出最终答复前，所有已派工作必须已回执并经你验收；若某项回执远超预期时长仍未到，用一次 list_agents 查状态，必要时 interrupt_agent 叫停后重派。",
+            "回执与验收（强制）：测绘/执行子代理完成任务时会第一时间自动送来回执（含收尾报告）并唤醒你，测绘的回报也以消息直达，无需任何等待动作，派遣完成后直接结束本回合等回执。以下由运行时执行，违反即被拒绝：有子代理运行时的 sleep 与循环等待；同一回合第二次 list_agents；edit/write 写白名单（.project-map.md、路径含 /reports/、~/.dsh/AGENTS.md）之外的路径；任务书含调研型措辞。执行者回执里的「结构增量」由插件自动转给测绘，你收到测绘回报后用 write 整文件重写 .project-map.md 登记新基准。给出最终答复前，所有已派工作必须已回执并经你验收；若某项回执远超预期时长仍未到，用一次 list_agents 查状态，必要时 interrupt_agent 叫停后重派。",
     });
 
     ctx.on("agent/created", async ({ agent }) => {

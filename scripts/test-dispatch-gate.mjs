@@ -497,6 +497,36 @@ test("英文调研措辞同样被拦，执行任务书不误伤", () => {
   );
 });
 
+test("调研措辞带否定前缀时豁免（「不要通读实现」「禁止先调研」）", () => {
+  const harness = makeHarness();
+  harness.primeScout("scout-A");
+
+  const allowed = [
+    "不要通读实现，改 gates/x.js:12 即可",
+    "禁止先调研，直接按任务书改 gates/x.js",
+    "严禁自行调研，坐标已由测绘给出",
+    "别先读懂整个模块，只看 gates/x.js:12",
+    "无需查清楚再动手",
+    "不必先摸清，入口 gates/x.js:12",
+    "勿读源码确认，事实在任务书里",
+    "do not investigate first, just edit gates/x.js",
+    "never read the source to figure out; the scout already did",
+    "don't research first",
+  ];
+  for (const prompt of allowed) {
+    assert.equal(harness.guard({ description: "改代码", prompt }), void 0, `应放行：${prompt}`);
+  }
+
+  // 否定只豁免它自己那一次：同一任务书里另有一处未被否定仍然拒。
+  assert.match(
+    harness.guard({ description: "改代码", prompt: "不要通读实现，接下来先调研现状再改" }),
+    /任务书含调研型措辞『先调研』/,
+  );
+  // 否定词必须紧邻命中词（6 个字符以内），离远了不算豁免。
+  assert.match(harness.guard({ description: "改代码", prompt: "不必在动手之前就开始通读" }), /通读/);
+  assert.equal(harness.monitor().filter((entry) => entry.kind === "dispatch-deny" && entry.rule === "brief-lint").length, 2);
+});
+
 test("测绘派遣含调研措辞仍放行（首笔与接替都不受第 1、3 条约束）", async () => {
   const harness = makeHarness();
   assert.equal(harness.guard({ description: "随便写", prompt: "先调研整个仓库并回报入口表" }), void 0);
