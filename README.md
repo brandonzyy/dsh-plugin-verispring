@@ -8,18 +8,38 @@ Verispring three-role session architecture plus a bundled local knowledge graph 
 | # | Gate | Behavior |
 |---|---|---|
 | 1 | Dispatch spec gate | `subagent` / `subagent_fork` requires the dispatch spec content to have appeared in the session (a read result containing the spec's first-line marker; state is persisted in the session log and survives restarts) |
-| 2 | Resident scout | The first dispatch of a session is pinned to the scout role at runtime (`description` is a display label only); once resident, repeats are denied with a `send_message` reuse pointer; escape hatch `touch /tmp/dsh-caseos-scout-reset-<pid>` (path is in the denial), and the reset is persisted too. Child roles are persisted at spawn (`session-state/<child session id>.json`) and restored from the record and the session title after reloads, so a resident scout is never silently reclassified as executor |
-| 3 | Map first + freshness | Non-scout dispatch requires `<session workspace>/.project-map.md` (project root = `.git`/`.manon` present; otherwise fail-open); it is also denied when main has advanced past the map's registered baseline — the denial points to a scout incremental recheck plus a map rewrite (`write` to that file registers the current HEAD; fail-open before the first baseline and when `CASEOS_SCOUT=0`) |
-| 4 | Pinned model | Routes are enforced at runtime per role: the first dispatch uses the panel's scout route, later ones the executor route; explicit `provider`/`model` on the call is ignored. `subagent_fork` is always denied |
-| 5 | Commit gate | `git commit` requires a prior read of `~/.dsh/specs/代码写作规范.md`; the shape is forced to `-F file -- explicit paths`, with `timeout`/`env`/`nice`/`nohup`/`stdbuf` style wrappers seen through |
-| 6 | Leader scope | The leader's tool face shrinks to the review five (`bash`/`edit`/`write`/`read`/`read_image`) plus the dispatch face (`subagent`/`send_message`/`interrupt_agent`/`list_agents`), intersected with the tools that actually exist in the leader's view (desktop serves them from the preset layer, headless from the root layer); dispatch tools are shadowed by slim definitions; `subagent-base` is unconditionally denied at the root layer (if the routing executor ever breaks, the model has no fallback to sneak through). Scout and executor subagents get the full face of the `verispring-subagent` preset, and scouts are hard-denied `edit`/`write` through the dispatch request. Kill switch `CASEOS_SCOUT=0` drops the scout part of the division clause |
-| 7 | manon bridge | Resolves the local graph CLI (`MANON_KG_BIN` > bundled `manon/manon-kg` > legacy `~/manon/manon-kg`) and, when present, injects per role: the scout gets the full surface (commands, sourced invocation rule, ownership discipline), the leader gets one line ("graph facts come from the scout"), the executor gets one line — **manon is scout-owned; leader and executors never invoke it directly**; semantics in `~/.dsh/specs/Manon调用规则.md`. **The load-bearing part is the invocation rule**: dsh's subprocess service strips KEY/TOKEN-shaped env vars from children (anti-leak), so a bare `manon-kg sync` always fails with a missing key — the injected form sources `~/.dsh/manon.env` inside the bash command first (the scrub only strips the first hop; grandchildren inherit freely). Secret values never pass through or get printed |
-| 8 | Secret hygiene | Credential/env files (`manon.env`, `verispring.env`, project `.env*`) cannot be read via `read` or echoed via `cat`/`sed` and friends (matched per command segment, so the sanctioned `source` prefix and pipes on manon output are not false positives); whole-environment dumps — bare `env`/`printenv`, `ps eww`, `/proc/*/environ`, `docker inspect` without `--format` — are denied |
-| 9 | Runtime monitor | Role drift, gate denials, scout resets and subagent start/end (role + route + stop reason) are appended to `~/.dsh/verispring-monitor.jsonl`, so audits no longer require decompressing session logs |
+| 2 | Resident scout (reachability) | The first dispatch of a session is pinned to the scout role at runtime (`description` is a display label only). The authoritative fact is **reachability**, not the description prefix: while a reachable scout exists, another scout dispatch is denied with a `send_message` reuse pointer (a scout waiting for a question showing finished/inactive is normal — `send_message` cold-resumes it); once it becomes unreachable (an `end` with a non-`completed` stop reason, or `send_message` reporting unavailable) the next dispatch is automatically re-roled to scout and the map is re-injected. Child roles are persisted at spawn (`session-state/<child session id>.json`) and restored from the record and the session title after reloads |
+| 3 | Map first + baseline | Non-scout dispatch requires `<session workspace>/.project-map.md` (project root = `.git`/`.manon` present; otherwise fail-open); a `write`/`edit` of that file registers the current HEAD as the map baseline, and dispatch is denied while HEAD has advanced past it (the denial points to a scout incremental recheck plus a full `write` rewrite to re-register). A map without a registered baseline is denied too — no fail-open, so a stale map cannot stay valid forever. Fail-open only when `CASEOS_SCOUT=0` or HEAD cannot be read |
+| 4 | Brief lint + executor cap | The executor brief is a result description, not a research request: briefs containing research wording (`BRIEF_LINT_TERMS` in `gates/dispatch-gate.js`) are denied with directions to `send_message` the scout instead — **negated mentions are exempt** (a negation within 6 characters before the hit, e.g. `不要通读实现` / `禁止先调研`). Running executors per leader session are capped (default 3); exceeding it is denied with "end the turn and wait for receipts". Both have kill switches (`CASEOS_BRIEF_LINT=0`, `CASEOS_MAX_EXECUTORS`) |
+| 5 | Pinned model | Routes are enforced at runtime per role: the first dispatch uses the panel's scout route, later ones the executor route; explicit `provider`/`model` on the call is ignored. `subagent_fork` is always denied |
+| 6 | Commit gate | `git commit` requires a prior read of `~/.dsh/specs/代码写作规范.md`; the shape is forced to `-F file -- explicit paths`, with `timeout`/`env`/`nice`/`nohup`/`stdbuf` style wrappers seen through |
+| 7 | Leader scope | The leader's tool face shrinks to the review five (`bash`/`edit`/`write`/`read`/`read_image`) plus the dispatch face (`subagent`/`send_message`/`interrupt_agent`/`list_agents`), intersected with the tools that actually exist in the leader's view (desktop serves them from the preset layer, headless from the root layer); dispatch tools are shadowed by slim definitions; `subagent-base` is unconditionally denied at the root layer (if the routing executor ever breaks, the model has no fallback to sneak through). Scout and executor subagents get the full face of the `verispring-subagent` preset, and scouts are hard-denied `edit`/`write` through the dispatch request. Kill switch `CASEOS_SCOUT=0` drops the scout part of the division clause |
+| 8 | Leader guard | The receipts-and-no-polling discipline and "the leader does not write code" are runtime denials, not prompt wishes: while a child is running, `sleep`/loop-waiting in `bash` is denied; a second `list_agents` in the same turn is denied; `edit`/`write` outside the whitelist (`.project-map.md`, paths containing `/reports/`, `~/.dsh/AGENTS.md`, plus `CASEOS_LEADER_WRITE_ALLOW` prefixes) is denied, as are `git commit/push/merge/rebase/restore/stash` (only `git stash list` / `git stash show` pass as read-only), `npm`/`pnpm` publish/install, `sed -i`/`perl -i`, `rm -rf`, and workspace redirects. Subagent sessions are unaffected. Kill switch `CASEOS_LEADER_GUARD=0` |
+| 9 | Scout relay | The three loops that used to exist only in the prompt: `ask_scout` lets an executor hand a location/fact question to the resident scout and waits for the fresh answer (sender is the leader agent, since `sendMessage` authorizes by lineage); the closing "结构增量" (structure delta) section of a non-scout child is forwarded to the scout automatically; a failed child (`error`/`aborted`/`refusal`) writes a checkpoint that the plugin attaches when the leader continues it. Non-scout subagents get an injected ≤4-line locator discipline (`ask_scout` when a scout is reachable, "write it into your report" otherwise) plus the mandatory structure-delta section. Kill switch `CASEOS_SCOUT_RELAY=0`; `CASEOS_ASK_SCOUT_TIMEOUT_MS` bounds the wait |
+| 10 | manon bridge | Resolves the local graph CLI (`MANON_KG_BIN` > bundled `manon/manon-kg` > legacy `~/manon/manon-kg`) and, when present, injects per role: the scout gets the full surface (commands, sourced invocation rule, ownership discipline), the leader gets one line ("graph facts come from the scout"), the executor gets one line — **manon is scout-owned; leader and executors never invoke it directly**; semantics in `~/.dsh/specs/Manon调用规则.md`. **The load-bearing part is the invocation rule**: dsh's subprocess service strips KEY/TOKEN-shaped env vars from children (anti-leak), so a bare `manon-kg sync` always fails with a missing key — the injected form sources `~/.dsh/manon.env` inside the bash command first (the scrub only strips the first hop; grandchildren inherit freely). Secret values never pass through or get printed |
+| 11 | Secret hygiene | Credential/env files (`manon.env`, `verispring.env`, project `.env*`) cannot be read via `read` or echoed via `cat`/`sed` and friends (matched per command segment, so the sanctioned `source` prefix and pipes on manon output are not false positives); whole-environment dumps — bare `env`/`printenv`, `ps eww`, `/proc/*/environ`, `docker inspect` without `--format` — are denied |
+| 12 | Runtime monitor | Role drift, gate denials, scout reachability changes and subagent start/end (role + route + stop reason, recorded only after a successful start) are appended to `~/.dsh/verispring-monitor.jsonl`, so audits no longer require decompressing session logs |
+
+### Environment variables
+
+| Variable | Default | Effect |
+|---|---|---|
+| `CASEOS_SCOUT` | on | `0` drops the scout part of the division clause and the map freshness/baseline gate |
+| `CASEOS_BRIEF_LINT` | on | `0` disables research-wording denials on executor briefs |
+| `CASEOS_MAX_EXECUTORS` | `3` | running-executor cap per leader session (`0` blocks every executor dispatch) |
+| `CASEOS_LEADER_GUARD` | on | `0` disables the leader runtime denials at assembly time |
+| `CASEOS_LEADER_WRITE_ALLOW` | empty | `:`-separated extra path prefixes the leader may `edit`/`write` |
+| `CASEOS_SCOUT_RELAY` | on | `0` unregisters `ask_scout` and stops forwarding/checkpointing/prompt injection |
+| `CASEOS_ASK_SCOUT_TIMEOUT_MS` | `600000` | how long `ask_scout` waits for the scout's answer before returning a timeout |
+
+### Monitor events
+
+`kind` values in `~/.dsh/verispring-monitor.jsonl`: `subagent-start` / `subagent-start-failed` / `subagent-end` / `subagent-error` (lifecycle + role + route), `child-route-updated`, `role-route-mismatch`, `scout-unreachable`, `dispatch-deny` (with `rule`: `brief-lint`, `map-baseline-missing`, `map-stale`, `executor-cap`), `gate-deny` (dispatch spec / resident-scout / missing-map denials, plus codestyle and manon), `leader-guard-deny` (with `rule`: `sleep-in-loop`, `sleep-long`, `sleep-background`, `list-agents-repeat`, `write-whitelist`, `git-mutation`, `package-mutation`, `in-place-edit`, `recursive-remove`, `workspace-redirect`), `ask-scout`, `structure-forward`, `checkpoint-saved` / `checkpoint-save-failed` / `checkpoint-injected` / `checkpoint-inject-failed`, `scout-relay-error`.
+
 
 ## Receipts instead of polling
 
-When a subagent finishes, DSH delivers a settlement receipt (including its closing report) into the leader's inbox and wakes the leader's turn; scout reports arrive as messages. The leader system prompt now says: end the turn after dispatching and wait for receipts; sleep loops, placeholder subagents and repeated `list_agents` polling are forbidden; the final answer comes only after every dispatched work has been receipted and accepted.
+When a subagent finishes, DSH delivers a settlement receipt (including its closing report) into the leader's inbox and wakes the leader's turn; scout reports arrive as messages. The leader system prompt explains the discipline (end the turn after dispatching and wait for receipts; the final answer comes only after every dispatched work has been receipted and accepted), and **leader-guard enforces it at runtime**: while a child is running, `sleep`/loop waiting and a second `list_agents` in the same turn are denied, so polling is a refusal rather than a wish.
 
 The bundle patch also configures the subagent tool: `backgroundMode: continuable`, `maxDepth: 1`,
 and the executor persona; both presets turn `modelSelectionSettings` off on `tool-subagent`
@@ -181,11 +201,15 @@ the plugin-pinned `verispring`/`deepseek-flash` route):
 covers dsh 0.2.0-rc.2 through 0.2.1-rc.1. Incompatible installs are rejected up front; the official
 exemption flow exists for force-installs.
 
-## Upgrade smoke check
+## Tests and upgrade smoke check
 
-Run `pnpm smoke` after a dsh upgrade for manifest and syntax checks. Set `DSH_BIN` and
-`DSH_SMOKE_PROFILE` to add an official `--dump-config` composition check against an isolated
-profile; the check must find the dispatch gate, configuration entry and subagent preset.
+`pnpm test` runs the three gate behavior suites and the smoke check in order:
+`node scripts/test-dispatch-gate.mjs`, `node scripts/test-leader-guard.mjs`,
+`node scripts/test-scout-relay.mjs`, then `pnpm smoke`. Mock suites cannot prove the host
+actually loads the gates, so `pnpm smoke` after a dsh upgrade does manifest and syntax checks
+and, when `DSH_BIN` and `DSH_SMOKE_PROFILE` are set, adds the official `--dump-config`
+composition check against an isolated profile; that check must find the dispatch gate,
+configuration entry and subagent preset.
 
 ## Dependencies and upgrade surface
 
@@ -193,6 +217,7 @@ profile; the check must find the dispatch gate, configuration entry and subagent
   runtime dependencies. The manon component freezes its Python dependencies in
   `manon/requirements.txt`.
 - cordis surface in use: `ctx.tools.guard`, `ctx.on("tools/result")`, `ctx.on("agent/created")`,
+  `ctx.on("subagent/end")`, `ctx.on("agent/error")`, `ctx.on("tools/pre-execute")`,
   `ctx.tools.restrict({allow/deny})`, `ctx.tools.schemas/get/register`, `ctx.systemPrompt.section`,
   `ctx.inject`, `ctx.logger.warn`.
 - The manon component tracks the upstream manon repository; after upstream changes, re-test

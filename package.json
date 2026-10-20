@@ -1,7 +1,7 @@
 {
   "name": "dsh-plugin-verispring",
   "description": "Verispring 三角色会话架构 + 本地知识图谱 manon，大幅度优化主会话上下文，大幅节省顶级模型API费用。",
-  "version": "1.3.63",
+  "version": "1.3.64",
   "type": "module",
   "icon": "./icon.svg",
   "license": "MIT",
@@ -19,7 +19,8 @@
   ],
   "main": "./gates/dispatch-gate.js",
   "scripts": {
-    "smoke": "node scripts/smoke-test.mjs"
+    "smoke": "node scripts/smoke-test.mjs",
+    "test": "node scripts/test-dispatch-gate.mjs && node scripts/test-leader-guard.mjs && node scripts/test-scout-relay.mjs && node scripts/smoke-test.mjs"
   },
   "exports": {
     ".": "./gates/dispatch-gate.js",
