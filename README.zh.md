@@ -279,11 +279,12 @@ tree-sitter 语言包按需动态加载，缺包只降级该语言不崩。密�
   纯 `dsh-headless` profile 没有这一条目，插件 patch 加载即报 `entry "preset-standard" not found`。
 - **规范文件**：`~/.dsh/specs/子代理派遣规范.md` 与 `~/.dsh/specs/代码写作规范.md`（路径按
   主目录解析）。缺规范时对应门禁会持续拦截并指路——这是特性：拒绝必须可满足。
-- **模型路由**：profile 需有 `verispring-ds` provider 及 `deepseek-flash` 模型，由包内
-  `cordis.patch.yml` 的 `verispring-deepseek` 条目经本插件的 `deepseek-gateway` 注册
-  （复用 `dsh-llm-deepseek` 的适配器，这样思考档位才会以 `output_config.effort` 发出）。
+- **模型路由**：profile 需有 `verispring` 渠道（pi-ai）及 `deepseek-flash` 模型，与领导面的
+  `claude-opus-5-5` 同一个渠道——同一网关只需一个渠道。`deepseek-flash` 条目必须声明
+  `reasoningEfforts`（off/low/high/max）与 `compat.forceAdaptiveThinking: true`，否则 pi-ai
+  拒发 effort（`UNSUPPORTED_REASONING_EFFORT`）。
   `gates/dispatch-gate.js` 的 `DEFAULT_ROUTES` 与包内 `agentOptions` 同为此路由，两处保持一致
-  （面板保存后以 `~/.dsh/verispring.json` 为准）。换网关时改这两处 + 插件的 `baseURL`。
+  （面板保存后以 `~/.dsh/verispring.json` 为准）。换网关时改这两处 + profile 里的 `baseURL`。
 - **manon（可选）**：组件自带，无需本机安装；密钥放 `~/.dsh/manon.env`
   （`MANON_EMBEDDING_API_KEY`，sync 的向量嵌入）与 `~/.dsh/verispring.env`
   （`VERISPRING_API_KEY`，deep-query 缺省回退）——注入的调用式会自行 source 这两个文件，
@@ -314,12 +315,10 @@ tree-sitter 语言包按需动态加载，缺包只降级该语言不崩。密�
 | Manon Deep Query | 面板选择 verispring 渠道、模型、思考强度；密钥回退 `VERISPRING_API_KEY` | **DeepSeek Flash + off**（出厂即推荐）；保存后写入 `~/.dsh/manon.env`，随注入调用式生效。 |
 | embedding | 环境变量：`MANON_EMBEDDING_URL` / `MANON_EMBEDDING_MODEL` / `MANON_EMBEDDING_API_KEY`（默认硅基流动 `BAAI/bge-m3`） | 内置 bge-m3 即推荐；更换需重新 sync 重建向量 |
 
-主会话的网关配置（放进 profile 的 `cordis.patch.yml`）。`verispring` = 领导面
-`claude-opus-5-5`（pi-ai，自适应思考）；`verispring-ds` = 全部 `deepseek-flash` 派遣，
-由本包 `cordis.patch.yml` 里的 `verispring-deepseek` 条目经 `deepseek-gateway` 注册
-（内部复用 `dsh-llm-deepseek`，思考档位才会以 `output_config.effort` 发出）。这条 insert
-随包自带，profile **不要再 insert 一次**（同 id 会冲突），只需要 profile 侧提供
-`llm-pi-ai` 的 `verispring` 渠道：
+主会话与派遣共用一个 `verispring` 渠道（pi-ai）：领导面 `claude-opus-5-5`，派遣面
+`deepseek-flash`。同一网关只需一个渠道；`deepseek-flash` 条目必须声明 `reasoningEfforts`
+与 `compat.forceAdaptiveThinking`，否则 pi-ai 拒发 effort（`UNSUPPORTED_REASONING_EFFORT`）。
+包内 `cordis.patch.yml` 已带这组条目，profile 侧按需覆盖：
 
 ```yaml
 - id: llm-pi-ai
@@ -347,6 +346,20 @@ tree-sitter 语言包按需动态加载，缺包只降级该语言不崩。密�
               high: high
               xhigh: xhigh
               max: max
+          - id: deepseek-flash
+            name: deepseek-flash
+            contextWindow: 1000000
+            maxTokens: 256000
+            input:
+              - text
+              - image
+            reasoningEfforts:
+              off: off
+              low: low
+              high: high
+              max: max
+            compat:
+              forceAdaptiveThinking: true
 
 - id: agent-default-model
   config:

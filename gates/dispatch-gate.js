@@ -48,12 +48,12 @@ const SUBAGENT_PRESET = "verispring-subagent";
 const BASE_SUBAGENT_TOOL = "subagent-base";
 const LEADER_SUBAGENT_TOOL = "subagent";
 const ROUTES_UPDATED_EVENT = "verispring/routes-updated";
-// 新派遣默认走 llm-deepseek 版（verispring-ds）：只有这个适配器会把思考档位发成
-// output_config.effort，网关也只从那儿读 effort。pi-ai 的 verispring 只剩两类用途：
-// claude-opus-5-5，以及切换前已在途、仍钉在 pi-ai deepseek-flash 上的老会话。
+// 派遣默认走 pi-ai 的 verispring 渠道（同一网关只需一个渠道）。该渠道的 deepseek-flash
+// 必须在 profile 的 llm-pi-ai 条目里声明 reasoningEfforts 与 compat.forceAdaptiveThinking，
+// 缺任一项 pi-ai 就拒发 effort（UNSUPPORTED_REASONING_EFFORT）。
 const DEFAULT_ROUTES = {
-  scout: { provider: "verispring-ds", model: "deepseek-flash", reasoningEffort: "high" },
-  executor: { provider: "verispring-ds", model: "deepseek-flash", reasoningEffort: "high" },
+  scout: { provider: "verispring", model: "deepseek-flash", reasoningEffort: "high" },
+  executor: { provider: "verispring", model: "deepseek-flash", reasoningEffort: "high" },
 };
 // 调研型措辞：执行任务书里出现即拒绝（调研是常驻测绘的职责，执行者只做已查实的事）。
 // 集中一处，环境变量 CASEOS_BRIEF_LINT=0 整表关闭。

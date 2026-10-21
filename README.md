@@ -314,13 +314,14 @@ injected invocation.
 - **Spec files**: `~/.dsh/specs/子代理派遣规范.md` and `~/.dsh/specs/代码写作规范.md`
   (resolved against the home directory). Missing specs mean the corresponding gate keeps
   denying with directions — by design: every denial must be satisfiable.
-- **Model route**: the profile needs a `verispring-ds` provider with a `deepseek-flash`
-  model, registered by the `verispring-deepseek` entry in the bundled `cordis.patch.yml`
-  through this plugin's `deepseek-gateway` (it reuses the `dsh-llm-deepseek` adapter, which
-  is what makes the effort level travel as `output_config.effort`). The bundled
-  `agentOptions` and `DEFAULT_ROUTES` in `gates/dispatch-gate.js` use the same route —
-  keep them in sync (a saved panel wins via `~/.dsh/verispring.json`). For another gateway,
-  change those two places plus the plugin's `baseURL`.
+- **Model route**: the profile needs a `verispring` (pi-ai) channel with a `deepseek-flash`
+  model — the same channel that serves the leader's `claude-opus-5-5`; one gateway needs only
+  one channel. The `deepseek-flash` entry must declare `reasoningEfforts` and
+  `compat.forceAdaptiveThinking`, or pi-ai refuses to send an effort level
+  (`UNSUPPORTED_REASONING_EFFORT`). The bundled `agentOptions` and `DEFAULT_ROUTES` in
+  `gates/dispatch-gate.js` use the same route — keep them in sync (a saved panel wins via
+  `~/.dsh/verispring.json`). For another gateway, change those two places plus the `baseURL`
+  in the profile.
 - **manon (optional)**: bundled — no local install needed. Keys live in `~/.dsh/manon.env`
   (`MANON_EMBEDDING_API_KEY`, sync embeddings) and `~/.dsh/verispring.env`
   (`VERISPRING_API_KEY`, deep-query fallback); the injected invocation sources both files
@@ -366,13 +367,12 @@ Three agent route slots are configurable in the plugin panel; the main session u
 | Manon Deep Query | choose the verispring provider, model, and effort in the panel; key falls back to `VERISPRING_API_KEY` | **DeepSeek Flash + off** (shipped as recommended); saving writes `~/.dsh/manon.env` and the sourced invocation uses it. |
 | embedding | env: `MANON_EMBEDDING_URL` / `MANON_EMBEDDING_MODEL` / `MANON_EMBEDDING_API_KEY` (defaults to SiliconFlow `BAAI/bge-m3`) | the built-in bge-m3 is the recommendation; switching requires a re-sync to rebuild vectors |
 
-Main-session gateway config (goes into the profile's `cordis.patch.yml`). `verispring` =
-leader-side `claude-opus-5-5` (pi-ai, adaptive thinking); `verispring-ds` = every
-`deepseek-flash` dispatch, registered by the bundled `verispring-deepseek` entry through
-`deepseek-gateway` (which reuses `dsh-llm-deepseek`, so the effort level actually travels as
-`output_config.effort`). That insert ships with the package — do **not** insert it again in
-the profile (same id collides); the profile only needs to provide the pi-ai `verispring`
-channel:
+Main-session gateway config (goes into the profile's `cordis.patch.yml`). The leader's
+`claude-opus-5-5` and every `deepseek-flash` dispatch share one `verispring` channel (pi-ai) —
+one gateway needs only one channel. The `deepseek-flash` entry must declare `reasoningEfforts`
+and `compat.forceAdaptiveThinking`, otherwise pi-ai refuses to send an effort level
+(`UNSUPPORTED_REASONING_EFFORT`). The bundled `cordis.patch.yml` already carries these
+entries; override them in the profile as needed:
 
 ```yaml
 - id: llm-pi-ai
@@ -400,6 +400,20 @@ channel:
               high: high
               xhigh: xhigh
               max: max
+          - id: deepseek-flash
+            name: deepseek-flash
+            contextWindow: 1000000
+            maxTokens: 256000
+            input:
+              - text
+              - image
+            reasoningEfforts:
+              off: off
+              low: low
+              high: high
+              max: max
+            compat:
+              forceAdaptiveThinking: true
 
 - id: agent-default-model
   config:

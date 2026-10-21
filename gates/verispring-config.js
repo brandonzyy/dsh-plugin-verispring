@@ -112,10 +112,10 @@ const z = await loadSchemastery();
 
 function buildConfig(z) {
   return z.object({
-    scoutProvider: z.string().description("测绘智能体渠道").default("verispring-ds").volatile(),
+    scoutProvider: z.string().description("测绘智能体渠道").default("verispring").volatile(),
     scoutModel: z.string().description("测绘智能体模型").default("deepseek-flash").volatile(),
     scoutEffort: z.string().description("测绘智能体思考强度（默认 High）").default("high").volatile(),
-    executorProvider: z.string().description("执行智能体渠道").default("verispring-ds").volatile(),
+    executorProvider: z.string().description("执行智能体渠道").default("verispring").volatile(),
     executorModel: z.string().description("执行智能体模型").default("deepseek-flash").volatile(),
     executorEffort: z.string().description("执行智能体思考强度（默认 High）").default("high").volatile(),
     deepQueryProvider: z.string().description("Manon Deep Query 渠道").default("verispring").volatile(),
@@ -242,10 +242,10 @@ export function apply(ctx, config) {
     const override = (typeof editor.configuration === "function" ? editor.configuration() : [])
       .find(item => item.entry.options.id === "verispring-config")?.override ?? {};
     const valueOf = (key, fallback) => configValue(config[key], configValue(override[key], fallback));
-    const scoutProvider = valueOf("scoutProvider", "verispring-ds");
+    const scoutProvider = valueOf("scoutProvider", "verispring");
     const scoutModel = valueOf("scoutModel", "deepseek-flash");
     const scoutEffort = valueOf("scoutEffort", "high") || "high";
-    const executorProvider = valueOf("executorProvider", "verispring-ds");
+    const executorProvider = valueOf("executorProvider", "verispring");
     const executorModel = valueOf("executorModel", "deepseek-flash");
     const executorEffort = valueOf("executorEffort", "high") || "high";
     const deepQueryProvider = valueOf("deepQueryProvider", "verispring");
@@ -255,8 +255,8 @@ export function apply(ctx, config) {
     const embeddingModel = valueOf("embeddingModel", "BAAI/bge-m3");
 
     const allDefault =
-      scoutProvider === "verispring-ds" && scoutModel === "deepseek-flash" && scoutEffort === "high" &&
-      executorProvider === "verispring-ds" && executorModel === "deepseek-flash" && executorEffort === "high" &&
+      scoutProvider === "verispring" && scoutModel === "deepseek-flash" && scoutEffort === "high" &&
+      executorProvider === "verispring" && executorModel === "deepseek-flash" && executorEffort === "high" &&
       deepQueryProvider === "verispring" && deepQueryModel === "deepseek-flash" && deepQueryEffort === "off" &&
       embeddingUrl === "https://api.siliconflow.cn/v1" && embeddingModel === "BAAI/bge-m3";
     const configRows = typeof editor.configuration === "function" ? editor.configuration() : [];

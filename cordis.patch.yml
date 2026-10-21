@@ -40,6 +40,22 @@
               high: high
               xhigh: xhigh
               max: max
+          # 派遣路由用的 flash 必须显式声明 reasoningEfforts 与 forceAdaptiveThinking，
+          # 否则 pi-ai 拒发 effort（UNSUPPORTED_REASONING_EFFORT）。
+          - id: deepseek-flash
+            name: deepseek-flash
+            contextWindow: 1000000
+            maxTokens: 256000
+            input:
+              - text
+              - image
+            reasoningEfforts:
+              off: off
+              low: low
+              high: high
+              max: max
+            compat:
+              forceAdaptiveThinking: true
 - id: llm-deepseek
   name: '@deepseek-ai/dsh-llm-deepseek-api-key'
   config:
@@ -197,8 +213,8 @@
               maxDepth: 1
               agentPreset: verispring-subagent
               agentOptions:
-                # 新派遣走 llm-deepseek 版；在途子代理启动时已钉住旧路由，不受影响。
-                provider: verispring-ds
+                # 派遣走 pi-ai 的 verispring 渠道。
+                provider: verispring
                 model: deepseek-flash
                 reasoningEffort: high
           - id: tool-subagent-fork
@@ -462,25 +478,3 @@
     # 配置面板：Config schema 提供宿主表单服务；client 组合包页渲染并把模型位落盘到执法面
     - id: verispring-config
       name: './gates/verispring-config.js'
-
-# ---- D4：Verispring 的 deepseek-flash 走 llm-deepseek（与官方同一适配器、同一份参数）----
-# provider id 用 verispring-ds（displayName「Verispring DeepSeek」）：id 由本插件的
-# deepseek-gateway 注入（复用 registerDeepSeekProvider——该函数把 provider id 当参数）。
-# 与官方 llm-deepseek 条目逐项相同，只保留地址（baseURL）与密钥（apiKeyEnv）两处差别。
-- insert:
-    - id: verispring-deepseek
-      name: 'dsh-plugin-verispring/deepseek-gateway'
-      config:
-        provider: verispring-ds
-        displayName: Verispring DeepSeek
-        apiKeyEnv: VERISPRING_API_KEY
-        baseURL: https://api.verispring.cn
-        models:
-          - id: deepseek-flash
-            name: deepseek-flash
-            contextWindow: 1000000
-            inputModalities:
-              - text
-              - image
-            systemPromptUpdate: in-history
-            toolUpdate: addition-only

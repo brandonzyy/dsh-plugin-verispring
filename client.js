@@ -10,10 +10,10 @@ window.__ModuleLoader__.load({
 
     const PACKAGE_NAME = "dsh-plugin-verispring";
     const DEFAULTS = {
-      scoutProvider: "verispring-ds",
+      scoutProvider: "verispring",
       scoutModel: "deepseek-flash",
       scoutEffort: "high",
-      executorProvider: "verispring-ds",
+      executorProvider: "verispring",
       executorModel: "deepseek-flash",
       executorEffort: "high",
       deepQueryProvider: "verispring",
@@ -22,15 +22,8 @@ window.__ModuleLoader__.load({
       embeddingUrl: "https://api.siliconflow.cn/v1",
       embeddingModel: "BAAI/bge-m3",
     };
-    // 目录未就绪时的兜底渠道表：两条都要在，否则面板会把已选中的 verispring-ds 显示成
-    // 「值无效」。verispring 仍是领导面 opus 与在途旧会话的渠道。
+    // 目录未就绪时的兜底渠道表：面板已选中的值必须在这里，否则会显示成「值无效」。
     const FALLBACK_GROUPS = [{
-      id: "verispring-ds",
-      name: "Verispring DeepSeek",
-      models: [
-        { id: "deepseek-flash", name: "deepseek-flash", reasoning: { efforts: [{ id: "off", name: "off" }, { id: "low", name: "low" }, { id: "high", name: "high" }, { id: "max", name: "max" }] } },
-      ],
-    }, {
       id: "verispring",
       name: "Verispring",
       models: [
@@ -169,8 +162,8 @@ window.__ModuleLoader__.load({
         .catch(() => { legacyConfigMigrationStarted = false; });
     }
 
-    // 渠道显示名：verispring = pi-ai（领导面 opus / 旧路由 flash），verispring-ds = llm-deepseek 版
-    const PROVIDER_LABELS = { verispring: "Verispring", "verispring-ds": "Verispring DeepSeek" };
+    // 渠道显示名：verispring = pi-ai（领导面 opus 与全部 deepseek-flash 派遣）
+    const PROVIDER_LABELS = { verispring: "Verispring" };
 
     function providerLabel(group) {
       return PROVIDER_LABELS[group.id] ?? (group.name || group.id);

@@ -83,7 +83,6 @@ const sourceFiles = [
     .map((name) => join("gates", name)),
 ];
 if (!sourceFiles.includes(join("gates", "leader-guard.js"))) fail("gates/leader-guard.js 不在语法检查清单里");
-if (!sourceFiles.includes(join("gates", "deepseek-gateway.js"))) fail("gates/deepseek-gateway.js 不在语法检查清单里");
 for (const file of sourceFiles) {
   try { run(process.execPath, ["--check", file]); }
   catch (error) { fail(String(error)); }
