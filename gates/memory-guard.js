@@ -16,14 +16,23 @@
 // - recycle：dispatch-gate 与 scout-relay 的模块层只增索引按活会话剪枝（权威事实在
 //   session-state 文件与会话日志里，剪掉的条目按需重建），不碰在用的条目。
 //
-// 开关与阈值（CASEOS_* 惯例）：CASEOS_MEM_GUARD=0 全关；CASEOS_MEM_CHECK_MS 默认 60000；
+// 烧堆是突发式的：实测堆能在两次 60s 采样之间从 <2.4GiB 跳到 4.06GiB，大头是巨型工具结果
+// 全文进 Session.log（宿主 pruner 对 >8KB 的结果还会复制一份）。所以除周期采样外，还有一道
+// 整读门（read-guard）在 tools/pre-execute 里拦住会整篇进结果的大文件读取：
+// CASEOS_READ_GUARD=0 全关；CASEOS_READ_GUARD_MAX_BYTES 默认 2MiB；CASEOS_READ_GUARD_ALLOW
+// 是逗号分隔的放行前缀。命中且 stat 超限才拒绝，stat 失败与任何解析歧义一律放行。
+//
+// 开关与阈值（CASEOS_* 惯例）：CASEOS_MEM_GUARD=0 全关；CASEOS_MEM_CHECK_MS 默认 15000；
 // CASEOS_MEM_SOFT_BYTES / CASEOS_MEM_HARD_BYTES 默认按 V8 顶棚比例（60% / 80%，4GiB 顶棚即
 // 2.4GiB / 3.2GiB）；显式设置时按 env 覆盖。drain/recycle 共享 5 分钟冷却；硬阈值不参与冷却
-// （只告警，不改状态）。
+// （只告警，不改状态）。采样在 subagent/end 与 tools/post-execute 之后各即时补一次。
 // 动作落 monitor：kind = mem-guard-boot（激活自报：heapLimitBytes / nodeArgv / pid /
-// thresholdsSource）/ mem-guard-drain / mem-guard-recycle / mem-guard-skip。
-import v8 from "node:v8";
+// thresholdsSource / checkMs / readGuard）/ mem-guard-drain / mem-guard-recycle /
+// mem-guard-skip / mem-guard-read-deny。
+import fs from "node:fs";
 import { homedir } from "node:os";
+import { basename, isAbsolute, resolve } from "node:path";
+import v8 from "node:v8";
 import { monitorEvent } from "./monitor-log.js";
 import { releaseIdleCaches as releaseDispatchCaches } from "./dispatch-gate.js";
 import { releaseIdleCaches as releaseRelayCaches } from "./scout-relay.js";
@@ -32,13 +41,44 @@ const GUARD_ENV = "CASEOS_MEM_GUARD";
 const CHECK_MS_ENV = "CASEOS_MEM_CHECK_MS";
 const SOFT_BYTES_ENV = "CASEOS_MEM_SOFT_BYTES";
 const HARD_BYTES_ENV = "CASEOS_MEM_HARD_BYTES";
-const DEFAULT_CHECK_MS = 60000;
+const READ_GUARD_ENV = "CASEOS_READ_GUARD";
+const READ_MAX_ENV = "CASEOS_READ_GUARD_MAX_BYTES";
+const READ_ALLOW_ENV = "CASEOS_READ_GUARD_ALLOW";
+const DEFAULT_CHECK_MS = 15000;
+const DEFAULT_READ_MAX_BYTES = 2 * 1024 * 1024;
+const READ_DENY_PATH_LIMIT = 200;
 const GIB = 1024 ** 3;
+const MIB = 1024 ** 2;
 const FALLBACK_HEAP_LIMIT_BYTES = 4 * GIB;
 const SOFT_RATIO = 0.6;
 const HARD_RATIO = 0.8;
 const COOLDOWN_MS = 5 * 60 * 1000;
 const IDLE_MS = 90 * 1000;
+// 宿主 workingDirectory.ensure 要求 AbortSignal；调用没带 signal 时给一个永不触发的。
+const NO_SIGNAL = new AbortController().signal;
+
+// 整读门的动词白名单：这些命令的默认输出就是文件全文（或多行转储），一次调用足以把整份
+// 内容压进工具结果。head/tail 默认只输出 10 行、-n/-c 显式限量，属受控读取，不在此列 —
+// 只有 tail -n +N / -c +N（从偏移读到 EOF）按整读检查。保守白名单：未列出的动词一律不查。
+const WHOLE_FILE_VERBS = new Set([
+  "cat",
+  "less",
+  "more",
+  "most",
+  "nl",
+  "tac",
+  "strings",
+  "xxd",
+  "hexdump",
+  "od",
+  "base64",
+  "wc",
+]);
+const WRAPPER_WORDS = new Set(["sudo", "env", "command", "time", "nohup", "nice", "exec"]);
+const SED_LINE_RANGE = /^\d+(,\d+)?p$/;
+const SED_TO_EOF = /^\d+,\$p$/;
+// 重定向、命令替换、进程替换都会让操作数无法静态判定：整段放行。
+const AMBIGUOUS_SHELL = /[<>`]|\$\(|<\(|>\(/;
 
 function envNumber(name, fallback) {
   const value = Number(process.env[name]);
@@ -49,6 +89,21 @@ function envNumber(name, fallback) {
 function envNumberExplicit(name) {
   const value = Number(process.env[name]);
   return Number.isFinite(value) && value > 0 ? value : void 0;
+}
+
+function expandHome(path) {
+  if (path === "~") return homedir();
+  return path.startsWith("~/") ? `${homedir()}${path.slice(1)}` : path;
+}
+
+// stat 拿不到大小（不存在、是目录、权限失败）一律放行：整读门只在能确定超限时拒绝。
+function fileSizeBytes(path) {
+  try {
+    const info = fs.statSync(path, { throwIfNoEntry: false });
+    return info?.isFile?.() === true ? info.size : void 0;
+  } catch {
+    return void 0;
+  }
 }
 
 // 顶棚按进程实际读数取（V8 构建上限会吃掉过大的 --max-old-space-size，见 README）；
@@ -77,6 +132,223 @@ export function memoryDecision({ heapUsed, softBytes, hardBytes, busy, lastActio
   return { kind: "soft" };
 }
 
+// ---- read-guard 的命令解析（纯函数，测试直接喂字符串） --------------------------
+
+// 按 shell 分隔符切段（引号内的分隔符不切），返回原文段。
+function shellSegments(command) {
+  const segments = [];
+  let current = "";
+  let quote = "";
+  let escaped = false;
+  for (const ch of command) {
+    if (escaped) {
+      current += ch;
+      escaped = false;
+      continue;
+    }
+    if (ch === "\\") {
+      current += ch;
+      escaped = true;
+      continue;
+    }
+    if (quote !== "") {
+      current += ch;
+      if (ch === quote) quote = "";
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      current += ch;
+      quote = ch;
+      continue;
+    }
+    if (";&|\n".includes(ch)) {
+      segments.push(current);
+      current = "";
+      continue;
+    }
+    current += ch;
+  }
+  segments.push(current);
+  return segments;
+}
+
+// 分词：引号不闭合返回 undefined（歧义放行）。
+function shellWords(segment) {
+  const words = [];
+  let word = "";
+  let quote = "";
+  let escaped = false;
+  let started = false;
+  for (const ch of segment) {
+    if (escaped) {
+      word += ch;
+      escaped = false;
+      started = true;
+      continue;
+    }
+    if (ch === "\\" && quote !== "'") {
+      escaped = true;
+      started = true;
+      continue;
+    }
+    if (quote !== "") {
+      started = true;
+      if (ch === quote) quote = "";
+      else word += ch;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      started = true;
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      if (started) {
+        words.push(word);
+        word = "";
+        started = false;
+      }
+      continue;
+    }
+    word += ch;
+    started = true;
+  }
+  if (quote !== "") return void 0;
+  if (started) words.push(word);
+  return words;
+}
+
+// 跳过 env 赋值与包装命令，返回真正执行的命令名与其余参数；识别不出返回 undefined。
+function commandOf(words) {
+  let index = 0;
+  while (index < words.length) {
+    const word = words[index];
+    if (word === "") return void 0;
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(word)) {
+      index += 1;
+      continue;
+    }
+    if (WRAPPER_WORDS.has(basename(word))) {
+      index += 1;
+      continue;
+    }
+    return { name: basename(word), rest: words.slice(index + 1) };
+  }
+  return void 0;
+}
+
+// 非选项词即文件操作数（`--` 之后全部按操作数；`-` 是 stdin）。选项带的值会被当成候选
+// 路径，stat 失败即放行，不会误伤。
+function pathOperands(rest) {
+  const paths = [];
+  let literal = false;
+  for (const word of rest) {
+    if (!literal && word === "--") {
+      literal = true;
+      continue;
+    }
+    if (!literal && word.startsWith("-") && word !== "-") continue;
+    if (word === "" || word === "-") continue;
+    paths.push(word);
+  }
+  return paths;
+}
+
+// sed：`-n` + 行范围脚本（a,bp / ap）是受控读取，返回 []；`1,$p` 读到 EOF、其他脚本按整读
+// 检查；`-e`/`-f`/`-i` 的脚本来源与原地改写在静态上判不准，整体放行。
+function sedPaths(rest) {
+  let quiet = false;
+  let script;
+  const files = [];
+  let literal = false;
+  for (const word of rest) {
+    if (literal) {
+      files.push(word);
+      continue;
+    }
+    if (word === "--") {
+      literal = true;
+      continue;
+    }
+    if (word === "-n") {
+      quiet = true;
+      continue;
+    }
+    if (word === "-e" || word === "-f" || word === "-i" || word.startsWith("--in-place")) return [];
+    if (word.startsWith("-") && word !== "-") continue;
+    if (script === void 0) {
+      script = word;
+      continue;
+    }
+    files.push(word);
+  }
+  if (script === void 0 || script === "-") return [];
+  if (quiet && SED_LINE_RANGE.test(script) && !SED_TO_EOF.test(script)) return [];
+  return files;
+}
+
+// `tail -n +N` / `-c +N` 从偏移读到 EOF = 整读；其余 tail 形态输出限量，受控放行（[]）。
+function tailPaths(rest) {
+  const paths = [];
+  let toEnd = false;
+  let literal = false;
+  for (let index = 0; index < rest.length; index += 1) {
+    const word = rest[index];
+    if (literal) {
+      paths.push(word);
+      continue;
+    }
+    if (word === "--") {
+      literal = true;
+      continue;
+    }
+    if (word === "-n" || word === "-c" || word === "--lines" || word === "--bytes") {
+      if ((rest[index + 1] ?? "").startsWith("+")) toEnd = true;
+      index += 1;
+      continue;
+    }
+    if (/^--(lines|bytes)=\+/.test(word) || /^-[nc]\+/.test(word)) toEnd = true;
+    if (word.startsWith("-") && word !== "-") continue;
+    if (word === "" || word === "-") continue;
+    paths.push(word);
+  }
+  return toEnd ? paths : [];
+}
+
+// 待检查的整读路径；[] = 放行（没命中读动词，或解析歧义）。
+export function bashReadPaths(command) {
+  if (typeof command !== "string" || command === "") return [];
+  const paths = [];
+  for (const segment of shellSegments(command)) {
+    if (AMBIGUOUS_SHELL.test(segment)) continue;
+    const words = shellWords(segment);
+    if (words === void 0) continue;
+    const invocation = commandOf(words);
+    if (invocation === void 0) continue;
+    if (WHOLE_FILE_VERBS.has(invocation.name)) paths.push(...pathOperands(invocation.rest));
+    else if (invocation.name === "sed") paths.push(...sedPaths(invocation.rest));
+    else if (invocation.name === "tail") paths.push(...tailPaths(invocation.rest));
+  }
+  return paths;
+}
+
+// read 工具只在调用方没给 offset/limit 时才是整读：宿主默认 limit 是行数上限，对超大文件
+// 仍会把整份内容拉进后端并写进结果。
+export function readToolReadPath(name, args) {
+  if (name !== "read" || args === void 0 || args === null) return void 0;
+  if (args.offset !== void 0 || args.limit !== void 0) return void 0;
+  const path = args.file_path;
+  return typeof path === "string" && path !== "" ? path : void 0;
+}
+
+// 拒绝文案直接给出正确读法：模型看得到这句话，下一次调用才会分段读。
+export function readDenyReason(path, size, maxBytes) {
+  const megabytes = (bytes) => (bytes / MIB).toFixed(1);
+  return `整读被拒：${path} 有 ${megabytes(size)} MB，超过整读上限 ${megabytes(maxBytes)} MB。`
+    + "请用 read 的 offset/limit 或 `sed -n 'a,bp'` 分段读——整读会把全文永久写进会话日志"
+    + `（宿主 >8KB 还会复制一份）；只想知道大小就用 stat/du。`;
+}
+
 export default {
   name: "caseos-memory-guard",
   // 只硬依赖 profileContext（落盘根）：agents/subagents 用 ctx.get 惰性取，缺了也照样做缓存
@@ -95,6 +367,13 @@ export default {
     const softBytes = softEnv ?? proportional.softBytes;
     const hardBytes = hardEnv ?? proportional.hardBytes;
     const thresholdsSource = softEnv === void 0 && hardEnv === void 0 ? "proportional" : "env";
+    const readGuardOff = process.env[READ_GUARD_ENV] === "0";
+    const readGuardMaxBytes = envNumber(READ_MAX_ENV, DEFAULT_READ_MAX_BYTES);
+    // 放行前缀按逗号分隔；相对前缀按命令里的原样文本比较，绝对前缀（含 ~）按解析后的路径比较。
+    const readAllowPrefixes = (process.env[READ_ALLOW_ENV] ?? "")
+      .split(",")
+      .map((entry) => entry.trim())
+      .filter(Boolean);
     const root = ctx.root ?? ctx;
 
     // 顶棚与阈值来源是后续一切实证的锚点：宿主换了堆上限（或哪天上游抬了顶）这里能直接看出来。
@@ -105,6 +384,8 @@ export default {
       hardBytes,
       thresholdsSource,
       checkMs,
+      readGuard: !readGuardOff,
+      readGuardMaxBytes: readGuardOff ? void 0 : readGuardMaxBytes,
       pid: process.pid,
       nodeArgv: process.execArgv,
     });
@@ -129,9 +410,60 @@ export default {
       }
     };
 
+    // 相对路径的基准是会话自己的工作目录（与 bash/read 工具同源）；拿不到就按「解析不出」放行。
+    const sessionCwd = async (exec) => {
+      const workingDirectory = service("workingDirectory");
+      if (exec?.agent === void 0 || typeof workingDirectory?.ensure !== "function") return void 0;
+      try {
+        return await workingDirectory.ensure(exec.agent, exec.signal ?? NO_SIGNAL);
+      } catch {
+        return void 0;
+      }
+    };
+
+    const allowListed = (raw, target) => readAllowPrefixes.some((entry) => {
+      const prefix = expandHome(entry);
+      if (!isAbsolute(prefix)) return raw === prefix || raw.startsWith(`${prefix}/`);
+      const base = prefix.endsWith("/") ? prefix.slice(0, -1) : prefix;
+      return target === base || target.startsWith(`${base}/`);
+    });
+
+    // 整读门：命中整读形态、stat 到大小且超限才拒绝。stat 失败、相对路径拿不到基准、
+    // 放行前缀命中、以及本函数自身的任何异常都放行——宁漏勿误伤，非读类命令完全不经这里。
+    const readGuardDenial = async (exec) => {
+      if (readGuardOff) return void 0;
+      try {
+        const name = exec?.name;
+        const targets = name === "bash"
+          ? bashReadPaths(exec?.arguments?.command)
+          : [readToolReadPath(name, exec?.arguments)].filter((path) => path !== void 0);
+        if (targets.length === 0) return void 0;
+        const cwd = targets.some((raw) => !isAbsolute(expandHome(raw))) ? await sessionCwd(exec) : void 0;
+        for (const raw of targets) {
+          const expanded = expandHome(raw);
+          const target = isAbsolute(expanded) ? resolve(expanded) : cwd === void 0 ? void 0 : resolve(cwd, expanded);
+          if (target === void 0 || allowListed(raw, target)) continue;
+          const size = fileSizeBytes(target);
+          if (size === void 0 || size <= readGuardMaxBytes) continue;
+          monitorEvent(dshHome, {
+            kind: "mem-guard-read-deny",
+            gate: "read-guard",
+            tool: name,
+            session: exec?.agent?.session?.header?.id,
+            path: target.slice(0, READ_DENY_PATH_LIMIT),
+            size,
+          });
+          return { kind: "deny", reason: readDenyReason(target, size, readGuardMaxBytes) };
+        }
+      } catch {
+        return void 0;
+      }
+      return void 0;
+    };
+
     let lastToolAt = Date.now();
     let lastActionAt = 0;
-    // 一次回收可能跨多个 60s 周期（drainChildren 等宿主释放完成），定时器与 end 事件不得叠加。
+    // 一次回收可能跨多个采样周期（drainChildren 等宿主释放完成），定时器与即时检查不得叠加。
     let checking = false;
 
     // 已排队待跑的输入（宿主 durable inbox 投影）：这样的空闲子代理还有活要干，不能当「已完成」。
@@ -251,11 +583,15 @@ export default {
       }
     };
 
-    // 工具活动标记开始与结束：长工具执行期间同样算忙。
+    // 工具活动标记开始与结束：长工具执行期间同样算忙。整读门在这里拦下会把全文写进会话
+    // 日志的超大读取；根 ctx 的监听器收到全部 agent 的调用（子代理会话同样经过这里，
+    // 宿主按 scopeTarget 派发：未打作用域标记的监听器就是全局监听器）。
     ctx.on("tools/pre-execute", async (exec, next) => {
       lastToolAt = Date.now();
-      if (typeof next !== "function") return;
       try {
+        const denial = await readGuardDenial(exec);
+        if (denial !== void 0) return denial;
+        if (typeof next !== "function") return;
         return await next();
       } finally {
         lastToolAt = Date.now();
@@ -264,6 +600,13 @@ export default {
     // 子代理收尾是内存回落/跃升的关键时刻，不等下一轮定时器。
     root.on("subagent/end", () => {
       void runCheck();
+    });
+    // 工具结果落地就是突发进入 Session.log 的瞬间：15s 定时器可能整整错过一次跃升，
+    // 所以每次结果之后立即补一次检查。不 await，工具结果不因看门狗变慢；并发仍由
+    // runCheck 的 checking 防抖与冷却收口。
+    root.on("tools/post-execute", (exec, result, next) => {
+      void runCheck();
+      return typeof next === "function" ? next() : void 0;
     });
 
     const timer = setInterval(runCheck, checkMs);

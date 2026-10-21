@@ -32,20 +32,24 @@ Verispring three-role session architecture plus a bundled local knowledge graph 
 | `CASEOS_SCOUT_RELAY` | on | `0` unregisters `ask_scout` and stops forwarding/checkpointing/prompt injection |
 | `CASEOS_ASK_SCOUT_TIMEOUT_MS` | `600000` | how long `ask_scout` waits for the scout's answer before returning a timeout |
 | `CASEOS_MEM_GUARD` | on | `0` disables the host memory watchdog at assembly time (no interval, no listeners) |
-| `CASEOS_MEM_CHECK_MS` | `60000` | host heap check interval |
+| `CASEOS_MEM_CHECK_MS` | `15000` | host heap check interval |
+| `CASEOS_READ_GUARD` | on | `0` disables the whole-file read guard (`tools/pre-execute` denial of oversized whole-file reads) |
+| `CASEOS_READ_GUARD_MAX_BYTES` | `2097152` (2MiB) | largest file a whole-file read may touch; larger targets are denied with a segment-read prompt |
+| `CASEOS_READ_GUARD_ALLOW` | empty | comma-separated path prefixes the read guard always allows (`~` expanded, directory-boundary matching) |
 | `CASEOS_MEM_SOFT_BYTES` | ceiling × 60% | soft heap threshold: best-effort release of idle subagents + pruning of the plugin's own indexes (2.4GiB on a 4GiB ceiling) |
 | `CASEOS_MEM_HARD_BYTES` | ceiling × 80% | hard heap threshold: idle-state `mem-guard-skip` + restart prompt, never an exit (3.2GiB on a 4GiB ceiling) |
 
 ### Monitor events
 
-`kind` values in `~/.dsh/verispring-monitor.jsonl`: `subagent-start` / `subagent-start-failed` / `subagent-end` / `subagent-error` (lifecycle + role + route), `child-route-updated`, `role-route-mismatch`, `scout-unreachable`, `scout-tools-restricted` (scout child id; its `edit`/`write` were restricted on `agent/created`), `dispatch-deny` (with `rule`: `scout-missing`, `brief-lint`, `map-baseline-missing`, `map-stale`, `executor-cap`), `gate-deny` (dispatch spec / resident-scout / missing-map denials, plus codestyle and manon), `leader-guard-deny` (with `rule`: `sleep-in-loop`, `sleep-long`, `sleep-background`, `list-agents-repeat`), `leader-write-hint` (with `rule`: `write-whitelist`, `git-mutation`, `package-mutation`, `in-place-edit`, `recursive-remove`, `workspace-redirect` — non-blocking leader write hints), `ask-scout`, `structure-forward`, `checkpoint-saved` / `checkpoint-save-failed` / `checkpoint-injected` / `checkpoint-inject-failed`, `scout-relay-error`, `mem-guard-boot` (activation self-report: `heapLimitBytes`, `nodeArgv`, `pid`, `softBytes`, `hardBytes`, `thresholdsSource`, `checkMs`), `mem-guard-drain` / `mem-guard-recycle` / `mem-guard-skip` (heap watchdog: `heapUsed`, `released`, `reason`).
+`kind` values in `~/.dsh/verispring-monitor.jsonl`: `subagent-start` / `subagent-start-failed` / `subagent-end` / `subagent-error` (lifecycle + role + route), `child-route-updated`, `role-route-mismatch`, `scout-unreachable`, `scout-tools-restricted` (scout child id; its `edit`/`write` were restricted on `agent/created`), `dispatch-deny` (with `rule`: `scout-missing`, `brief-lint`, `map-baseline-missing`, `map-stale`, `executor-cap`), `gate-deny` (dispatch spec / resident-scout / missing-map denials, plus codestyle and manon), `leader-guard-deny` (with `rule`: `sleep-in-loop`, `sleep-long`, `sleep-background`, `list-agents-repeat`), `leader-write-hint` (with `rule`: `write-whitelist`, `git-mutation`, `package-mutation`, `in-place-edit`, `recursive-remove`, `workspace-redirect` — non-blocking leader write hints), `ask-scout`, `structure-forward`, `checkpoint-saved` / `checkpoint-save-failed` / `checkpoint-injected` / `checkpoint-inject-failed`, `scout-relay-error`, `mem-guard-boot` (activation self-report: `heapLimitBytes`, `nodeArgv`, `pid`, `softBytes`, `hardBytes`, `thresholdsSource`, `checkMs`, `readGuard`, `readGuardMaxBytes`), `mem-guard-drain` / `mem-guard-recycle` / `mem-guard-skip` (heap watchdog: `heapUsed`, `released`, `reason`), `mem-guard-read-deny` (whole-file read guard: `tool`, `session`, `path`, `size`).
 
 
 ## Memory guard
 
 The host process keeps every opened session resident and never evicts it, so a long-running host
 eventually dies of an OOM. `gates/memory-guard.js` watches `process.memoryUsage()` from inside the
-host (every `CASEOS_MEM_CHECK_MS`, default 60s, plus immediately on `subagent/end`):
+host (every `CASEOS_MEM_CHECK_MS`, default 15s, plus immediately on `subagent/end` and after every
+tool result via `tools/post-execute` — one huge result can jump the heap between two samples):
 
 - **Boot self-report** — on activation it appends `mem-guard-boot` to `~/.dsh/verispring-monitor.jsonl`
   with `heapLimitBytes` (`v8.getHeapStatistics().heap_size_limit`), `nodeArgv` (`process.execArgv`),
@@ -61,6 +65,16 @@ host (every `CASEOS_MEM_CHECK_MS`, default 60s, plus immediately on `subagent/en
   `send_message` cold-resumes them; running children and children with queued input are never touched),
   and the plugin's own append-only indexes are pruned of entries whose session is gone. Recorded as
   `mem-guard-drain` / `mem-guard-recycle`; drain and recycle share a 5-minute cooldown.
+- **Whole-file read guard** — the burst is mostly one huge tool result landing in `Session.log`
+  (the host pruner copies results over 8KB a second time), so `tools/pre-execute` checks the calls
+  that dump a whole file: `read` without `offset`/`limit`, and `bash` whole-file readers (`cat`,
+  `less`, `more`, `most`, `nl`, `tac`, `strings`, `xxd`, `hexdump`, `od`, `base64`, `wc`, `sed`
+  unless it carries a `-n 'a,bp'` range, `tail -n +N`). A target larger than
+  `CASEOS_READ_GUARD_MAX_BYTES` (default 2MiB) is denied, and the denial names the file size and
+  says how to read it in segments; the hit is recorded as `mem-guard-read-deny`. `stat` failures,
+  relative paths without a resolvable session cwd, and any parse ambiguity (redirections, command
+  substitution, unbalanced quotes) are allowed — the guard only fires when it is certain. Root
+  context listeners receive every agent's calls, so subagent sessions are covered as well.
 - **Hard threshold** — only in the idle state (no running subagent and no tool activity for 90s) it
   records `mem-guard-skip` and prints a restart prompt on stderr. It does **not** exit the host:
   `main.js` treats any host close — exit 0 included — as a failed stop and never respawns the child
@@ -68,7 +82,8 @@ host (every `CASEOS_MEM_CHECK_MS`, default 60s, plus immediately on `subagent/en
 - `mem-guard-skip` also records the busy case, cooldown skips and recovery failures, always with
   `heapUsed` (plus `hardBytes` / `released` / `reason` where they apply).
 
-Kill switch: `CASEOS_MEM_GUARD=0` (no interval, no listeners, and no boot line).
+Kill switch: `CASEOS_MEM_GUARD=0` (no interval, no listeners, no boot line — the read guard is part of
+this gate, so it goes too; `CASEOS_READ_GUARD=0` turns off only the read guard).
 
 ### Heap ceiling: 4GB is a V8 build limit — launch flags cannot move it (measured)
 

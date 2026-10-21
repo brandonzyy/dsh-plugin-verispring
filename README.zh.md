@@ -32,18 +32,22 @@ Verispring 三角色会话架构 + 本地知识图谱 manon，大幅度优化主
 | `CASEOS_SCOUT_RELAY` | 开 | `0` 不注册 `ask_scout`，且停止转交、检查点与提示注入 |
 | `CASEOS_ASK_SCOUT_TIMEOUT_MS` | `600000` | `ask_scout` 等测绘答复的时限，超时返回超时文案 |
 | `CASEOS_MEM_GUARD` | 开 | `0` 在装配时关闭 host 内存看门狗（不装定时器、不挂监听） |
-| `CASEOS_MEM_CHECK_MS` | `60000` | host 堆内存检查间隔 |
+| `CASEOS_MEM_CHECK_MS` | `15000` | host 堆内存检查间隔 |
+| `CASEOS_READ_GUARD` | 开 | `0` 关闭整读门（`tools/pre-execute` 里拒绝超大文件整读） |
+| `CASEOS_READ_GUARD_MAX_BYTES` | `2097152`（2MiB） | 整读允许的最大文件；超过就拒绝并给出分段读法 |
+| `CASEOS_READ_GUARD_ALLOW` | 空 | 逗号分隔的放行前缀（`~` 展开、按目录边界匹配），命中的路径整读门直接放行 |
 | `CASEOS_MEM_SOFT_BYTES` | 顶棚 × 60% | 软阈值：尽力释放空闲子代理 + 剪本插件的只增索引（4GiB 顶棚即 2.4GiB） |
 | `CASEOS_MEM_HARD_BYTES` | 顶棚 × 80% | 硬阈值：空闲态记 `mem-guard-skip` + 重启提示（绝不退出；4GiB 顶棚即 3.2GiB） |
 
 ### monitor 事件
 
-`~/.dsh/verispring-monitor.jsonl` 的 `kind`：`subagent-start` / `subagent-start-failed` / `subagent-end` / `subagent-error`（生命周期 + 角色 + 路由）、`child-route-updated`、`role-route-mismatch`、`scout-unreachable`、`scout-tools-restricted`（带测绘子代理 id；其 `edit`/`write` 已在 `agent/created` 时摘除）、`dispatch-deny`（带 `rule`：`scout-missing`、`brief-lint`、`map-baseline-missing`、`map-stale`、`executor-cap`）、`gate-deny`（派遣规范门/测绘常驻/缺地图，以及 codestyle 与 manon 的拒绝）、`leader-guard-deny`（带 `rule`：`sleep-in-loop`、`sleep-long`、`sleep-background`、`list-agents-repeat`）、`leader-write-hint`（带 `rule`：`write-whitelist`、`git-mutation`、`package-mutation`、`in-place-edit`、`recursive-remove`、`workspace-redirect`——非阻断的领导写入提示）、`ask-scout`、`structure-forward`、`checkpoint-saved` / `checkpoint-save-failed` / `checkpoint-injected` / `checkpoint-inject-failed`、`scout-relay-error`、`mem-guard-boot`（激活自报：`heapLimitBytes`、`nodeArgv`、`pid`、`softBytes`、`hardBytes`、`thresholdsSource`、`checkMs`）、`mem-guard-drain` / `mem-guard-recycle` / `mem-guard-skip`（内存看门狗：`heapUsed`、释放条数 `released`、`reason`）。
+`~/.dsh/verispring-monitor.jsonl` 的 `kind`：`subagent-start` / `subagent-start-failed` / `subagent-end` / `subagent-error`（生命周期 + 角色 + 路由）、`child-route-updated`、`role-route-mismatch`、`scout-unreachable`、`scout-tools-restricted`（带测绘子代理 id；其 `edit`/`write` 已在 `agent/created` 时摘除）、`dispatch-deny`（带 `rule`：`scout-missing`、`brief-lint`、`map-baseline-missing`、`map-stale`、`executor-cap`）、`gate-deny`（派遣规范门/测绘常驻/缺地图，以及 codestyle 与 manon 的拒绝）、`leader-guard-deny`（带 `rule`：`sleep-in-loop`、`sleep-long`、`sleep-background`、`list-agents-repeat`）、`leader-write-hint`（带 `rule`：`write-whitelist`、`git-mutation`、`package-mutation`、`in-place-edit`、`recursive-remove`、`workspace-redirect`——非阻断的领导写入提示）、`ask-scout`、`structure-forward`、`checkpoint-saved` / `checkpoint-save-failed` / `checkpoint-injected` / `checkpoint-inject-failed`、`scout-relay-error`、`mem-guard-boot`（激活自报：`heapLimitBytes`、`nodeArgv`、`pid`、`softBytes`、`hardBytes`、`thresholdsSource`、`checkMs`、`readGuard`、`readGuardMaxBytes`）、`mem-guard-drain` / `mem-guard-recycle` / `mem-guard-skip`（内存看门狗：`heapUsed`、释放条数 `released`、`reason`）、`mem-guard-read-deny`（整读门：`tool`、`session`、`path`、`size`）。
 
 ## 内存看门狗（memory-guard）
 
 host 进程把点开的会话整份常驻、永不淘汰，跑久了必然 OOM。`gates/memory-guard.js` 在 host 内读
-`process.memoryUsage()`（每 `CASEOS_MEM_CHECK_MS`，默认 60s；`subagent/end` 时立即补一次）：
+`process.memoryUsage()`（每 `CASEOS_MEM_CHECK_MS`，默认 15s；`subagent/end` 后与每次工具结果
+（`tools/post-execute`）后都立即补一次——一次巨型结果就能在两次采样之间把堆顶上去）：
 
 - **启动自报**——激活时往 `~/.dsh/verispring-monitor.jsonl` 追加一条 `mem-guard-boot`：
   `heapLimitBytes`（`v8.getHeapStatistics().heap_size_limit`）、`nodeArgv`（`process.execArgv`）、
@@ -57,13 +61,22 @@ host 进程把点开的会话整份常驻、永不淘汰，跑久了必然 OOM�
   `subagents.drainChildren(parent, childIds)` 释放（之后 `send_message` 冷恢复；运行中的、还有排队
   输入的一律不碰），同时按活会话剪掉本插件自己的只增索引。记 `mem-guard-drain` /
   `mem-guard-recycle`；drain 与 recycle 共享 5 分钟冷却。
+- **整读门**——突发大头是「一份巨型工具结果进 `Session.log`」（宿主 pruner 对 >8KB 的结果还会
+  复制一份），所以 `tools/pre-execute` 先查会整篇进结果的调用：没带 `offset`/`limit` 的 `read`，
+  以及 bash 里的整读动词（`cat`、`less`、`more`、`most`、`nl`、`tac`、`strings`、`xxd`、
+  `hexdump`、`od`、`base64`、`wc`、带 `-n 'a,bp'` 行范围之外的 `sed`、`tail -n +N`）。目标超过
+  `CASEOS_READ_GUARD_MAX_BYTES`（默认 2MiB）即拒绝，拒绝文案写明文件大小与分段读法，并记
+  `mem-guard-read-deny`。`stat` 失败、相对路径拿不到会话 cwd、以及任何解析歧义（重定向、命令
+  替换、引号不闭合）一律放行——只在确定超限时才拒绝。根 ctx 的监听器收到全部 agent 的调用，
+  子代理会话同样受检。
 - **硬阈值**——只在空闲态（无运行中子代理、近 90s 无工具活动）记 `mem-guard-skip` 并在 stderr
   提示人工重启。**不退出 host**：`main.js` 把 host 子进程的任何 close（含 exit 0）都当作失败停止
   且不会重新 spawn，靠退出触发重启只会打断当前 desktop 后端（热重启接缝见下节，插件层不可达）。
 - `mem-guard-skip` 还记录忙态、冷却跳过与回收失败，一律带 `heapUsed`（必要时 `hardBytes` /
   `released` / `reason`）。
 
-一键全关：`CASEOS_MEM_GUARD=0`（连 boot 自报也不落）。
+一键全关：`CASEOS_MEM_GUARD=0`（连 boot 自报与整读门也不落、不挂）；只想关整读门用
+`CASEOS_READ_GUARD=0`。
 
 ### 堆顶棚：4GB 是 V8 构建硬上限，启动参数抬不动（实测）
 
