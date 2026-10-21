@@ -467,12 +467,12 @@
       name: './gates/manon-bridge.js'
     - id: caseos-scout-relay
       name: './gates/scout-relay.js'
-    # host 内存看门狗：软阈值释放空闲子代理的常驻 activation 并剪本插件只增索引；硬阈值只
-    # 告警（main.js 对 host 子进程任何 exit 都算失败停止，不会自动重启）。CASEOS_MEM_GUARD=0 关闭。
+    # host 内存看门狗：软阈值只剪本插件只增索引并给主会话发释放提示；硬阈值只告警
+    # （main.js 对 host 子进程任何 exit 都算失败停止，不会自动重启）。CASEOS_MEM_GUARD=0 关闭。
     - id: caseos-memory-guard
       name: './gates/memory-guard.js'
-    # 空闲会话卸载器：包装 agents.resume 捕获 promote 丢掉的 handle，空闲且无 follower/活子代/
-    # pending 输入时 dispose()，让 Session.log 真正释放；CASEOS_EVICT=0 关闭，阈值见 README。
+    # 子代理释放器：包装 agents.resume 捕获 promote 丢掉的 handle，主会话经 release_subagent
+    # 逐个决定释放（主会话自身与子代理都不会被自动卸载）；CASEOS_EVICT=0 关闭。
     - id: caseos-session-evictor
       name: './gates/session-evictor.js'
     # 配置面板：Config schema 提供宿主表单服务；client 组合包页渲染并把模型位落盘到执法面

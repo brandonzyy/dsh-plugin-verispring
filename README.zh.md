@@ -13,7 +13,7 @@ Verispring 三角色会话架构 + 本地知识图谱 manon，大幅度优化主
 | 4 | 任务书闸 + 并发上限 | 执行任务书是成果描述，不是调研请求：含调研型措辞（`gates/dispatch-gate.js` 的 `BRIEF_LINT_TERMS`）即拒绝并指路 `send_message` 测绘——**带否定的说法豁免**（命中词前 6 个字符内有否定词，如「不要通读实现」「禁止先调研」）。同一领导会话里运行中的执行子代理有上限（缺省 8），超限拒绝并提示结束回合等回执。两者各有开关（`CASEOS_BRIEF_LINT=0`、`CASEOS_MAX_EXECUTORS`） |
 | 5 | 模型钉死 | 路由在运行时**按角色**强制注入：测绘派遣走面板测绘路由，执行派遣走执行路由（角色来自 `description` 前缀）；调用里显式写的 `provider`/`model` 一律忽略。`subagent_fork` 一律拒绝 |
 | 6 | 提交门 | `git commit` 前必须先读 `~/.dsh/specs/代码写作规范.md`；提交形状强制 `-F 文件 -- 显式路径`，`timeout`/`env`/`nice`/`nohup`/`stdbuf` 等包装命令穿透识别 |
-| 7 | 领导面限定 | 领导会话工具面收缩到复核五件（`bash`/`edit`/`write`/`read`/`read_image`）+ 派遣面（`subagent`/`send_message`/`interrupt_agent`/`list_agents`），名单与领导视图里实际存在的工具取交集（桌面工具在 preset 层，headless 在根层），派遣工具以瘦身定义遮蔽；`subagent-base` 在 root 层无条件隐藏（路由执行体异常时模型无路可绕）。测绘/执行子代理用 `verispring-subagent` preset 的全量工具面；测绘的 `edit`/`write` 在运行时硬禁——`gates/dispatch-gate.js` 在 `agent/created` 时按派遣队列计划里的 `scout` 角色，在子代理自己的作用域上调 `rtc.tools.restrict({ deny: ["edit", "write"] })`，工具列表里直接没有这两个工具（执行者与领导保留）。逃生开关 `CASEOS_SCOUT=0` 关闭分工条款中的测绘部分与该硬禁 |
+| 7 | 领导面限定 | 领导会话工具面收缩到复核五件（`bash`/`edit`/`write`/`read`/`read_image`）+ 派遣面（`subagent`/`send_message`/`interrupt_agent`/`list_agents`/`release_subagent`），名单与领导视图里实际存在的工具取交集（桌面工具在 preset 层，headless 在根层），派遣工具以瘦身定义遮蔽；`subagent-base` 在 root 层无条件隐藏（路由执行体异常时模型无路可绕）。测绘/执行子代理用 `verispring-subagent` preset 的全量工具面；测绘的 `edit`/`write` 在运行时硬禁——`gates/dispatch-gate.js` 在 `agent/created` 时按派遣队列计划里的 `scout` 角色，在子代理自己的作用域上调 `rtc.tools.restrict({ deny: ["edit", "write"] })`，工具列表里直接没有这两个工具（执行者与领导保留）。逃生开关 `CASEOS_SCOUT=0` 关闭分工条款中的测绘部分与该硬禁 |
 | 8 | 领导守卫（leader-guard） | 两类处置。**拒绝（不变）**：有子代理运行时 `bash` 里的 `sleep`/循环等待被拒；同一回合第二次 `list_agents` 被拒。**提示（1.3.66 起）**：白名单（`.project-map.md`、路径含 `/reports/`、`~/.dsh/AGENTS.md`，外加 `CASEOS_LEADER_WRITE_ALLOW` 前缀）之外的 `edit`/`write` 与 `bash` 变更命令——`git commit/push/merge/rebase/restore/stash`（只有 `git stash list` / `git stash show` 按只读静默）、`npm`/`pnpm` 的 publish/install、`sed -i`/`perl -i`、`rm -rf`、工作区重定向——**不再拒绝**：调用照常执行，在工具结果后经宿主 `tools/post-execute` 的 `additionalContexts` 追加一次提示（「有明确边界的代码和写作任务，请交给执行子代理；领导自己只做小修正、地图、报告和验收所需的写入」），同一回合只提示一次，monitor 记 `leader-write-hint`（规则名 + 摘要）。子代理会话不受限。逃生开关 `CASEOS_LEADER_GUARD=0` |
 | 9 | 测绘接力（scout-relay） | 三条原本只在提示词里的闭环：`ask_scout` 让执行者把定位/事实问题代发给常驻测绘并等它新答复（sender 取领导 Agent，`sendMessage` 按血缘授权）；非测绘子代理收尾文本里的「结构增量」段自动转给测绘；异常结束（`error`/`aborted`/`refusal`）落检查点，领导续接时由插件携现场代发。非测绘子代理另有注入的 ≤4 行定位纪律（有可达测绘指 `ask_scout`，没有则写进汇报）+ 必带的「结构增量」段。逃生开关 `CASEOS_SCOUT_RELAY=0`；`CASEOS_ASK_SCOUT_TIMEOUT_MS` 控制等待时限 |
 | 10 | manon 桥接 | 解析本地图谱 CLI（`MANON_KG_BIN` > 组件自带 `manon/manon-kg` > 旧地 `~/manon/manon-kg`），存在则按角色注入：测绘拿全量（命令面、source 调用铁则、维护纪律），领导只拿"图谱事实找测绘"，执行只拿一行说明。manon 是测绘专责，领导和执行都不直接调用；语义详见 `~/.dsh/specs/Manon调用规则.md`。**承重墙是调用铁则**：dsh 子进程服务会把 KEY/TOKEN 形状的环境变量从子进程剥掉（防泄漏），直接跑 `manon-kg sync` 必报缺密钥——注入的调用式让 bash 命令先 `source ~/.dsh/manon.env` 再执行（清洗只剥第一层，孙进程自由继承）。密钥值不经过也不打印 |
@@ -36,19 +36,18 @@ Verispring 三角色会话架构 + 本地知识图谱 manon，大幅度优化主
 | `CASEOS_READ_GUARD` | 开 | `0` 关闭整读门（`tools/pre-execute` 里拒绝超大文件整读） |
 | `CASEOS_READ_GUARD_MAX_BYTES` | `2097152`（2MiB） | 整读允许的最大文件；超过就拒绝并给出分段读法 |
 | `CASEOS_READ_GUARD_ALLOW` | 空 | 逗号分隔的放行前缀（`~` 展开、按目录边界匹配），命中的路径整读门直接放行 |
-| `CASEOS_MEM_SOFT_BYTES` | 顶棚 × 60% | 软阈值：尽力释放空闲子代理 + 剪本插件的只增索引（4GiB 顶棚即 2.4GiB） |
+| `CASEOS_MEM_SOFT_BYTES` | 顶棚 × 60% | 软阈值：给主会话发非阻断释放提示 + 剪本插件的只增索引（4GiB 顶棚即 2.4GiB） |
 | `CASEOS_MEM_HARD_BYTES` | 顶棚 × 80% | 硬阈值：空闲态记 `mem-guard-skip` + 重启提示（绝不退出；4GiB 顶棚即 3.2GiB） |
-| `CASEOS_EVICT` | 开 | `0` 在装配时关闭空闲会话卸载器（不包装 `agents.resume`、不装定时器、不落事件） |
-| `CASEOS_EVICT_SCAN_MS` | `60000` | 空闲会话扫描间隔 |
-| `CASEOS_EVICT_IDLE_MS` | `600000` | 会话空闲多久才允许卸载；堆压力（≥ 顶棚 × 50%）时自动降到 2 分钟 |
+| `CASEOS_EVICT` | 开 | `0` 在装配时关闭子代理释放器（不包装 `agents.resume`、不装扫描、不注册 `release_subagent`、不落事件） |
+| `CASEOS_EVICT_SCAN_MS` | `60000` | 遥测扫描间隔；只上报可释放子代理数，绝不释放任何会话 |
 
 ### monitor 事件
 
-`~/.dsh/verispring-monitor.jsonl` 的 `kind`：`subagent-start` / `subagent-start-failed` / `subagent-end` / `subagent-error`（生命周期 + 角色 + 路由）、`child-route-updated`、`role-route-mismatch`、`scout-unreachable`、`scout-tools-restricted`（带测绘子代理 id；其 `edit`/`write` 已在 `agent/created` 时摘除）、`dispatch-deny`（带 `rule`：`scout-missing`、`brief-lint`、`map-baseline-missing`、`map-stale`、`executor-cap`）、`gate-deny`（派遣规范门/测绘常驻/缺地图，以及 codestyle 与 manon 的拒绝）、`leader-guard-deny`（带 `rule`：`sleep-in-loop`、`sleep-long`、`sleep-background`、`list-agents-repeat`）、`leader-write-hint`（带 `rule`：`write-whitelist`、`git-mutation`、`package-mutation`、`in-place-edit`、`recursive-remove`、`workspace-redirect`——非阻断的领导写入提示）、`ask-scout`、`structure-forward`、`checkpoint-saved` / `checkpoint-save-failed` / `checkpoint-injected` / `checkpoint-inject-failed`、`scout-relay-error`、`mem-guard-boot`（激活自报：`heapLimitBytes`、`nodeArgv`、`pid`、`softBytes`、`hardBytes`、`thresholdsSource`、`checkMs`、`readGuard`、`readGuardMaxBytes`）、`mem-guard-drain` / `mem-guard-recycle` / `mem-guard-skip`（内存看门狗：`heapUsed`、释放条数 `released`、`reason`）、`mem-guard-read-deny`（整读门：`tool`、`session`、`path`、`size`）、`mem-guard-sample`（每 5 分钟的 `heapUsed` / `rss` / `heapLimitBytes` 增长曲线）、`mem-guard-soft`（软阈值越线心跳，5 分钟限流）、`mem-guard-evict-boot`（卸载器自报：`scanMs`、`idleMs`、`tracked`、`untracked`、`subagentProbe`）、`mem-guard-evict`（卸载成功：`session`、`idleMs`、`heapUsedBefore`、`pressure`、`observationEvicted`、`coldLogEvicted`）、`mem-guard-evict-fail`（`error` 截 200 字符、`retryAfterMs`）、`mem-guard-evict-skip`（`reason`：`follower-unknown`、`scan-failed`）。
+`~/.dsh/verispring-monitor.jsonl` 的 `kind`：`subagent-start` / `subagent-start-failed` / `subagent-end` / `subagent-error`（生命周期 + 角色 + 路由）、`child-route-updated`、`role-route-mismatch`、`scout-unreachable`、`scout-tools-restricted`（带测绘子代理 id；其 `edit`/`write` 已在 `agent/created` 时摘除）、`dispatch-deny`（带 `rule`：`scout-missing`、`brief-lint`、`map-baseline-missing`、`map-stale`、`executor-cap`）、`gate-deny`（派遣规范门/测绘常驻/缺地图，以及 codestyle 与 manon 的拒绝）、`leader-guard-deny`（带 `rule`：`sleep-in-loop`、`sleep-long`、`sleep-background`、`list-agents-repeat`）、`leader-write-hint`（带 `rule`：`write-whitelist`、`git-mutation`、`package-mutation`、`in-place-edit`、`recursive-remove`、`workspace-redirect`——非阻断的领导写入提示）、`ask-scout`、`structure-forward`、`checkpoint-saved` / `checkpoint-save-failed` / `checkpoint-injected` / `checkpoint-inject-failed`、`scout-relay-error`、`mem-guard-boot`（激活自报：`heapLimitBytes`、`nodeArgv`、`pid`、`softBytes`、`hardBytes`、`thresholdsSource`、`checkMs`、`readGuard`、`readGuardMaxBytes`）、`mem-guard-recycle` / `mem-guard-skip`（内存看门狗：`heapUsed`、释放条数 `released`、`reason`）、`mem-guard-read-deny`（整读门：`tool`、`session`、`path`、`size`）、`mem-guard-sample`（每 5 分钟的 `heapUsed` / `rss` / `heapLimitBytes` 增长曲线）、`mem-guard-soft`（软阈值越线心跳，5 分钟限流）、`mem-guard-release-hint`（软阈值期间主会话下一次工具结果后的非阻断提示：`session`、`heapUsed`、`softBytes`、`candidates`）、`mem-guard-release`（主会话点名释放子代理：`caller`、`child`、`mode`：`drain` / `dispose` / `noop` / `refused`、`reason`、`heapUsedBefore`、`heapUsedAfter`）、`mem-guard-evict-boot`（释放器自报：`scanMs`、`tracked`、`untracked`、`releaseTool`、`subagentProbe`）、`mem-guard-evict-follow`（follow 包装安装：`source`、`preexistingFollowers`、`elapsedMs`）、`mem-guard-evict-scan`（每 5 分钟遥测：`tracked`、`candidates`、`resident`、`followerTotal`、`followerTracked`、`followerUntracked`、`followerProbe`、`subagentProbe`、`heapUsed`）、`mem-guard-evict-skip`（`reason`：`scan-failed`）。
 
 ## 内存看门狗（memory-guard）
 
-host 进程把点开的会话整份常驻、永不淘汰，跑久了必然 OOM。`gates/memory-guard.js` 在 host 内读
+host 进程自己从不淘汰点开的会话；没有释放路径，跑久了必然 OOM。`gates/memory-guard.js` 在 host 内读
 `process.memoryUsage()`（每 `CASEOS_MEM_CHECK_MS`，默认 15s；`subagent/end` 后与每次工具结果
 （`tools/post-execute`）后都立即补一次——一次巨型结果就能在两次采样之间把堆顶上去）：
 
@@ -60,10 +59,12 @@ host 进程把点开的会话整份常驻、永不淘汰，跑久了必然 OOM�
   4GiB 顶棚即 2.4GiB / 3.2GiB（与旧版固定值同档），8GiB 顶棚自动抬到 4.8GiB / 6.4GiB。
   `CASEOS_MEM_SOFT_BYTES` / `CASEOS_MEM_HARD_BYTES` 显式设置时按 env 覆盖（可只覆盖一侧），此时
   `thresholdsSource: "env"`。读不到 V8 顶棚时按 4GiB 兜底，不会让看门狗整个失活。
-- **软阈值**——尽力回收。空闲且 durable inbox 已清空的子代理（`status === "idle"`）走宿主自己的
-  `subagents.drainChildren(parent, childIds)` 释放（之后 `send_message` 冷恢复；运行中的、还有排队
-  输入的一律不碰），同时按活会话剪掉本插件自己的只增索引。记 `mem-guard-drain` /
-  `mem-guard-recycle`；drain 与 recycle 共享 5 分钟冷却。
+- **软阈值**——只观测、不行动。插件绝不自行释放任何会话：按活会话剪掉本插件自己的只增索引
+  （记 `mem-guard-recycle`，5 分钟冷却），并保留 `mem-guard-soft` 心跳；没有可剪条目时记
+  `mem-guard-skip`（`reason: "soft-threshold-no-targets"`）。
+- **释放提示**——堆越过软阈值期间，**主会话**的下一次工具结果后追加一条非阻断
+  `additionalContexts`：列出主会话可释放的已结束子代理（`id`、截断的描述、测绘/执行）并建议调用
+  `release_subagent`。落 `mem-guard-release-hint`；同一主会话 5 分钟最多一次，子代理会话永远收不到。
 - **整读门**——突发大头是「一份巨型工具结果进 `Session.log`」（宿主 pruner 对 >8KB 的结果还会
   复制一份），所以 `tools/pre-execute` 先查会整篇进结果的调用：没带 `offset`/`limit` 的 `read`，
   以及 bash 里的整读动词（`cat`、`less`、`more`、`most`、`nl`、`tac`、`strings`、`xxd`、
@@ -74,9 +75,8 @@ host 进程把点开的会话整份常驻、永不淘汰，跑久了必然 OOM�
   子代理会话同样受检。
 - **观测面**——阈值以下也每 5 分钟落一条 `mem-guard-sample`（`heapUsed` / `rss` /
   `heapLimitBytes`），增长曲线不再只在越线后可见；软阈值越线每 5 分钟落一条
-  `mem-guard-soft`，无论有没有可回收目标。一次检查若卡在宿主释放的 await 上超过
-  `max(2×checkMs, 60s)`，记 `mem-guard-skip`（`reason: "check-stuck"`）并把 `checking`
-  置回，后续 tick 不再被永久静默。
+  `mem-guard-soft`。一次检查若卡在宿主释放的 await 上超过 `max(2×checkMs, 60s)`，记
+  `mem-guard-skip`（`reason: "check-stuck"`）并把 `checking` 置回，后续 tick 不再被永久静默。
 - **硬阈值**——只在空闲态（无运行中子代理、近 90s 无工具活动）记 `mem-guard-skip` 并在 stderr
   提示人工重启。**不退出 host**：`main.js` 把 host 子进程的任何 close（含 exit 0）都当作失败停止
   且不会重新 spawn，靠退出触发重启只会打断当前 desktop 后端（热重启接缝见下节，插件层不可达）。
@@ -86,55 +86,72 @@ host 进程把点开的会话整份常驻、永不淘汰，跑久了必然 OOM�
 一键全关：`CASEOS_MEM_GUARD=0`（连 boot 自报与整读门也不落、不挂）；只想关整读门用
 `CASEOS_READ_GUARD=0`。
 
-## 空闲会话卸载（session-evictor）
+## 子代理释放由主会话决定（session-evictor）
 
-memory-guard 只放子代理的常驻 activation，**被点开 / 被 promote 的父会话本身**仍会整份常驻：
-session-controller 的 promote 链把 `ctx.agents.resume()` 返回的 `{ agent, dispose }` 里的
-`dispose` 丢掉（`dsh-api-session-controller/lib/index.js:396-403`），而 resume 的 owner 是长期
-存活的控制器作用域（`dsh-agent/lib/index.js:466-470`），所以被 UI 跟随过的会话（含 caseos
-工作流里的子代理会话）要等 host 退出才释放。
+host 把每次 promote 的会话整份常驻：session-controller 的 promote 链把 `ctx.agents.resume()`
+返回的 `{ agent, dispose }` 里的 `dispose` 丢掉（`dsh-api-session-controller/lib/index.js:
+396-403`），而 resume 的 owner 是长期存活的控制器作用域（`dsh-agent/lib/index.js:466-470`），
+所以被 UI 跟随过的会话（含 caseos 工作流里的子代理会话）本会一直留到 host 退出。本门禁
+**自己不做任何决定**：
 
-`gates/session-evictor.js` 在插件激活时包装 `AgentRegistry.prototype.resume`：cordis 的
+- **主会话永不被自动卸载**；
+- **子代理也不再自动卸载**——由主会话通过 `release_subagent` 工具逐个决定（只有主会话看得见、
+  调得动；子代理调用一律拒绝）；
+- 定时扫描（`CASEOS_EVICT_SCAN_MS`，默认 60s）**只是遥测**：上报「主会话当前可释放几个已结束
+  子代理」，绝不调用 dispose。
+
+`gates/session-evictor.js` 仍在插件激活时包装 `AgentRegistry.prototype.resume`：cordis 的
 `ctx.agents` 是 traceable proxy，每次方法访问都重新沿原型链取 `resume`（`cordis/lib/index.js:
-84-157`、`:675`、`:686`、`:763-764`），所以 session-controller 的
-`this.ctx.agents.resume` 必然经过包装；包装只旁路记录 handle，返回值原样透传。卸载后
-session-controller 的 `resolve()` 首行 `liveAgent()` 落空，下一次访问自然重新 promote，又被
-包装捕获——不需要任何宿主改动。激活前已经 promote 的会话拿不到 handle，只在
-`mem-guard-evict-boot` 的 `untracked` 里上报，不动它们。
+84-157`、`:675`、`:686`、`:763-764`），所以 session-controller 的 `this.ctx.agents.resume`
+必然经过包装；包装只旁路记录 handle，返回值原样透传——这份 handle 正是 `release_subagent`
+释放「冷续接过、已 settle」的子代理时要用的。激活前已经 promote 的会话拿不到 handle，只在
+`mem-guard-evict-boot.untracked` 里上报，不动它们。
 
-follow 归属包装在 host 启动阶段就安装：apply 先试装，若 session-controller 尚未 provide，则用
-`ctx.inject(["sessionController"], …)` 在服务可用时立即补装，故界面首条 follow 前包装已就位。
-boot 的 `followerProbe:"deferred"` 表示在等服务 provide，实际安装另落 `mem-guard-evict-follow`
-（`source`、`preexistingFollowers`、`elapsedMs`）；`preexistingFollowers>0` 表示存在无法归属的旧流
-（阻塞名 `follower-untracked`），此时保守全不卸。另每 5 分钟落 `mem-guard-evict-scan`：`tracked`、
-`candidates`、`evicted`、`blockers`（原因→计数）、`followerTotal`、`followerTracked`、
-`followerUntracked`、`followerProbe`、`subagentProbe`（附 `heapUsed`、`pressure`），直接回答「为什么没卸」。
+`release_subagent` 只有一个参数 `agent_ids: string[]`，逐 id 返回 `released` / `not-loaded` /
+`refused`（带原因）以及 `heapUsedBefore` / `heapUsedAfter`。授权与安全判据：
 
-**卸载判据**（全部满足；任一不满足就不碰）：
+- 调用方必须是主会话（`session.header.origin !== "subagent"`）；子代理调用直接拒绝，且不释放
+  任何目标；
+- 目标必须是调用方的**后代**（`header.parentSession` 链可达）；主会话（含调用方自己）或无关
+  会话一律拒绝；
+- 目标必须已结束：`agent.status === "idle"`、durable inbox 无 pending、manager 的
+  `ChildLock.tails` 无在途续接/投递、`session-controller` 无在途 resume/claim；
+- 目标**没有活着的后代**：孙代先释放，否则一并拒绝（本实现选择拒绝，绝不隐式拆整棵子树）；
+- 目标没有 UI follow 流：`sessionController.history.follow` 包装按 sessionId 归属活跃 follow；
+  包装安装前就存在的 follow 无法归属，此时保守拒绝（`follower-untracked`）。
 
-- 子代理来源会话按 **activation 归属**：id 仍在 `subagents` manager 的 `resident`（活 activation）
-  中 → 不碰（`subagent-resident`）；已 settle（resident 在 `dsh-subagent/lib/index.js:2034`
-  删除）→ 与普通会话走同一套判据；manager 的 `ChildLock.tails` 有在途续接/投递也不碰。拿不到
-  resident 探针时退回旧行为（子代理会话一律不卸），boot 报 `subagentProbe:false`；
-- `agent.status === "idle"`，且 durable inbox 无 pending；
-- 没有活着的子代 agent（含 idle 常驻；父会话 dispose 会连带拆子作用域，先让宿主按自己的
-  顺序 drain）；
-- 没有在途 `resume` / `claim`；
-- 没有 UI follow 流：包装 `sessionController.history.follow` 记录 sessionId → 活跃 follow 数；
-  `closeFollowers` 里无法归属的 follow（包装安装前就在看的）一律视为「有人在看」；
-- 距最后一次 `session/event`、`agent/status`、工具调用 ≥ `CASEOS_EVICT_IDLE_MS`。
+**释放路径**：目标仍在 `subagents.manager.resident` → 调宿主 `subagents.drainChildren(parent,
+[id])`，宿主要求 **exact live direct parent**（`dsh-subagent/lib/index.js:1372-1383`）；调用方是
+祖父时用该 activation 自己的直接父，且它必须仍在 agents 注册表里（否则 `drain-parent-not-live`）。
+不用 `drainDescendants`（`:1334`）：它释放 root 的全部后代，不能只挑一个孙代。已 settle 但仍在
+内存的目标走捕获的 `handle.dispose()`；本就不在内存的返回 `not-loaded`（成功无操作）；
+活着但本插件没捕获到 handle 的（激活前已 promote）返回 `not-captured`，不谎报已释放。每次尝试
+都落 `mem-guard-release`（`caller`、`child`、`mode`：`drain` / `dispose` / `noop` / `refused`、
+`reason`、`heapUsedBefore`、`heapUsedAfter`）。
 
 **释放效果**：`handle.dispose()` 会 stop loop → await idle → 拆 scope → 关持久化 handle →
 `detachAgent` / `detachSession`（`dsh-agent-loop/lib/index.js:1740-1810`），SessionStore
 （`dsh-session:1886-1893`）与 AgentRegistry（`dsh-agent:544`）的条目一起消失；本插件还会在
-`sessionQuery._observations.cache` 里对 `refs === 0` 的目标会话做一次定点清退（冷观察缓存
-上限 5，`dsh-session-query/lib/index.js:327-341`）；persistence 的 `coldLogMemo`（上限 2）按
-会话 id 点名删一条可重建缓存；session-controller 的 assistant-stream 缓存随 `agent/disposed` 删除。
-被卸载的会话若之后被 UI 重新打开或收到新消息，会重新走 promote 冷恢复，不丢会话。
+`sessionQuery._observations.cache` 里对 `refs === 0` 的目标做一次定点清退（冷观察缓存上限 5，
+`dsh-session-query/lib/index.js:327-341`），persistence 的 `coldLogMemo`（上限 2）按会话 id
+点名删一条可重建缓存。被释放的子代理若之后收到 `send_message`，会走 manager 的
+`coldResume → materialize → agents.resume` 正常冷恢复并被再次捕获，不丢会话。
 
-**堆压力**：`heapUsed ≥ 顶棚 × 50%` 时空闲门槛降到 2 分钟，并按 `lastActive` 的 LRU 顺序先卸
-最久未活动的。dispose 失败（含 60s 超时）落 `mem-guard-evict-fail`，该会话 30 分钟内不再尝试；
-成功落 `mem-guard-evict`（含 `heapUsedBefore`）。一键全关：`CASEOS_EVICT=0`。
+follow 归属包装在 host 启动阶段就安装：apply 先试装，若 session-controller 尚未 provide，则用
+`ctx.inject(["sessionController"], …)` 在服务可用时立即补装，故界面首条 follow 前包装已就位。
+boot 的 `followerProbe:"deferred"` 表示在等服务 provide，实际安装另落 `mem-guard-evict-follow`
+（`source`：`apply` / `inject` / `scan` / `release`、`preexistingFollowers`、`elapsedMs`）。
+每 5 分钟落 `mem-guard-evict-scan`：`tracked`、`candidates`（当前可释放的已结束子代理数）、
+`resident`、`followerTotal`、`followerTracked`、`followerUntracked`、`followerProbe`、
+`subagentProbe`、`heapUsed`。
+
+堆越过软阈值时，内存看门狗会在主会话下一次工具结果后追加非阻断的
+`mem-guard-release-hint`（见上节），列出的正是同一批候选；它自己绝不释放任何东西。
+
+旧的 `CASEOS_EVICT_IDLE_MS` 与「堆压力 ≥ 50% 降阈」机制一并删除：不再自动释放，也就没有
+空闲门槛可调。
+
+一键全关：`CASEOS_EVICT=0`（不包装、不扫描、不注册 `release_subagent`、不落事件）。
 
 ### 堆顶棚：4GB 是 V8 构建硬上限，启动参数抬不动（实测）
 

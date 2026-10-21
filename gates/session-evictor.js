@@ -1,4 +1,4 @@
-// 空闲会话卸载器：把「被点开 / 被 promote 过、但已经没人看也没人用」的会话真正释放。
+// 主会话决定的子代理释放器（session-evictor）。
 //
 // 病因（rc.2 实测源码）：session-controller 的 promote 链
 //   follow() 收到冷快照 → source.retain() → this.promote()（dsh-api-session-controller/lib/index.js:1586-1594）
@@ -8,67 +8,53 @@
 // AgentRegistry.resume 的 owner 是长期存活的控制器作用域（dsh-agent/lib/index.js:466-470），
 // 于是每次 promote 都把整份 Session.log 挂到进程生命周期，直到 OOM。
 //
-// 包装生效面（必须查清的一点）：cordis 的 context 是 proxy，`ctx.agents` 每次读取都经
-// getTraceable 返回一个 traceable proxy（cordis/lib/index.js:675、:686、:763-764）；该 proxy 的
-// get 陷阱在**每次方法访问**时重新沿原型链查 `resume`（:84-157），所以改
-// `AgentRegistry.prototype.resume` 对 session-controller 的 `this.ctx.agents.resume` 必然生效
-// （rc.2 的 resume 是类方法，在原型上：dsh-agent/lib/index.js:466）。反过来，插件拿不到 raw
-// registry 实例（`ctx.get("agents")` 同样被 getTraceable 包过），改实例不可行。
+// 决定权模型（本版起）：没有任何自动卸载。主会话自身永不被自动卸载；子代理是否卸载由主会话
+// 通过 `release_subagent` 工具按需决定（权限与任务都在主会话）。resume 包装保留——它捕获的
+// handle 正是释放冷续接过的子代理所需的；定时扫描只做遥测，不 dispose 任何会话。
 //
-// 卸载判据（全部满足）：不是「仍有活 activation 的子代理会话」；agent.status === "idle"；
-// durable inbox 无 pending；无任何活的子代 agent；没有 UI follow 流（按 follow 的 session 归属；
-// 无法归属的 follower 视为「有人在看」一律不卸）；session-controller 没有在途 resume/claim；
-// subagents manager 没有在途 child 操作；距最后一次 session/event、agent/status、工具调用 ≥
-// 空闲阈值。子代理来源会话按 activation 归属判定：id 仍在 manager 的 resident 里才不碰
-// （subagent-resident）；已经 settle（resident 在 dsh-subagent/lib/index.js:2034 删除）的会话
-// 与普通会话走同一套判据。resident 探针拿不到时退回旧行为（子代理会话一律不卸）并保守记
-// subagent-probe-unavailable；follower 证据找不到时同样保守不卸（记 skip，5 分钟限流一次）。
+// 包装生效面：cordis 的 context 是 proxy，`ctx.agents` 每次读取都经 getTraceable 返回
+// traceable proxy（cordis/lib/index.js:675、:686、:763-764）；该 proxy 的 get 陷阱在每次方法
+// 访问时重新沿原型链查 `resume`（:84-157），所以改 `AgentRegistry.prototype.resume` 对
+// session-controller 的 `this.ctx.agents.resume` 必然生效（rc.2 的 resume 是类方法，在原型上：
+// dsh-agent/lib/index.js:466）。反过来，插件拿不到 raw registry 实例（`ctx.get("agents")` 同样被
+// getTraceable 包过），改实例不可行。
 //
-// follow 归属的安装时机：session-controller 与插件条目由 loader 并发 apply
-// （cordis-plugin-loader/src/config/group.ts:56 的 Promise.all），apply 时 history 可能还没
-// provide；惰性到首次扫描（约 60s 后）安装又晚于界面第一条 follow，那之后计数与总数永远对不上，
-// 卸载器在用户切换会话之前什么都不卸。因此在 apply 时先试装一次，再用
-// ctx.inject(["sessionController"], …) 在服务可用的那一刻补装：cordis 的 inject 回调由 provide
-// 唤醒（cordis/lib/index.js:800-856、:1306-1343），发生在 host 向 shell 发 ready 之前
-// （dsh-desktop-host/lib/index.js:328 的 await application → :342-346 的 process.send ready），
-// 因而必然早于界面发起的第一条 follow。closeFollowers 的元素是 follow 生成器体里创建的裸闭包，
-// 没有 sessionId/address（dsh-api-session-controller/lib/index.js:1523-1528），安装之前就已存在的
-// 流无法按元素归属；此时只要总数多于已归属数，就全部会话保守不卸。
+// 释放路径（宿主语义，rc.2 已查实）：目标仍在 `subagents.manager.resident` → 走
+// `subagents.drainChildren(parent, [id])`（manager 要求 exact live parent；调用方是祖父时用该
+// activation 自己的直接父 Agent，它必须仍在 agents 注册表里）；否则用本插件捕获的 handle
+// `dispose()`；两者都没有 → not-loaded（本就不在内存，成功无操作）。drainChildren 见
+// dsh-subagent/lib/index.js:1372（EXACT live parent + direct child 校验），drainDescendants
+// 见 :1334（按 root 批量释放全部后代，不能只挑一个孙代，故这里不用它）。
 //
-// 释放后 session-controller 的 resolve() 首行 liveAgent() 会落空（dsh-api-session-controller/
-// lib/index.js:218-240），下一次访问自然重新 promote → 再次被本插件捕获。dispose 会 stop loop、
-// await idle、卸 scope、关持久化 handle、最后 detachAgent/detachSession（agent-loop:1740-1810），
-// 因而 SessionStore（dsh-session/lib/index.js:1886-1893）与 AgentRegistry（dsh-agent:544）的条目
-// 一起消失。残留引用只剩有界缓存：session-query 冷观察缓存 ≤5（dsh-session-query/lib/index.js:
-// 327-341）、persistence coldLogMemo ≤2（dsh-session-persistence-jsonl:2881-2888）；本插件对
-// 前者做一次 refs===0 的定点清退，对后者按 session id 删一条可重建缓存。
+// 释放后 SessionStore（dsh-session/lib/index.js:1886-1893）与 AgentRegistry（dsh-agent:544）
+// 的条目一起消失；残留引用只剩有界缓存：session-query 冷观察缓存 ≤5
+// （dsh-session-query/lib/index.js:327-341）、persistence coldLogMemo ≤2
+// （dsh-session-persistence-jsonl:2881-2888）；本插件对前者做一次 refs===0 的定点清退，对后者
+// 按 session id 删一条可重建缓存。之后对该子代理 send_message 会走 manager 的
+// coldResume → materialize → agents.resume 重建，并被本包装再次捕获。
 //
-// 开关与阈值（CASEOS_* 惯例）：CASEOS_EVICT=0 全关（不包装、不装定时器、不落事件）；
-// CASEOS_EVICT_SCAN_MS 默认 60000；CASEOS_EVICT_IDLE_MS 默认 600000；
-// 堆压力（heapUsed ≥ V8 顶棚 × 50%）时门槛降到 2 分钟并按 lastActive 的 LRU 顺序卸。
-// 卸载失败 30 分钟内不再尝试该会话。monitor：mem-guard-evict（session、idleMs、
-// heapUsedBefore、pressure、observationEvicted）/ mem-guard-evict-fail（error 截 200）/
-// mem-guard-evict-boot / mem-guard-evict-follow（follow 包装装上时一条：source=apply|inject|scan、
-// preexistingFollowers、elapsedMs）/ mem-guard-evict-scan（每 5 分钟一条汇总：tracked、candidates、
-// evicted、blockers、followerTotal、followerTracked、followerUntracked、followerProbe、
-// subagentProbe、heapUsed、pressure）/ mem-guard-evict-skip（reason：follower-unknown、scan-failed）。
+// 开关与遥测：CASEOS_EVICT=0 全关（不包装、不装定时器、不注册工具、不落事件）；
+// CASEOS_EVICT_SCAN_MS 默认 60000（只决定遥测扫描间隔，不触发释放）。
+// monitor：mem-guard-release（caller、child、mode=drain|dispose|noop|refused、reason、
+// heapUsedBefore/After、observationEvicted/coldLogEvicted）/ mem-guard-release-hint（由
+// memory-guard 落：软阈值后给主会话的非阻断提示）/ mem-guard-evict-boot / mem-guard-evict-follow
+// （follow 包装装上时一条：source=apply|inject|scan|release、preexistingFollowers、elapsedMs）/
+// mem-guard-evict-scan（每 5 分钟一条汇总：tracked、candidates、resident、followerTotal、
+// followerTracked、followerUntracked、followerProbe、subagentProbe、heapUsed）/
+// mem-guard-evict-skip（reason：scan-failed）。
 import { homedir } from "node:os";
 import { monitorEvent } from "./monitor-log.js";
-import { heapLimitBytes } from "./memory-guard.js";
 
 const EVICT_ENV = "CASEOS_EVICT";
 const SCAN_MS_ENV = "CASEOS_EVICT_SCAN_MS";
-const IDLE_MS_ENV = "CASEOS_EVICT_IDLE_MS";
+const TOOL_NAME = "release_subagent";
 const DEFAULT_SCAN_MS = 60 * 1000;
-const DEFAULT_IDLE_MS = 10 * 60 * 1000;
-const PRESSURE_IDLE_MS = 2 * 60 * 1000;
-const PRESSURE_RATIO = 0.5;
-const FAIL_BACKOFF_MS = 30 * 60 * 1000;
 const SKIP_LOG_MS = 5 * 60 * 1000;
 const SUMMARY_MS = 5 * 60 * 1000;
 const DISPOSE_TIMEOUT_MS = 60 * 1000;
 const ERROR_LIMIT = 200;
 const UNTRACKED_LIMIT = 10;
+const LINEAGE_LIMIT = 512;
 // 原型补丁用全局 symbol 标记：插件重载时能从旧包装里取出 original，避免把包装套在包装上。
 const RESUME_PATCH = Symbol.for("caseos.session-evictor.resume");
 const FOLLOW_PATCH = Symbol.for("caseos.session-evictor.follow");
@@ -83,7 +69,7 @@ function errorText(error) {
 }
 
 // dispose 自身也可能卡住（宿主 teardown 等 scope/persistence close）。超时不是「没卸」：
-// 报 fail 并退避，底层 dispose 继续跑，真卸掉时会由 agent/disposed 清条目。
+// 报失败让主会话重试，底层 dispose 继续跑，真卸掉时由 agent/disposed 清条目。
 function withTimeout(promise, ms, label) {
   let timer;
   const timeout = new Promise((_, reject) => {
@@ -109,7 +95,7 @@ function makeFollowWrapper(original, active) {
     if (inner === null || typeof inner !== "object" || typeof inner.next !== "function") return inner;
     return (async function* () {
       // 与宿主的 closeFollowers.add 同步：生成器体开始执行时才登记，避免「调用但从未迭代」
-      // 的流把某个会话永久锁在不可卸载状态。
+      // 的流把某个会话永久锁在不可释放状态。
       if (tracked) active.set(sessionId, (active.get(sessionId) ?? 0) + 1);
       let released = false;
       const releaseOnce = () => {
@@ -149,49 +135,51 @@ function installResumePatch(agents, track) {
   return { proto, original, wrapped };
 }
 
-// 纯判据：返回阻塞原因列表，[] 才允许卸载。测试直接喂替身对象核对。
-export function evictionBlockers(entry, context) {
-  const {
-    now,
-    threshold,
-    agents,
-    sessions,
-    followerBlocks,
-    descendantLive,
-    claimInFlight,
-    subagentResident,
-    subagentOperationInFlight,
-  } = context;
-  if (entry === void 0 || entry.agent === void 0) return ["no-entry"];
+// 纯判据：返回阻塞原因列表，[] 才允许释放。测试直接喂替身对象核对。
+// 只判断「这一刻是否安全」，不看空闲时长与堆压力——那两样不再触发任何动作。
+export function releaseBlockers(target, context) {
+  if (target === void 0) return ["no-target"];
+  const { followerBlocks, descendantLive, claimInFlight, subagentOperationInFlight } = context;
   const blockers = [];
-  if (entry.subagent === true) {
-    const resident = subagentResident();
-    if (resident === void 0) blockers.push("subagent-probe-unavailable");
-    else if (resident.has(entry.sessionId)) blockers.push("subagent-resident");
-    else if (subagentOperationInFlight(entry.sessionId)) blockers.push("subagent-operation-in-flight");
+  const agent = target.agent;
+  if (agent !== void 0) {
+    // 宿主只有 idle/running 两态；非 idle 一律按「还没结束」保守拒绝。
+    if (agent.status !== "idle") blockers.push("running");
+    let pending = true;
+    try {
+      pending = agent.inbox?.hasPending !== false;
+    } catch {
+      pending = true;
+    }
+    if (pending) blockers.push("pending-inbox");
   }
-  if (now - entry.lastActive < threshold) blockers.push("recent-activity");
-  if ((entry.blockedUntil ?? 0) > now) blockers.push("backoff");
-  if (agents.get(entry.sessionId) !== entry.agent) blockers.push("agent-not-live");
-  if (sessions.get(entry.sessionId) !== entry.agent.session) blockers.push("session-not-attached");
-  if (entry.agent.status !== "idle") blockers.push("running");
-  try {
-    if (entry.agent.inbox?.hasPending !== false) blockers.push("pending-inbox");
-  } catch {
-    blockers.push("pending-inbox");
-  }
-  if (descendantLive(entry.sessionId)) blockers.push("live-descendant");
-  if (claimInFlight(entry.sessionId)) blockers.push("operation-in-flight");
+  if (claimInFlight?.(target.sessionId) === true) blockers.push("operation-in-flight");
+  if (subagentOperationInFlight?.(target.sessionId) === true) blockers.push("subagent-operation-in-flight");
+  if (descendantLive?.(target.sessionId) === true) blockers.push("live-descendant");
   // followerBlocks 返回具体原因串（followed / follower-untracked），替身返回布尔时按 followed 记。
-  const follower = followerBlocks(entry.sessionId);
+  const follower = followerBlocks?.(target.sessionId);
   if (follower) blockers.push(typeof follower === "string" ? follower : "followed");
   return blockers;
 }
 
+// 沿 parentSession 链判断 id 是否是 ancestorId 的后代。parentOf 由调用方提供（活会话头优先，
+// 已释放/未加载的会话退回本插件记住的 lineage）。环路按 visited 截断，不信任损坏的日志。
+export function descendsFrom(id, ancestorId, parentOf) {
+  const visited = new Set();
+  let current = id;
+  while (typeof current === "string" && current !== "") {
+    if (current === ancestorId) return true;
+    if (visited.has(current)) return false;
+    visited.add(current);
+    current = typeof parentOf === "function" ? parentOf(current) : void 0;
+  }
+  return false;
+}
+
 export default {
   name: "caseos-session-evictor",
-  // 只依赖 agents/sessions 两个宿主服务；sessionController、sessionQuery、subagents 都按需惰性取，
-  // 缺任何一个都不该让卸载器整个不激活。
+  // 只硬依赖 agents/sessions；sessionController、sessionQuery、subagents、tools 都按需惰性取，
+  // 缺任何一个都不该让释放器整个不激活。
   inject: ["agents", "sessions"],
   apply(ctx) {
     if (process.env[EVICT_ENV] === "0") return;
@@ -204,8 +192,6 @@ export default {
     }
     const dshHome = profileHome ?? process.env.DSH_HOME ?? `${homedir()}/.dsh`;
     const scanMs = envMs(SCAN_MS_ENV, DEFAULT_SCAN_MS);
-    const idleMs = envMs(IDLE_MS_ENV, DEFAULT_IDLE_MS);
-    const limit = heapLimitBytes();
     const root = ctx.root ?? ctx;
 
     const service = (name) => {
@@ -221,8 +207,7 @@ export default {
     };
 
     // resident 在 manager 上（service 暴露的是 `subagents.manager`，dsh-subagent/lib/index.js:
-    // 2984、:2996-3003），不是 service 顶层字段。它是 live activation 的唯一权威集合
-    // （:1220-1223、:1850 插入、:2034 自然 settle 删除）。拿不到 Map 时返回 undefined，判据退回旧行为。
+    // 2984、:2996-3003），是 live activation 的唯一权威集合。拿不到 Map 时返回 undefined。
     const subagentManager = () => service("subagents")?.manager;
     const subagentResident = () => {
       const resident = subagentManager()?.resident;
@@ -237,20 +222,23 @@ export default {
 
     const agents = ctx.agents;
     const sessions = ctx.sessions;
-    // sessionId → { handle, agent, lastActive, subagent, blockedUntil }
+    // sessionId → { handle, agent, subagent }：resume 包装捕获的释放句柄。
     const entries = new Map();
+    // 子会话 id → 直接父会话 id。活会话优先读 header；已释放/未加载的目标靠这份记忆继续
+    // 授权（noop 与重复调用才判得出「是不是我的后代」）。
+    const knownParents = new Map();
     const activeFollowers = new Map();
     let resumePatch;
     let followPatch;
     let followerKnown = false;
     let scanning = false;
-    // 卸载后若别的插件又把 resume 包在我们外层，原型恢复不回去；trackingEnabled 让残留
-    // 包装变成 no-op，避免往已清空的 entries 里继续塞 handle。
     let trackingEnabled = true;
     let lastSkipAt = 0;
     let lastSkipReason = "";
     let lastSummaryAt = 0;
     let followerInstalledAt = 0;
+    let releaseTool;
+    let releaseToolRegistered = false;
     let disposed = false;
     const bootAt = Date.now();
 
@@ -262,6 +250,14 @@ export default {
       monitorEvent(dshHome, { kind: "mem-guard-evict-skip", reason, ...extra });
     };
 
+    const heapUsed = () => {
+      try {
+        return process.memoryUsage().heapUsed;
+      } catch {
+        return 0;
+      }
+    };
+
     const liveAgents = () => {
       try {
         return agents?.list?.() ?? [];
@@ -270,14 +266,35 @@ export default {
       }
     };
 
-    const touch = (sessionId, now = Date.now()) => {
-      const entry = entries.get(sessionId);
-      if (entry !== void 0) entry.lastActive = now;
+    const rememberParent = (childId, parentId) => {
+      if (typeof childId !== "string" || childId === "") return;
+      if (typeof parentId !== "string" || parentId === "" || parentId === childId) return;
+      knownParents.delete(childId);
+      knownParents.set(childId, parentId);
+      while (knownParents.size > LINEAGE_LIMIT) knownParents.delete(knownParents.keys().next().value);
     };
 
-    const removeEntry = (entry) => {
-      if (entries.get(entry.sessionId) === entry) entries.delete(entry.sessionId);
+    const headerOf = (sessionId) => {
+      const agent = agents?.get?.(sessionId);
+      if (agent?.session?.header !== void 0) return agent.session.header;
+      try {
+        return sessions?.get?.(sessionId)?.header;
+      } catch {
+        return void 0;
+      }
     };
+
+    const parentOf = (sessionId) => {
+      const header = headerOf(sessionId);
+      const parent = header?.parentSession;
+      if (typeof parent === "string") {
+        rememberParent(sessionId, parent);
+        return parent;
+      }
+      return knownParents.get(sessionId);
+    };
+
+    const removeEntry = (sessionId) => entries.delete(sessionId);
 
     const track = (handle, options) => {
       if (!trackingEnabled) return;
@@ -286,18 +303,18 @@ export default {
         if (agent === void 0) return;
         const sessionId = agent.id ?? options?.resumeSessionId;
         if (typeof sessionId !== "string" || sessionId === "") return;
-        if (agent.session?.header?.id !== sessionId) return;
+        const header = agent.session?.header;
+        if (header?.id !== sessionId) return;
+        if (typeof header?.parentSession === "string") rememberParent(sessionId, header.parentSession);
         if (entries.has(sessionId)) return;
         entries.set(sessionId, {
           sessionId,
           handle,
           agent,
-          lastActive: Date.now(),
-          subagent: agent.session?.header?.origin === "subagent",
-          blockedUntil: 0,
+          subagent: header?.origin === "subagent",
         });
       } catch {
-        // 记录失败不影响 resume 的返回值；该会话退化为「未跟踪」，后续 promote 仍会被包装捕获。
+        // 记录失败不影响 resume 的返回值；该会话退化为「未捕获」，release_subagent 会报 not-loaded。
       }
     };
 
@@ -338,13 +355,13 @@ export default {
         }
         return true;
       } catch {
-        followerKnown = typeof history.closeFollowers?.size === "number";
+        followerKnown = typeof history?.closeFollowers?.size === "number";
         return false;
       }
     };
 
-    const followerBlocks = (sessionId) => {
-      installFollowerProbe("scan");
+    const followerBlocks = (sessionId, source = "scan") => {
+      installFollowerProbe(source);
       if (!followerKnown) return true;
       if ((activeFollowers.get(sessionId) ?? 0) > 0) return "followed";
       const history = service("sessionController")?.history;
@@ -353,13 +370,12 @@ export default {
       let tracked = 0;
       for (const count of activeFollowers.values()) tracked += count;
       // 安装前就存在的 follow 没有归属（元素是裸闭包，取不到 sessionId/address）：只要总数多于
-      // 已归属数，就对所有会话保守不卸；它们关掉之后总数回落，卸载自动恢复。
+      // 已归属数，就对所有会话保守拒绝；它们关掉之后总数回落，释放自动恢复。
       return total > tracked ? "follower-untracked" : false;
     };
 
-    // 任何活子代（含 idle 常驻）都算「有活」：父 agent 的 dispose 会连带拆子激活，
-    // 让 memory-guard 的 drainChildren 先按宿主自己的顺序释放，卸载器只碰叶子会话。
-    // 每次扫描只建一次索引，避免候选多时反复 list()/建 Map。
+    // 任何活子代（含 idle 常驻）都算「有活」：逐个释放时才不会拆掉还在用的子树。
+    // 每次调用只建一次索引，避免候选多时反复 list()/建 Map。
     const makeDescendantCheck = (live) => {
       const byParent = new Map();
       for (const agent of live) {
@@ -389,7 +405,7 @@ export default {
       return false;
     };
 
-    // 冷观察缓存把整份事件数组按会话缓存到 5 条；dispose 后若不点名清退，内存仍留一份。
+    // 冷观察缓存把整份事件数组按会话缓存到 5 条；释放后若不点名清退，内存仍留一份。
     // 只在没有活跃 lease（refs > 0）时删；缓存 miss 只会让下一次冷读重新加载。
     const purgePreparedObservation = (sessionId) => {
       try {
@@ -415,8 +431,208 @@ export default {
       }
     };
 
-    // 每 5 分钟一条扫描汇总：把「为什么没卸」变成可直接读的计数，无需翻单条 evict 事件。
-    // 首次扫描就发（lastSummaryAt=0），之后按 5 分钟节流；节流以发事件时刻为准，与扫描间隔无关。
+    const emitRelease = (callerId, childId, mode, reason, before, extra) => {
+      const after = heapUsed();
+      const trimmed = reason === void 0 ? void 0 : String(reason).slice(0, ERROR_LIMIT);
+      monitorEvent(dshHome, {
+        kind: "mem-guard-release",
+        caller: callerId,
+        child: childId,
+        mode,
+        ...(trimmed === void 0 ? {} : { reason: trimmed }),
+        heapUsedBefore: before,
+        heapUsedAfter: after,
+        ...extra,
+      });
+      return {
+        id: childId,
+        result: mode === "refused" ? "refused" : mode === "noop" ? "not-loaded" : "released",
+        mode,
+        ...(trimmed === void 0 ? {} : { reason: trimmed }),
+        heapUsedBefore: before,
+        heapUsedAfter: after,
+      };
+    };
+
+    // 释放单个 id。安全判据全部通过才动手；任一不满足就拒绝并说明原因。
+    const releaseOne = async (caller, callerId, childId) => {
+      const before = heapUsed();
+      const refuse = (reason) => emitRelease(callerId, childId, "refused", reason, before);
+      if (childId === callerId) return refuse("main-session");
+      const header = headerOf(childId);
+      const parentId = header?.parentSession ?? knownParents.get(childId);
+      if (header !== void 0 && header.origin !== "subagent") return refuse("main-session");
+      if (typeof parentId !== "string") return refuse("not-descendant");
+      if (!descendsFrom(childId, callerId, parentOf)) return refuse("not-descendant");
+
+      const agent = agents?.get?.(childId);
+      const blockers = releaseBlockers(
+        { sessionId: childId, agent },
+        {
+          followerBlocks: (sessionId) => followerBlocks(sessionId, "release"),
+          descendantLive: makeDescendantCheck(liveAgents()),
+          claimInFlight,
+          subagentOperationInFlight,
+        },
+      );
+      if (blockers.length > 0) return refuse(blockers.join(","));
+
+      const resident = subagentResident();
+      if (resident?.has?.(childId) === true) {
+        const activation = resident.get(childId);
+        const directParent = activation?.parent;
+        // 宿主的 drainChildren 要求 exact live parent（dsh-subagent/lib/index.js:1373-1378）。
+        // 调用方是直接父时就是它；是祖父时用 activation 自己的直接父，且必须仍活着。
+        if (directParent === void 0 || agents?.get?.(directParent.id) !== directParent) {
+          return refuse("drain-parent-not-live");
+        }
+        if (directParent.id !== callerId && !descendsFrom(directParent.id, callerId, parentOf)) {
+          return refuse("not-descendant");
+        }
+        const subagents = service("subagents");
+        if (typeof subagents?.drainChildren !== "function") return refuse("subagents-unavailable");
+        try {
+          await withTimeout(Promise.resolve(subagents.drainChildren(directParent, [childId])), DISPOSE_TIMEOUT_MS, "subagent drain");
+        } catch (error) {
+          return refuse(`drain-failed: ${errorText(error)}`);
+        }
+        if (agents?.get?.(childId) !== void 0) return refuse("still-registered");
+        removeEntry(childId);
+        rememberParent(childId, directParent.id);
+        return emitRelease(callerId, childId, "drain", void 0, before, {
+          observationEvicted: purgePreparedObservation(childId),
+          coldLogEvicted: purgeColdLogMemo(childId),
+        });
+      }
+
+      const entry = entries.get(childId);
+      if (entry?.handle === void 0 || typeof entry.handle.dispose !== "function") {
+        // 还活着但本插件没有捕获到 handle（激活前就存在、或走了别的 resume 路径）：
+        // 不能谎报 not-loaded——它在内存里，只是我们无法安全释放。
+        if (agents?.get?.(childId) !== void 0) return refuse("not-captured");
+        return emitRelease(callerId, childId, "noop", void 0, before);
+      }
+      try {
+        await withTimeout(Promise.resolve(entry.handle.dispose()), DISPOSE_TIMEOUT_MS, "session dispose");
+      } catch (error) {
+        return refuse(`dispose-failed: ${errorText(error)}`);
+      }
+      if (agents?.get?.(childId) !== void 0) return refuse("still-registered");
+      removeEntry(childId);
+      return emitRelease(callerId, childId, "dispose", void 0, before, {
+        observationEvicted: purgePreparedObservation(childId),
+        coldLogEvicted: purgeColdLogMemo(childId),
+      });
+    };
+
+    const executeRelease = async (args, exec) => {
+      const caller = exec?.agent;
+      if (caller === void 0) throw new Error("release_subagent 需要调用方会话（exec.agent 为空）");
+      const header = caller.session?.header ?? {};
+      const callerId = header.id ?? caller.id;
+      const requested = Array.isArray(args?.agent_ids)
+        ? args.agent_ids.filter((id) => typeof id === "string" && id !== "")
+        : [];
+      const ids = [...new Set(requested)];
+      // 权限只在主会话：子代理会话一律拒绝，且不解析、不释放任何目标。
+      if (header.origin === "subagent" || header.parentSession !== void 0) {
+        monitorEvent(dshHome, {
+          kind: "mem-guard-release",
+          caller: callerId,
+          child: ids[0] ?? null,
+          mode: "refused",
+          reason: "not-leader",
+          heapUsedBefore: heapUsed(),
+          heapUsedAfter: heapUsed(),
+        });
+        throw new Error("release_subagent 只给主会话调用：子代理无权释放子代理，由主会话统一决定。");
+      }
+      if (ids.length === 0) throw new Error("release_subagent 需要 agent_ids：至少一个子代理 id");
+      const before = heapUsed();
+      const results = [];
+      for (const id of ids) results.push(await releaseOne(caller, callerId, id));
+      return { results, heapUsedBefore: before, heapUsedAfter: heapUsed() };
+    };
+
+    releaseTool = {
+      name: TOOL_NAME,
+      description:
+        "释放主会话名下的已结束子代理的内存（只给主会话）。目标必须是你派出的后代，且当前未运行、"
+        + "durable inbox 无 pending、manager 无在途操作、无界面跟随、无活的后代。常驻 release 走宿主 "
+        + "drainChildren，其余走本插件捕获的 handle.dispose；本就不在内存的返回 not-loaded。"
+        + "释放后仍可用 send_message 续接（会自动从磁盘冷恢复）。主会话自身永不被自动卸载。",
+      parameters: {
+        type: "object",
+        properties: {
+          agent_ids: {
+            type: "array",
+            items: { type: "string" },
+            description: "要释放的子代理 id 列表；每个 id 独立判定，返回 released / not-loaded / refused + 原因。",
+          },
+        },
+        required: ["agent_ids"],
+        additionalProperties: false,
+      },
+      output: {
+        schema: {
+          type: "object",
+          properties: {
+            results: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: {
+                  id: { type: "string" },
+                  result: { type: "string", enum: ["released", "not-loaded", "refused"] },
+                  mode: { type: "string", enum: ["drain", "dispose", "noop", "refused"] },
+                  reason: { type: "string" },
+                  heapUsedBefore: { type: "number" },
+                  heapUsedAfter: { type: "number" },
+                },
+                required: ["id", "result", "mode", "heapUsedBefore", "heapUsedAfter"],
+                additionalProperties: false,
+              },
+            },
+            heapUsedBefore: { type: "number" },
+            heapUsedAfter: { type: "number" },
+          },
+          required: ["results", "heapUsedBefore", "heapUsedAfter"],
+          additionalProperties: false,
+        },
+        render: (_args, value) => [{
+          type: "text",
+          text: value.results.map((row) => {
+            if (row.result === "released") return `${row.id}: 已释放（${row.mode}）`;
+            if (row.result === "not-loaded") return `${row.id}: 本就不在内存（noop）`;
+            return `${row.id}: 拒绝（${row.reason}）`;
+          }).join("\n"),
+        }],
+      },
+      async execute(args, exec) {
+        return executeRelease(args, exec);
+      },
+    };
+
+    const registerReleaseTool = (registry) => {
+      if (releaseToolRegistered || registry === void 0 || typeof registry.register !== "function") return;
+      try {
+        registry.register(releaseTool);
+        releaseToolRegistered = true;
+      } catch (error) {
+        process.stderr.write(`caseos-session-evictor: ${TOOL_NAME} 注册失败: ${errorText(error)}\n`);
+      }
+    };
+    try {
+      registerReleaseTool(root.tools);
+    } catch {}
+    if (!releaseToolRegistered) {
+      try {
+        ctx.inject(["tools"], (rtc) => registerReleaseTool(rtc?.tools ?? root.tools));
+      } catch {}
+    }
+
+    // 每 5 分钟一条扫描汇总：candidates 是「当前可由主会话释放的已结束子代理」计数。
+    // 首次扫描就发（lastSummaryAt=0），之后按 5 分钟节流；节流以发事件时刻为准。
     const reportScan = (summary) => {
       const now = Date.now();
       if (lastSummaryAt !== 0 && now - lastSummaryAt < SUMMARY_MS) return;
@@ -424,104 +640,41 @@ export default {
       const total = service("sessionController")?.history?.closeFollowers?.size;
       let followerTracked = 0;
       for (const count of activeFollowers.values()) followerTracked += count;
+      const resident = subagentResident();
       monitorEvent(dshHome, {
         kind: "mem-guard-evict-scan",
         ...summary,
+        resident: resident instanceof Map || resident instanceof Set ? resident.size : null,
         followerTotal: typeof total === "number" ? total : null,
         followerTracked,
         followerUntracked: typeof total === "number" ? Math.max(0, total - followerTracked) : null,
         followerProbe: followerKnown ? "session-controller" : "unavailable",
-        subagentProbe: subagentResident() !== void 0,
+        subagentProbe: resident !== void 0,
       });
     };
 
-    const scan = async () => {
+    const scan = () => {
       if (scanning) return;
       scanning = true;
       try {
-        const now = Date.now();
-        const heapUsed = process.memoryUsage().heapUsed;
-        const pressure = heapUsed >= Math.floor(limit * PRESSURE_RATIO);
-        const threshold = pressure ? Math.min(idleMs, PRESSURE_IDLE_MS) : idleMs;
-        if (!followerKnown) {
-          installFollowerProbe("scan");
-          if (!followerKnown) reportSkip("follower-unknown", { heapUsed });
-        }
         const live = liveAgents();
+        if (!followerKnown) installFollowerProbe("scan");
         const context = {
-          now,
-          threshold,
-          agents,
-          sessions,
-          followerBlocks,
+          followerBlocks: (sessionId) => followerBlocks(sessionId, "scan"),
           descendantLive: makeDescendantCheck(live),
           claimInFlight,
-          subagentResident,
           subagentOperationInFlight,
         };
-        const tracked = entries.size;
-        const candidates = [];
-        const blockers = {};
-        for (const entry of entries.values()) {
-          const reasons = evictionBlockers(entry, context);
-          if (reasons.length === 0) {
-            candidates.push(entry);
-            continue;
-          }
-          for (const reason of reasons) blockers[reason] = (blockers[reason] ?? 0) + 1;
+        const resident = subagentResident();
+        let candidates = 0;
+        for (const agent of live) {
+          const header = agent?.session?.header;
+          if (header?.origin !== "subagent" || typeof header?.parentSession !== "string") continue;
+          const canAct = resident?.has?.(agent.id) === true || entries.has(agent.id);
+          if (!canAct) continue;
+          if (releaseBlockers({ sessionId: agent.id, agent }, context).length === 0) candidates += 1;
         }
-        // 堆压力下按 LRU 先卸；非压力时同样从最久未活动的开始，避免先动刚用过的会话。
-        candidates.sort((left, right) => left.lastActive - right.lastActive);
-        let evicted = 0;
-        for (const entry of candidates) {
-          // 候选确定到真正 dispose 之间可能来输入/follow/claim/子代理：调用前用最新状态再核一次。
-          const fresh = {
-            ...context,
-            now: Date.now(),
-            descendantLive: makeDescendantCheck(liveAgents()),
-          };
-          if (evictionBlockers(entry, fresh).length > 0) continue;
-          const idle = Date.now() - entry.lastActive;
-          const before = process.memoryUsage().heapUsed;
-          try {
-            await withTimeout(Promise.resolve(entry.handle.dispose()), DISPOSE_TIMEOUT_MS, "session dispose");
-            if (agents.get(entry.sessionId) !== void 0) {
-              throw new Error("agent is still registered after dispose resolved");
-            }
-            const observationEvicted = purgePreparedObservation(entry.sessionId);
-            const coldLogEvicted = purgeColdLogMemo(entry.sessionId);
-            removeEntry(entry);
-            evicted += 1;
-            monitorEvent(dshHome, {
-              kind: "mem-guard-evict",
-              session: entry.sessionId,
-              idleMs: idle,
-              heapUsedBefore: before,
-              heapUsedAfter: process.memoryUsage().heapUsed,
-              pressure,
-              observationEvicted,
-              coldLogEvicted,
-            });
-          } catch (error) {
-            entry.blockedUntil = Date.now() + FAIL_BACKOFF_MS;
-            monitorEvent(dshHome, {
-              kind: "mem-guard-evict-fail",
-              session: entry.sessionId,
-              idleMs: idle,
-              heapUsedBefore: before,
-              error: errorText(error),
-              retryAfterMs: FAIL_BACKOFF_MS,
-            });
-          }
-        }
-        reportScan({
-          tracked,
-          candidates: candidates.length,
-          evicted,
-          blockers,
-          heapUsed,
-          pressure,
-        });
+        reportScan({ tracked: entries.size, candidates, heapUsed: heapUsed() });
       } catch (error) {
         reportSkip("scan-failed", { error: errorText(error) });
       } finally {
@@ -545,37 +698,47 @@ export default {
     }
 
     const live = liveAgents();
+    for (const agent of live) {
+      const header = agent?.session?.header;
+      if (header?.origin === "subagent" && typeof header.parentSession === "string") {
+        rememberParent(header.id, header.parentSession);
+      }
+    }
     const untracked = live.filter((agent) => agent?.id !== void 0 && !entries.has(agent.id)).map((agent) => agent.id);
     monitorEvent(dshHome, {
       kind: "mem-guard-evict-boot",
       scanMs,
-      idleMs,
-      pressureIdleMs: PRESSURE_IDLE_MS,
-      pressureRatio: PRESSURE_RATIO,
-      heapLimitBytes: limit,
       tracked: entries.size,
       untrackedTotal: untracked.length,
       untracked: untracked.slice(0, UNTRACKED_LIMIT),
       // 有 inject 的宿主这里只是「还没到 provide 时刻」，实际安装由 mem-guard-evict-follow 记录。
       followerProbe: followerKnown ? "session-controller" : canInject ? "deferred" : "unavailable",
       resumePatched: resumePatch !== void 0,
+      releaseTool: releaseToolRegistered,
       subagentProbe: subagentResident() !== void 0,
     });
 
-    // 活动面：任何会话事件/状态/工具调用都刷新 lastActive；agent 消失时清条目，避免本插件自己泄漏。
-    ctx.on("session/event", (session) => touch(session?.id));
-    ctx.on("agent/status", ({ agent }) => touch(agent?.id));
+    // 子代理会话不暴露 release_subagent（工具只给主会话）；权限在 execute 里还会再判一次。
+    ctx.on("agent/created", ({ agent }) => {
+      const header = agent?.session?.header;
+      if (header === void 0) return;
+      if (header.origin === "subagent" && typeof header.parentSession === "string") {
+        rememberParent(header.id, header.parentSession);
+      }
+      if (header.origin !== "subagent") return;
+      try {
+        agent.ctx?.inject?.(["tools"], (rtc) => {
+          try {
+            rtc.tools.restrict({ deny: [TOOL_NAME] });
+          } catch {}
+        });
+      } catch {}
+    });
+
+    // 宿主自己释放（或面板重载）时清条目；捕获的 handle 不能第二次 dispose。
     ctx.on("agent/disposed", ({ agent }) => {
       const entry = entries.get(agent?.id);
       if (entry !== void 0 && entry.agent === agent) entries.delete(entry.sessionId);
-    });
-    ctx.on("tools/pre-execute", (exec, next) => {
-      touch(exec?.agent?.session?.header?.id ?? exec?.agent?.id);
-      return typeof next === "function" ? next() : void 0;
-    });
-    ctx.on("tools/post-execute", (exec, _result, next) => {
-      touch(exec?.agent?.session?.header?.id ?? exec?.agent?.id);
-      return typeof next === "function" ? next() : void 0;
     });
 
     const timer = setInterval(scan, scanMs);
@@ -593,6 +756,7 @@ export default {
       }
       activeFollowers.clear();
       entries.clear();
+      knownParents.clear();
     }, "caseos-session-evictor: interval + prototype patches");
   },
 };

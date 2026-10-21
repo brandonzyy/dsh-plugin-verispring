@@ -5,16 +5,14 @@
 // DesktopBackendController（:7109-7260）只在 start() 被再次调用时拉起子进程。所以「优雅退出
 // 触发宿主重启」在本宿主上不成立，硬阈值降级为 monitor 事件 + stderr 提示（提示写明人工重启）。
 //
-// 触达边界：subagents 运行时暴露 drainChildren(parent, childIds)（只释放同一活父代理名下指定
-// 的常驻子代理，后续 send_message 冷恢复）。这里只放 status === "idle" 且 durable inbox 已清空
-// 的子代理：running 的有活在跑，inbox 有排队的还有活要干，两者都不算「已完成」。宿主没有暴露
-// 释放「被点开常驻的父会话」的 API——那部分只能靠重启，正是 T2 告警的意义；父会话的 fiber 卸载
-// 才删 SessionStore（dsh-session/lib/index.js:1871-1893）。
-//
-// 软回收两类目标：
-// - drain：agents 注册表里已完成（idle 且 inbox 清空）的子代理按父代理分组调 drainChildren；
+// 触达边界：子代理是否释放由主会话决定（session-evictor 的 release_subagent），本看门狗
+// 不再自动调 drainChildren。软阈值只剩两类动作：
 // - recycle：dispatch-gate 与 scout-relay 的模块层只增索引按活会话剪枝（权威事实在
-//   session-state 文件与会话日志里，剪掉的条目按需重建），不碰在用的条目。
+//   session-state 文件与会话日志里，剪掉的条目按需重建），不碰在用的条目；
+// - hint：堆越过软阈值时，在主会话下一次工具结果后追加一条非阻断提示，列出可释放的已结束
+//   子代理，由主会话自己决定是否调用 release_subagent（同一主会话 5 分钟最多一次）。
+// 宿主没有暴露释放「被点开常驻的父会话」的 API——那部分只能靠重启，正是 T2 告警的意义；父会话的
+// fiber 卸载才删 SessionStore（dsh-session/lib/index.js:1871-1893）。主会话自身永不被自动卸载。
 //
 // 烧堆是突发式的：实测堆能在两次 60s 采样之间从 <2.4GiB 跳到 4.06GiB，大头是巨型工具结果
 // 全文进 Session.log（宿主 pruner 对 >8KB 的结果还会复制一份）。所以除周期采样外，还有一道
@@ -24,15 +22,14 @@
 //
 // 开关与阈值（CASEOS_* 惯例）：CASEOS_MEM_GUARD=0 全关；CASEOS_MEM_CHECK_MS 默认 15000；
 // CASEOS_MEM_SOFT_BYTES / CASEOS_MEM_HARD_BYTES 默认按 V8 顶棚比例（60% / 80%，4GiB 顶棚即
-// 2.4GiB / 3.2GiB）；显式设置时按 env 覆盖。drain/recycle 共享 5 分钟冷却；硬阈值不参与冷却
+// 2.4GiB / 3.2GiB）；显式设置时按 env 覆盖。recycle 与提示各自 5 分钟冷却；硬阈值不参与冷却
 // （只告警，不改状态）。采样在 subagent/end 与 tools/post-execute 之后各即时补一次。
 // 观测面：每 5 分钟一条 mem-guard-sample（不管阈值的增长曲线）；软阈值越线每 5 分钟一条
-// mem-guard-soft（无论有没有可回收目标）。检查自身若卡在 await 上（drainChildren 等宿主释放
-// 不返回），超过 max(2×checkMs, 60s) 记 skip=check-stuck 并把 checking 置回，避免之后所有
-// 定时器 tick 都在 checking 守卫处静默 return——上一轮 56 分钟零事件、直到 4.0GiB OOM 的
-// 唯一静默路径就是这里。
+// mem-guard-soft（无论有没有可回收目标）。检查自身若卡在 await 上（未来若恢复宿主释放路径），
+// 超过 max(2×checkMs, 60s) 记 skip=check-stuck 并把 checking 置回，避免之后所有定时器 tick
+// 都在 checking 守卫处静默 return——上一轮 56 分钟零事件、直到 4.0GiB OOM 的唯一静默路径就是这里。
 // 动作落 monitor：kind = mem-guard-boot（激活自报：heapLimitBytes / nodeArgv / pid /
-// thresholdsSource / checkMs / readGuard）/ mem-guard-sample / mem-guard-soft / mem-guard-drain /
+// thresholdsSource / checkMs / readGuard）/ mem-guard-sample / mem-guard-soft / mem-guard-release-hint /
 // mem-guard-recycle / mem-guard-skip / mem-guard-read-deny。
 import fs from "node:fs";
 import { homedir } from "node:os";
@@ -59,6 +56,10 @@ const SOFT_RATIO = 0.6;
 const HARD_RATIO = 0.8;
 const COOLDOWN_MS = 5 * 60 * 1000;
 const SAMPLE_MS = 5 * 60 * 1000;
+const HINT_MS = 5 * 60 * 1000;
+const HINT_LIMIT = 10;
+const HINT_DESC_LIMIT = 60;
+const HINT_STATE_LIMIT = 64;
 const IDLE_MS = 90 * 1000;
 // 宿主 workingDirectory.ensure 要求 AbortSignal；调用没带 signal 时给一个永不触发的。
 const NO_SIGNAL = new AbortController().signal;
@@ -136,6 +137,12 @@ export function memoryDecision({ heapUsed, softBytes, hardBytes, busy, lastActio
     return { kind: "cooldown", remainingMs: COOLDOWN_MS - (now - lastActionAt) };
   }
   return { kind: "soft" };
+}
+
+// 检查卡死判定：从一次检查开始到现在的耗时越过 stuck 窗口，才允许抢占它的 checking。
+// 纯函数，测试直接喂时间戳；越窗后调用方记 skip=check-stuck 并清 checking。
+export function checkStuck({ checking, startedAt, now, stuckMs }) {
+  return checking === true && Number.isFinite(startedAt) && startedAt > 0 && now - startedAt >= stuckMs;
 }
 
 // ---- read-guard 的命令解析（纯函数，测试直接喂字符串） --------------------------
@@ -469,7 +476,7 @@ export default {
 
     let lastToolAt = Date.now();
     let lastActionAt = 0;
-    // 一次回收可能跨多个采样周期（drainChildren 等宿主释放完成），定时器与即时检查不得叠加。
+    // 一次回收可能跨多个采样周期（宿主释放完成），定时器与即时检查不得叠加。
     let checking = false;
     // 卡死自愈与观测节流：sample 是增长曲线，soft 是越线心跳，二者都按 5 分钟一条。
     const stuckMs = Math.max(checkMs * 2, 60 * 1000);
@@ -477,6 +484,8 @@ export default {
     let checkToken = 0;
     let lastSampleAt = 0;
     let lastSoftReportAt = 0;
+    // 主会话 id → 上次压力提示时刻：同一主会话 5 分钟最多提示一次。
+    const lastHintAt = new Map();
 
     // 已排队待跑的输入（宿主 durable inbox 投影）：这样的空闲子代理还有活要干，不能当「已完成」。
     // inbox 属 agent-loop 的内部面，取不到就按「有活」保守处理，只放确认清空的。
@@ -496,42 +505,99 @@ export default {
       );
     };
 
-    const drainIdleChildren = async () => {
-      const subagents = service("subagents");
-      const agents = service("agents");
-      if (typeof subagents?.drainChildren !== "function" || typeof agents?.list !== "function") {
-        return { released: 0 };
-      }
-      const live = agents.list();
-      const byId = new Map(live.map((agent) => [agent?.id, agent]));
+    // 子代理的 description 由宿主的 `subagent/descriptor` 事件承载（dispatch-gate 写入的 label
+    // 形如「route · role · description」）。snapshotEvents 是同步读取，提示路径不额外加载会话。
+    const descriptorLabel = (agent) => {
+      try {
+        for (const event of agent?.session?.snapshotEvents?.() ?? []) {
+          if (event?.type !== "subagent/descriptor") continue;
+          const label = event?.data?.label;
+          if (typeof label === "string" && label !== "") return label;
+        }
+      } catch {}
+      return "";
+    };
+
+    // label 的第二段是 dispatch-gate 写的角色（route · role · description）；旧标签按 description
+    // 的测绘前缀兜底。两者任一命中即按测绘展示。
+    const isScoutLabel = (label) => {
+      const role = label.split("·").map((part) => part.trim())[1];
+      if (role === "scout") return true;
+      return /^(测绘智能体|scout:)/i.test(label.trim());
+    };
+
+    // 该主会话名下当前可释放的已结束子代理：idle、inbox 清空、没有任何活着的后代（孙代先释放）。
+    // 只看 agents 注册表里仍在的会话——本就不在内存的不需提示。
+    const releaseCandidates = (leaderId) => {
+      const live = liveAgents();
       const byParent = new Map();
       for (const agent of live) {
-        const header = agent?.session?.header ?? {};
-        if (header.origin !== "subagent" || agent.status !== "idle") continue;
-        if (hasPendingInput(agent)) continue;
-        const parent = byId.get(header.parentSession);
-        if (!parent) continue;
-        const ids = byParent.get(parent.id) ?? [];
-        ids.push(agent.id);
-        byParent.set(parent.id, ids);
+        const parent = agent?.session?.header?.parentSession;
+        if (typeof parent !== "string") continue;
+        const children = byParent.get(parent) ?? [];
+        children.push(agent);
+        byParent.set(parent, children);
       }
-      let released = 0;
-      for (const [parentId, ids] of byParent) {
-        try {
-          await subagents.drainChildren(byId.get(parentId), ids);
-          // 宿主按 activation 释放，非驻留 id 是 no-op：只数已从注册表卸载的。
-          released += ids.filter((id) => agents.get?.(id) === void 0).length;
-        } catch (error) {
-          monitorEvent(dshHome, {
-            kind: "mem-guard-skip",
-            reason: "drain-failed",
-            parent: parentId,
-            children: ids.length,
-            error: String(error?.message ?? error).slice(0, 200),
-          });
+      const descendants = [];
+      const pending = [leaderId];
+      const visited = new Set();
+      while (pending.length > 0) {
+        const parentId = pending.shift();
+        if (visited.has(parentId)) continue;
+        visited.add(parentId);
+        for (const child of byParent.get(parentId) ?? []) {
+          descendants.push(child);
+          pending.push(child.id);
         }
       }
-      return { released };
+      return descendants.filter((agent) => {
+        if (agent?.status !== "idle") return false;
+        if (hasPendingInput(agent)) return false;
+        return (byParent.get(agent.id) ?? []).length === 0;
+      });
+    };
+
+    // 软阈值后的非阻断提示：只在主会话的下一次工具结果后追加，5 分钟一条，绝不替主会话做释放。
+    const releaseHint = (exec) => {
+      const agent = exec?.agent;
+      if (agent === void 0) return void 0;
+      const header = agent.session?.header ?? {};
+      if (header.origin === "subagent" || header.parentSession !== void 0) return void 0;
+      const heapUsed = process.memoryUsage().heapUsed;
+      if (!(heapUsed >= softBytes)) return void 0;
+      const now = Date.now();
+      const sessionId = header.id ?? agent.id;
+      const last = lastHintAt.get(sessionId);
+      if (last !== void 0 && now - last < HINT_MS) return void 0;
+      const candidates = releaseCandidates(sessionId);
+      if (candidates.length === 0) return void 0;
+      lastHintAt.set(sessionId, now);
+      if (lastHintAt.size > HINT_STATE_LIMIT) {
+        for (const [id, at] of lastHintAt) {
+          if (now - at >= HINT_MS) lastHintAt.delete(id);
+        }
+      }
+      const items = candidates.slice(0, HINT_LIMIT).map((child) => {
+        const label = descriptorLabel(child);
+        const description = label === "" ? "（无描述）" : label.slice(0, HINT_DESC_LIMIT);
+        return `- ${child.id} · ${isScoutLabel(label) ? "测绘" : "执行"} · ${description}`;
+      });
+      if (candidates.length > HINT_LIMIT) items.push(`- …等 ${candidates.length} 个`);
+      const text = [
+        `【内存提示】堆已越过软阈值（${(heapUsed / GIB).toFixed(1)}GiB / 软阈值 ${(softBytes / GIB).toFixed(1)}GiB），`
+          + "以下已结束子代理可由你决定释放：",
+        ...items,
+        "验收完毕且确定不再 send_message 续接时，调用 release_subagent（agent_ids 传上面 id）释放它的内存；"
+          + "常驻测绘通常保留，内存紧张时也可释放（之后 send_message 会从磁盘冷恢复）。主会话自身永不被自动卸载。",
+      ].join("\n");
+      monitorEvent(dshHome, {
+        kind: "mem-guard-release-hint",
+        session: sessionId,
+        heapUsed,
+        softBytes,
+        candidates: candidates.map((child) => child.id),
+      });
+      return text;
     };
 
     const recycleCaches = () => {
@@ -577,7 +643,7 @@ export default {
       }
       if (checking) {
         const stuckFor = now - checkStartedAt;
-        if (stuckFor < stuckMs) return;
+        if (!checkStuck({ checking, startedAt: checkStartedAt, now, stuckMs })) return;
         // 回收 await 不返回时不能永远占着 checking：否则之后每次 tick 都在这里静默 return。
         monitorEvent(dshHome, { kind: "mem-guard-skip", reason: "check-stuck", stuckMs: stuckFor, heapUsed });
         checkToken += 1;
@@ -620,15 +686,12 @@ export default {
           return;
         }
         lastActionAt = now;
-        const drain = await drainIdleChildren();
+        // 软阈值不再动任何会话：子代理的释放由主会话经 release_subagent 决定。这里只回收
+        // 本插件自己的只增索引，并继续用 mem-guard-soft / mem-guard-release-hint 给主会话证据。
         const recycled = recycleCaches();
-        if (drain.released > 0) {
-          monitorEvent(dshHome, { kind: "mem-guard-drain", reason: "soft-threshold", heapUsed, released: drain.released });
-        }
         if (recycled > 0) {
           monitorEvent(dshHome, { kind: "mem-guard-recycle", reason: "soft-threshold", heapUsed, released: recycled });
-        }
-        if (drain.released === 0 && recycled === 0) {
+        } else {
           monitorEvent(dshHome, { kind: "mem-guard-skip", reason: "soft-threshold-no-targets", heapUsed });
         }
       } catch (error) {
@@ -658,10 +721,22 @@ export default {
     });
     // 工具结果落地就是突发进入 Session.log 的瞬间：15s 定时器可能整整错过一次跃升，
     // 所以每次结果之后立即补一次检查。不 await，工具结果不因看门狗变慢；并发仍由
-    // runCheck 的 checking 防抖与冷却收口。
-    root.on("tools/post-execute", (exec, result, next) => {
+    // runCheck 的 checking 防抖与冷却收口。堆越过软阈值时，给主会话的工具结果后追加一条
+    // 非阻断提示（additionalContexts 会成为下一条用户消息），由主会话自己决定是否释放。
+    root.on("tools/post-execute", async (exec, result, next) => {
       void runCheck();
-      return typeof next === "function" ? next() : void 0;
+      const downstream = typeof next === "function" ? await next() : result;
+      let hint;
+      try {
+        hint = releaseHint(exec);
+      } catch {
+        hint = void 0;
+      }
+      if (hint === void 0) return downstream;
+      return {
+        ...downstream,
+        additionalContexts: [hint, ...(downstream?.additionalContexts ?? [])],
+      };
     });
 
     const timer = setInterval(runCheck, checkMs);

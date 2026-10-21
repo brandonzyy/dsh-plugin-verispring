@@ -1,6 +1,6 @@
 // 领导/测绘/执行三面工具架构（工具面口径 = ~/.dsh/specs/子代理派遣规范.md：领导原生
 // 工具为复核五件 bash/edit/write/read/read_image 与派遣面 subagent/send_message/
-// interrupt_agent/list_agents）：
+// interrupt_agent/list_agents，外加由主会话决定子代理释放的 release_subagent）：
 // - 领导会话（origin != subagent）创建时 restrict({allow}) 收缩继承来的工具面（全局层与
 //   preset 层都受限）；名单先与领导视图里实际存在的工具求交集——点名不存在的工具即抛错，
 //   而桌面把模型可见工具全放在 preset 层、headless 全在全局层，两处的存在集不同。
@@ -11,7 +11,7 @@
 // - CASEOS_SCOUT=0 关闭分工条款中的测绘部分。
 const LEADER_ALLOW = new Set([
   "bash", "edit", "write", "read", "read_image",
-  "subagent", "subagent-base", "send_message", "interrupt_agent", "list_agents",
+  "subagent", "subagent-base", "send_message", "interrupt_agent", "list_agents", "release_subagent",
 ]);
 
 // 派遣面工具的瘦身文案。subagent 的遮蔽注册由 dispatch-gate 完成（路由执行体在它那，
@@ -81,6 +81,19 @@ const plugin = {
           : "分工：有明确边界的代码与写作任务交给执行子代理（subagent）——读码、改码、跑测试与门禁、检索这类整块工作各派一个执行者，任务书自足。领导自己做小修正、维护地图、写报告，以及验收所需的读写。Manon 图谱是常驻测绘的专责工具（sync/query/deep-query 都由它做），要图谱事实就问测绘。" +
             scoutClause +
             "回执与验收（强制）：测绘/执行子代理完成任务时会第一时间自动送来回执（含收尾报告）并唤醒你，测绘的回报也以消息直达，无需任何等待动作，派遣完成后直接结束本回合等回执。以下由运行时执行，违反即被拒绝：有子代理运行时的 sleep 与循环等待；同一回合第二次 list_agents；任务书含调研型措辞。领导自己写码或跑变更命令不会被拒绝，但工具结果后会追加一句分工提示。执行者回执里的「结构增量」由插件自动转给测绘，你收到测绘回报后用 write 整文件重写 .project-map.md 登记新基准。给出最终答复前，所有已派工作必须已回执并经你验收；若某项回执远超预期时长仍未到，用一次 list_agents 查状态，必要时 interrupt_agent 叫停后重派。",
+    });
+
+    // 子代理内存的最终决定权在主会话：插件不自动卸载任何会话，release_subagent 是唯一释放入口。
+    // 只解释运行时已有的工具，判定在 session-evictor / memory-guard 的代码里。
+    ctx.systemPrompt.section({
+      name: "caseos:leader-release",
+      order: ctx.systemPrompt.getSectionOrder("TOOL_SUBAGENT"),
+      text: (context) =>
+        isSubagent(context.scope)
+          ? ""
+          : "子代理内存由你决定：子代理回执验收完毕、且确定不再 send_message 续接时，调用 release_subagent 释放它的内存；"
+            + "常驻测绘通常保留，内存紧张时也可释放（之后 send_message 会自动从磁盘恢复）。"
+            + "主会话自身永不被自动卸载；插件也不会自动卸载任何子代理。",
     });
 
     ctx.on("agent/created", async ({ agent }) => {

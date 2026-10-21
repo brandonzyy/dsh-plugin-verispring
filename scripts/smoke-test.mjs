@@ -59,10 +59,21 @@ if (readsSecretFile("bash -c 'source ~/.dsh/manon.env; manon-kg sync'")) fail("M
 if (!readsSecretFile("cat ~/.dsh/manon.env")) fail("Manon 明文读取密钥未被拦截");
 if (!codestyleText.includes("ctx.profileContext?.home") || !codestyleText.includes("specPath")) fail("提交门禁未使用 DSH profile home");
 const leaderGuardText = readFileSync(join(root, "gates/leader-guard.js"), "utf8");
+const leaderScopeText = readFileSync(join(root, "gates/leader-scope.js"), "utf8");
+const sessionEvictorText = readFileSync(join(root, "gates/session-evictor.js"), "utf8");
+const memoryGuardText = readFileSync(join(root, "gates/memory-guard.js"), "utf8");
 if (!patchText.includes("id: caseos-leader-guard") || !patchText.includes("name: './gates/leader-guard.js'")) fail("cordis.patch.yml 未注册 leader-guard 门禁");
 if (!leaderGuardText.includes("CASEOS_LEADER_GUARD") || !leaderGuardText.includes("CASEOS_LEADER_WRITE_ALLOW")) fail("leader-guard 未实现关闭开关与写白名单环境变量");
 if (!leaderGuardText.includes("leader-guard-deny") || !leaderGuardText.includes("monitorEvent")) fail("leader-guard 拒绝未落监控");
 if (!leaderGuardText.includes("ctx.tools.guard")) fail("leader-guard 未通过宿主 guard 拒绝工具调用");
+if (!leaderScopeText.includes('"release_subagent"')) fail("领导工具白名单缺少 release_subagent");
+if (!leaderScopeText.includes("caseos:leader-release")) fail("领导提示词未注入子代理释放说明");
+if (!sessionEvictorText.includes('"release_subagent"') || !sessionEvictorText.includes("mem-guard-release")) {
+  fail("session-evictor 未实现 release_subagent 或未落释放监控");
+}
+if (!memoryGuardText.includes("mem-guard-release-hint") || !memoryGuardText.includes("releaseHint")) {
+  fail("memory-guard 未实现软阈值后的非阻断释放提示");
+}
 if (!dispatchText.includes("${routeText(route)} · ${role} · ${label}")) fail("子代理显示标题未包含实际模型路由");
 if (!dispatchText.includes("【实际路由：${role} · ${routeText(route)}】")) fail("子代理任务未携带实际模型路由元信息");
 if (!dispatchText.includes("sessionTitle.rename(agent.session, title)")) fail("子代理标题未调用 DSH sessionTitle.rename");

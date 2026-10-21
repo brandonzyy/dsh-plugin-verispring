@@ -3,33 +3,26 @@
 // - AgentRegistry.resume 是原型方法（dsh-agent/lib/index.js:466-470），返回 { agent, dispose }
 //   的 handle（dsh-agent-loop/lib/index.js:1795-1806）；调用方丢掉 dispose 是泄漏根因
 //   （dsh-api-session-controller/lib/index.js:396-403）。
-// - dispose = unregister agent + remove session（dsh-agent:544、dsh-session:1886-1893），
-//   之后 agents.get(sessionId) 为 undefined。
+// - 本版没有任何自动卸载：resume 包装只捕获 handle，定时扫描只数遥测；释放只发生在主会话
+//   调用 release_subagent 时。
+// - dispose = unregister agent + remove session（dsh-agent:544、dsh-session:1886-1893）。
+// - 宿主 drainChildren(parent, childIds) 要求 exact live parent，且目标必须是直接子代理
+//   （dsh-subagent/lib/index.js:1372-1383）；resident 在 manager 上（:2984、:2996-3003），
+//   在途续接/投递经 ChildLock.tails（:1121-1140、:2090-2095）。冷续接走
+//   sendMessage → coldResume → materialize → agents.resume，会再次经过 resume 包装。
 // - follow 是 AsyncGenerator，挂在 sessionController.history 上；closeFollowers 是全局 Set，
-//   元素是 follow 生成器体里创建的裸闭包（没有 sessionId/address），因此只能按「包装时登记
-//   是哪个会话在迭代」归属，包装之前就已存在的流不可归属（dsh-api-session-controller/lib/index.js:
-//   1444、:1523-1528、:1624）。
-// - session-controller 与插件条目由 loader 并发 apply（cordis-plugin-loader/src/config/group.ts:56），
-//   所以 history 可能晚于插件 apply 才 provide；cordis 的 ctx.inject 回调在 provide 时唤醒
-//   （cordis/lib/index.js:1600、:800-856、:1306-1343），早于 host 向 shell 发 ready
-//   （dsh-desktop-host/lib/index.js:328 → :342-346），即早于界面第一条 follow。
+//   元素是 follow 生成器体里创建的裸闭包，只能按「包装时登记的是哪个会话」归属。
 // - 冷观察缓存是 sessionQuery._observations.cache，条目带 refs（dsh-session-query/lib/index.js:
-//   327-341、:449-475）；refs > 0 不得清退。
-// - 子代理归属看 manager 的 resident：set 在 agents.resume 之后（dsh-subagent/lib/index.js:1850），
-//   自然 settle 时先 dispose handle（:2026）再 resident.delete（:2034）；manager 的续接/投递
-//   先经 ChildLock.tails（:1121-1140、:2090-2095）再 observe→resume（:2095→:2141→:1809）。
-// 定时器、Date.now、process.memoryUsage、v8.getHeapStatistics 全部替身化，用例不存在等待。
+//   327-341）；refs > 0 不得清退。persistence coldLogMemo 按会话 id 点名清。
+// 定时器、Date.now、process.memoryUsage 全部替身化，用例不存在等待。
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import v8 from "node:v8";
-import plugin, { evictionBlockers } from "../gates/session-evictor.js";
+import plugin, { descendsFrom, releaseBlockers } from "../gates/session-evictor.js";
 
-const GIB = 1024 ** 3;
-const ENV_KEYS = ["CASEOS_EVICT", "CASEOS_EVICT_SCAN_MS", "CASEOS_EVICT_IDLE_MS"];
+const ENV_KEYS = ["CASEOS_EVICT", "CASEOS_EVICT_SCAN_MS"];
 const realMemoryUsage = process.memoryUsage;
-const realGetHeapStatistics = v8.getHeapStatistics;
 const realSetInterval = globalThis.setInterval;
 const realClearInterval = globalThis.clearInterval;
 const realNow = Date.now;
@@ -42,6 +35,27 @@ function readJsonl(path) {
   }
 }
 
+function makeSession(id, spec = {}) {
+  return {
+    id,
+    header: {
+      id,
+      origin: spec.origin ?? "user",
+      ...(spec.parentSession === undefined ? {} : { parentSession: spec.parentSession }),
+    },
+    snapshotEvents: () => [],
+  };
+}
+
+function makeAgent(sessionId, spec, session) {
+  return {
+    id: sessionId,
+    session,
+    status: spec.status ?? "idle",
+    inbox: { hasPending: spec.inboxPending ?? false },
+  };
+}
+
 function makeHarness(options = {}) {
   const home = mkdtempSync(join(tmpdir(), "session-evictor-home-"));
   for (const key of ENV_KEYS) delete process.env[key];
@@ -49,11 +63,8 @@ function makeHarness(options = {}) {
   for (const [key, value] of Object.entries(options.env ?? {})) process.env[key] = String(value);
 
   const clock = { base: realNow(), offset: 0 };
-  const heap = { value: options.heapUsed ?? 1 * GIB };
-  const limit = options.heapLimitBytes ?? 4 * GIB;
   Date.now = () => clock.base + clock.offset;
-  process.memoryUsage = () => ({ heapUsed: heap.value, rss: heap.value + 64 * 1024 ** 2, external: 0, arrayBuffers: 0 });
-  v8.getHeapStatistics = () => ({ heap_size_limit: limit });
+  process.memoryUsage = () => ({ heapUsed: 1 * 1024 ** 3, rss: 1 * 1024 ** 3, external: 0, arrayBuffers: 0 });
 
   const intervals = [];
   globalThis.setInterval = (fn, ms) => {
@@ -65,11 +76,20 @@ function makeHarness(options = {}) {
     if (entry) entry.cleared = true;
   };
 
-  const specs = new Map(Object.entries(options.specs ?? {}).map(([id, spec]) => [id, { ...spec }]));
+  const specs = new Map();
   const registryAgents = new Map();
   const sessionStore = new Map();
   const disposeCalls = [];
   const disposeFailures = new Set();
+
+  const disposeFor = async (sessionId) => {
+    disposeCalls.push({ sessionId, at: Date.now() });
+    if (disposeFailures.has(sessionId)) {
+      throw new Error(`dispose failed for ${sessionId}: ${"x".repeat(300)}`);
+    }
+    registryAgents.delete(sessionId);
+    sessionStore.delete(sessionId);
+  };
 
   class MockRegistry {
     get(id) {
@@ -81,50 +101,28 @@ function makeHarness(options = {}) {
     async resume(resumeOptions) {
       const sessionId = resumeOptions.resumeSessionId;
       const spec = specs.get(sessionId) ?? {};
-      const session = {
-        id: sessionId,
-        header: {
-          id: sessionId,
-          origin: spec.origin ?? "user",
-          ...(spec.parentSession === undefined ? {} : { parentSession: spec.parentSession }),
-        },
-        snapshotEvents: () => [],
-      };
-      const agent = {
-        id: sessionId,
-        session,
-        status: spec.status ?? "idle",
-        inbox: { hasPending: spec.inboxPending ?? false },
-      };
+      const session = makeSession(sessionId, spec);
+      const agent = makeAgent(sessionId, spec, session);
       registryAgents.set(sessionId, agent);
       sessionStore.set(sessionId, session);
-      return {
-        agent,
-        dispose: async () => {
-          disposeCalls.push({ sessionId, at: Date.now() });
-          if (disposeFailures.has(sessionId)) throw new Error(`dispose failed for ${sessionId}: ${"x".repeat(300)}`);
-          registryAgents.delete(sessionId);
-          sessionStore.delete(sessionId);
-        },
-      };
+      return { agent, dispose: () => disposeFor(sessionId) };
     }
   }
   const registry = new MockRegistry();
   const originalResume = MockRegistry.prototype.resume;
 
-  // 激活前就存在的 Agent（例如 UI 在插件激活前 promote 的会话）：只有 agent/session，没有
-  // handle，卸载器不能动它们，只能在 boot 自报里列出来。
+  // 激活前就存在的 Agent（没有 handle，卸载器只能上报）。
   for (const spec of options.preAgents ?? []) {
-    const sessionId = spec.id;
-    const session = {
-      id: sessionId,
-      header: { id: sessionId, origin: spec.origin ?? "user" },
-      snapshotEvents: () => [],
-    };
-    const agent = { id: sessionId, session, status: "idle", inbox: { hasPending: false } };
-    registryAgents.set(sessionId, agent);
-    sessionStore.set(sessionId, session);
+    const session = makeSession(spec.id, spec);
+    registryAgents.set(spec.id, makeAgent(spec.id, { status: "idle" }, session));
+    sessionStore.set(spec.id, session);
   }
+  // 未加载但可授权判定的目标：会话头还在 sessions 服务里，但没有 agent/handle。
+  const seedSession = (id, spec = {}) => {
+    const session = makeSession(id, spec);
+    sessionStore.set(id, session);
+    return session;
+  };
 
   const closeFollowers = new Set();
   const history = {
@@ -134,8 +132,6 @@ function makeHarness(options = {}) {
       this.closeFollowers.add(close);
       try {
         yield { type: "snapshot" };
-        // 宿主 follow 的循环条件是 !signal.aborted（dsh-api-session-controller/lib/index.js:1596），
-        // 已经中止就直接结束，不再挂 abort 监听。
         if (signal?.aborted === true) return;
         if (signal === undefined) await new Promise(() => {});
         else await new Promise((resolve) => signal.addEventListener("abort", resolve, { once: true }));
@@ -149,33 +145,85 @@ function makeHarness(options = {}) {
   const observationCache = options.observationCache ?? new Map();
   const coldLogMemo = options.coldLogMemo ?? new Map();
   const sessionQuery = { _observations: { cache: observationCache } };
+
   const resident = new Map();
   const locks = { tails: new Map() };
-  // 宿主的 resident/locks 在 manager 上（service 暴露为 subagents.manager）：
-  // dsh-subagent/lib/index.js:2984、:2996-3003。
+  const drainCalls = [];
+  const sendCalls = [];
+  const drainChildren = async (parent, childIds) => {
+    drainCalls.push({ parentId: parent?.id, childIds: [...childIds] });
+    if (parent === void 0 || registryAgents.get(parent.id) !== parent) {
+      throw new Error("selected child teardown requires the exact live parent agent (UNAUTHORIZED)");
+    }
+    for (const id of childIds) {
+      const activation = resident.get(id);
+      if (activation === void 0) continue;
+      if (activation.parent?.id !== parent.id) {
+        throw new Error(`subagent "${id}" is not a direct child of agent "${parent.id}" (UNAUTHORIZED)`);
+      }
+    }
+    for (const id of childIds) {
+      if (!resident.has(id)) continue;
+      resident.delete(id);
+      await disposeFor(id);
+    }
+  };
+  const sendMessage = async (parent, childId, messages) => {
+    sendCalls.push({
+      parentId: parent?.id,
+      childId,
+      text: messages?.map((message) => message?.text ?? "").join("\n") ?? "",
+    });
+    if (parent === void 0 || registryAgents.get(parent.id) !== parent) {
+      throw new Error("message delivery requires the exact live sender agent (UNAUTHORIZED)");
+    }
+    if (registryAgents.get(childId) === void 0) {
+      // manager coldResume：先 observe，再 agents.resume（再次经过 resume 包装）。
+      await registry.resume({ resumeSessionId: childId });
+    }
+    const parentId = specs.get(childId)?.parentSession ?? parent.id;
+    resident.set(childId, { childId, parent: registryAgents.get(parentId) ?? { id: parentId }, ancestry: new Set([parent]) });
+    return "message-1";
+  };
   const manager = { resident, locks };
-  const subagents = { manager };
-  // withoutResidentProbe 模拟宿主没有暴露 resident（或以后改形状）：子代理会话必须退回旧行为。
-  if (options.withoutResidentProbe === true) manager.resident = void 0;
+  const subagents = { manager, drainChildren, sendMessage };
+
+  const tools = new Map();
+  const restrictCalls = [];
+  const toolsService = {
+    register(definition) {
+      if (tools.has(definition.name)) throw new Error(`tool "${definition.name}" is already registered`);
+      tools.set(definition.name, definition);
+    },
+    get(name) {
+      return tools.get(name);
+    },
+    schemas() {
+      return [...tools.values()];
+    },
+    restrict(spec) {
+      restrictCalls.push(spec);
+    },
+  };
+
   const services = {
     agents: registry,
     sessions: { get: (id) => sessionStore.get(id) },
     sessionQuery,
     sessionPersistence: { coldLogMemo },
     subagents,
+    tools: toolsService,
     profileContext: { home },
   };
-  // sessionControllerLate：loader 并发 apply 条目（cordis-plugin-loader/src/config/group.ts:56），
-  // 插件 apply 时 session-controller 可能还没 provide，稍后由它的 fiber provide 唤醒 inject 回调。
   if (options.sessionControllerLate !== true) services.sessionController = sessionController;
   const listeners = new Map();
   const disposers = [];
   const injectRequests = [];
-  const toolNextCalls = { count: 0 };
   const ctx = {
     profileContext: { home },
     agents: registry,
     sessions: services.sessions,
+    tools: toolsService,
     get: (name) => services[name],
     on: (name, callback) => {
       listeners.set(name, [...(listeners.get(name) ?? []), callback]);
@@ -185,11 +233,10 @@ function makeHarness(options = {}) {
       const disposer = factory();
       if (typeof disposer === "function") disposers.push(disposer);
     },
-    // cordis 的 ctx.inject（cordis/lib/index.js:1600）：依赖齐备时回调立即执行，否则等 provide。
     inject: (names, callback) => {
       const request = { names, callback, active: true };
       injectRequests.push(request);
-      if (names.every((name) => services[name] !== void 0)) callback();
+      if (names.every((name) => services[name] !== void 0)) callback({ tools: toolsService });
       return {
         dispose: () => {
           request.active = false;
@@ -201,6 +248,7 @@ function makeHarness(options = {}) {
 
   plugin.apply(ctx);
 
+  const agentOf = (id) => registryAgents.get(id);
   return {
     registry,
     history,
@@ -208,28 +256,31 @@ function makeHarness(options = {}) {
     intervals,
     disposers,
     disposeCalls,
+    drainCalls,
+    sendCalls,
     originalResume,
     originalFollow,
-    disabled: options.disabled === true,
-    // 模拟 session-controller 的 fiber 稍后 provide：cordis 在 _reload 里先过一轮微任务再执行
-    // 回调（cordis/lib/index.js:1349-1360），这里同样等一个微任务再唤醒仍在等待的 inject 回调。
+    tool: () => tools.get("release_subagent"),
     provideSessionController: async () => {
       services.sessionController = sessionController;
       await Promise.resolve();
       for (const request of injectRequests) {
-        if (request.active && request.names.every((name) => services[name] !== void 0)) request.callback();
+        if (request.active && request.names.every((name) => services[name] !== void 0)) {
+          request.callback({ tools: toolsService });
+        }
       }
     },
     resume: async (sessionId, spec = {}) => {
       specs.set(sessionId, { ...(specs.get(sessionId) ?? {}), ...spec });
       return registry.resume({ resumeSessionId: sessionId });
     },
-    agent: (id) => registryAgents.get(id),
-    failDispose: (id) => disposeFailures.add(id),
-    clearDisposeFailure: (id) => disposeFailures.delete(id),
-    setHeap: (bytes) => {
-      heap.value = bytes;
+    seedSession,
+    agent: agentOf,
+    dropAgent: (id) => {
+      registryAgents.delete(id);
+      sessionStore.delete(id);
     },
+    failDispose: (id) => disposeFailures.add(id),
     advance: (ms) => {
       clock.offset += ms;
     },
@@ -244,45 +295,31 @@ function makeHarness(options = {}) {
     emit: async (name, payload) => {
       for (const callback of listeners.get(name) ?? []) await callback(payload);
     },
-    preTool: async (exec) => {
-      let called = false;
-      for (const callback of listeners.get("tools/pre-execute") ?? []) {
-        await callback(exec, () => {
-          called = true;
-          return { kind: "allow" };
-        });
-      }
-      if (called) toolNextCalls.count += 1;
-      return called;
+    residentSet: () => resident,
+    makeResident: (id, parentId) => {
+      resident.set(id, {
+        childId: id,
+        parent: registryAgents.get(parentId) ?? { id: parentId },
+        ancestry: new Set([registryAgents.get(parentId)].filter(Boolean)),
+      });
     },
-    postTool: async (exec, result) => {
-      let downstream = result;
-      for (const callback of listeners.get("tools/post-execute") ?? []) {
-        const next = () => downstream;
-        downstream = await callback(exec, result, next);
-      }
-      return downstream;
-    },
-    toolNextCalls,
-    resident,
-    locks,
-    // 模拟 manager 的 resident.set（dsh-subagent/lib/index.js:1850）与 settle 删除（:2034）。
-    makeResident: (id, parentId = "parent") => {
-      resident.set(id, { childId: id, parent: { id: parentId }, closing: void 0 });
-    },
-    dropResident: (id) => resident.delete(id),
-    // 模拟 manager 的 ChildLock.tails（:1121-1140）：在途 observe/resume 会先占住 childId。
     beginManagerOp: (id) => locks.tails.set(id, Promise.resolve()),
-    endManagerOp: (id) => locks.tails.delete(id),
+    release: async (ids, callerId) => {
+      const tool = tools.get("release_subagent");
+      assert.ok(tool, "应注册 release_subagent");
+      return tool.execute({ agent_ids: ids }, { agent: registryAgents.get(callerId) });
+    },
+    // 模拟 manager 的 sendMessage → coldResume（宿主会重建 agent 并再次经过 resume 包装）。
+    send: async (parentId, childId) => sendMessage(registryAgents.get(parentId), childId, [{ type: "text", text: "续接" }]),
     monitor: () => readJsonl(`${home}/verispring-monitor.jsonl`),
     events: () => readJsonl(`${home}/verispring-monitor.jsonl`).filter((entry) => entry.kind !== "mem-guard-evict-boot"),
     boot: () => readJsonl(`${home}/verispring-monitor.jsonl`).find((entry) => entry.kind === "mem-guard-evict-boot"),
+    releases: () => readJsonl(`${home}/verispring-monitor.jsonl`).filter((entry) => entry.kind === "mem-guard-release"),
   };
 }
 
 function restoreGlobals() {
   process.memoryUsage = realMemoryUsage;
-  v8.getHeapStatistics = realGetHeapStatistics;
   globalThis.setInterval = realSetInterval;
   globalThis.clearInterval = realClearInterval;
   Date.now = realNow;
@@ -292,351 +329,313 @@ function restoreGlobals() {
 const tests = [];
 const test = (name, fn) => tests.push({ name, fn });
 
-test("判据纯函数：空条目、subagent、运行中、pending inbox、follower 都有明确阻塞名", () => {
-  const agent = { status: "idle", inbox: { hasPending: false }, session: {} };
+test("判据纯函数：运行中、pending inbox、在途操作、活后代、follower 都有明确阻塞名", () => {
+  const idle = { status: "idle", inbox: { hasPending: false } };
   const base = {
-    now: 1000,
-    threshold: 100,
-    agents: { get: () => agent },
-    sessions: { get: () => agent.session },
     followerBlocks: () => false,
     descendantLive: () => false,
     claimInFlight: () => false,
-    subagentResident: () => new Map(),
     subagentOperationInFlight: () => false,
   };
-  assert.deepEqual(evictionBlockers(void 0, base), ["no-entry"]);
+  assert.deepEqual(releaseBlockers(void 0, base), ["no-target"]);
+  assert.deepEqual(releaseBlockers({ sessionId: "s", agent: idle }, base), []);
   assert.deepEqual(
-    evictionBlockers({ sessionId: "s", agent, lastActive: 950 }, base),
-    ["recent-activity"],
-    "未到阈值不得卸载",
+    releaseBlockers({ sessionId: "s", agent: { ...idle, status: "running", inbox: { hasPending: true } } }, base),
+    ["running", "pending-inbox"],
   );
   assert.deepEqual(
-    evictionBlockers(
-      { sessionId: "s", agent, lastActive: 0, subagent: true },
-      { ...base, agents: { get: () => void 0 }, sessions: { get: () => void 0 } },
+    releaseBlockers({ sessionId: "s", agent: idle }, { ...base, claimInFlight: () => true, subagentOperationInFlight: () => true }),
+    ["operation-in-flight", "subagent-operation-in-flight"],
+  );
+  assert.deepEqual(
+    releaseBlockers(
+      { sessionId: "s", agent: idle },
+      { ...base, descendantLive: () => true, followerBlocks: () => "follower-untracked" },
     ),
-    ["agent-not-live", "session-not-attached"],
+    ["live-descendant", "follower-untracked"],
   );
+  // inbox 读取失败按「有活」保守处理
   assert.deepEqual(
-    evictionBlockers(
-      { sessionId: "s", agent, lastActive: 0, subagent: true },
-      { ...base, subagentResident: () => new Map([["s", {}]]) },
-    ),
-    ["subagent-resident"],
-    "仍在 manager resident 中的子代理不得卸载",
-  );
-  assert.deepEqual(
-    evictionBlockers(
-      { sessionId: "s", agent, lastActive: 0, subagent: true },
-      { ...base, subagentResident: () => void 0 },
-    ),
-    ["subagent-probe-unavailable"],
-    "resident 探针缺失时退回旧行为",
-  );
-  assert.deepEqual(
-    evictionBlockers(
-      { sessionId: "s", agent, lastActive: 0, subagent: true },
-      { ...base, subagentOperationInFlight: () => true },
-    ),
-    ["subagent-operation-in-flight"],
-    "manager 有在途 child 操作时不得卸载",
-  );
-  const busyAgent = { ...agent, status: "running", inbox: { hasPending: true } };
-  assert.deepEqual(
-    evictionBlockers(
-      { sessionId: "s", agent: busyAgent, lastActive: 0 },
-      {
-        ...base,
-        agents: { get: () => busyAgent },
-        followerBlocks: () => true,
-        descendantLive: () => true,
-        claimInFlight: () => true,
-      },
-    ),
-    ["running", "pending-inbox", "live-descendant", "operation-in-flight", "followed"],
+    releaseBlockers({ sessionId: "s", agent: { status: "idle", get inbox() { throw new Error("closed"); } } }, base),
+    ["pending-inbox"],
   );
 });
 
-test("resume 包装：捕获 handle，空闲阈值后 dispose；再次 promote 再次捕获", async () => {
+test("后代判定纯函数：沿 parentSession 链可达才算，环路与缺链不误判", () => {
+  const parents = new Map([["g", "c"], ["c", "leader"], ["other", "leader-b"]]);
+  const parentOf = (id) => parents.get(id);
+  assert.equal(descendsFrom("c", "leader", parentOf), true);
+  assert.equal(descendsFrom("g", "leader", parentOf), true);
+  assert.equal(descendsFrom("other", "leader", parentOf), false);
+  assert.equal(descendsFrom("leader", "leader", parentOf), true, "自身在链首即命中（调用方另有主会话拒绝）");
+  parents.set("loop", "loop");
+  assert.equal(descendsFrom("loop", "leader", parentOf), false, "坏日志成环只访问一次");
+});
+
+test("自动卸载已关闭：root 与 subagent 空闲任意久都不 dispose", async () => {
   const harness = makeHarness();
-  await harness.resume("session-1");
-  assert.equal(harness.disposeCalls.length, 0, "promote 不应立即卸载");
-
-  harness.advance(10 * 60 * 1000 - 1);
-  await harness.tick();
-  assert.equal(harness.disposeCalls.length, 0, "差 1ms 也不得提前卸载");
-
-  harness.advance(1);
-  await harness.tick();
-  assert.equal(harness.disposeCalls.length, 1, "到阈值应卸载");
-  assert.equal(harness.agent("session-1"), void 0, "dispose 后注册表应无该 agent");
-  await harness.tick();
-  assert.equal(harness.disposeCalls.length, 1, "条目已随 dispose 清除，不重复卸载");
-  const evicted = harness.events().find((entry) => entry.kind === "mem-guard-evict");
-  assert.equal(evicted?.session, "session-1");
-  assert.ok(evicted.idleMs >= 10 * 60 * 1000);
-  assert.equal(typeof evicted.heapUsedBefore, "number");
-  assert.equal(evicted.pressure, false);
-
-  // 卸载后 session-controller 的 resolve 会重新 promote；包装必须再次捕获。
-  await harness.resume("session-1");
-  harness.advance(10 * 60 * 1000);
-  await harness.tick();
-  assert.equal(harness.disposeCalls.length, 2, "重新 promote 的 handle 应再次被捕获");
+  await harness.resume("leader-1");
+  await harness.resume("child-1", { origin: "subagent", parentSession: "leader-1" });
+  harness.advance(24 * 60 * 60 * 1000);
+  for (let index = 0; index < 10; index += 1) await harness.tick();
+  assert.deepEqual(harness.disposeCalls, [], "没有任何定时器可以 dispose 会话");
+  assert.equal(harness.agent("leader-1")?.id, "leader-1");
+  assert.equal(harness.agent("child-1")?.id, "child-1");
+  assert.equal(harness.events().some((entry) => entry.kind === "mem-guard-evict"), false, "旧的自动卸载事件不再出现");
+  assert.equal(harness.events().some((entry) => entry.kind === "mem-guard-evict-fail"), false);
 });
 
-test("活动跟踪：session/event 与工具调用都会刷新 lastActive", async () => {
+test("resume 包装仍捕获 handle：release 能拿到 dispose 路径；作用域释放恢复原型", async () => {
   const harness = makeHarness();
-  await harness.resume("session-1");
-  harness.advance(9 * 60 * 1000);
-  await harness.emit("session/event", { id: "session-1", type: "user/message" });
-  harness.advance(9 * 60 * 1000);
-  await harness.tick();
-  assert.equal(harness.disposeCalls.length, 0, "9 分钟前的会话事件应续命");
-
-  const called = await harness.preTool({ agent: harness.agent("session-1"), name: "bash", arguments: { command: "true" } });
-  assert.equal(called, true, "pre-execute 监听器必须把 next() 放行下去");
-  assert.equal(harness.toolNextCalls.count, 1);
-  await harness.postTool({ agent: harness.agent("session-1"), name: "bash" }, { value: "ok" });
-  harness.advance(9 * 60 * 1000);
-  await harness.tick();
-  assert.equal(harness.disposeCalls.length, 0, "工具调用后同样续命");
-
-  harness.advance(1 * 60 * 1000);
-  await harness.tick();
-  assert.equal(harness.disposeCalls.length, 1, "最后一次活动满 10 分钟后卸载");
-});
-
-test("堆压力：门槛降到 2 分钟，并按 LRU 先卸最久未活动的会话", async () => {
-  const harness = makeHarness({ heapUsed: 2.2 * GIB, heapLimitBytes: 4 * GIB });
-  await harness.resume("older");
-  harness.advance(3 * 60 * 1000);
-  await harness.resume("newer");
-  harness.advance(3 * 60 * 1000);
-  await harness.tick();
-  assert.deepEqual(
-    harness.disposeCalls.map((call) => call.sessionId),
-    ["older", "newer"],
-    "压力下 2 分钟即可卸，且按 lastActive 从旧到新",
-  );
-  assert.ok(harness.events().filter((entry) => entry.kind === "mem-guard-evict").every((entry) => entry.pressure === true));
-});
-
-test("堆压力在扫描时动态读取：低堆 9 分钟不卸，抬到 50% 后按 2 分钟门槛卸", async () => {
-  const harness = makeHarness({ heapUsed: 1 * GIB });
-  await harness.resume("session-1");
-  harness.advance(9 * 60 * 1000);
-  await harness.tick();
-  assert.equal(harness.disposeCalls.length, 0, "低堆时按 10 分钟门槛，9 分钟不卸");
-
-  harness.setHeap(2.2 * GIB);
-  await harness.tick();
-  assert.equal(harness.disposeCalls.length, 1, "抬到 50% 顶棚后同一次扫描按 2 分钟门槛卸");
-  assert.equal(harness.events().find((entry) => entry.kind === "mem-guard-evict")?.pressure, true);
-});
-
-test("有 follower 的会话不卸；其他空闲会话照卸；follow 结束后可卸", async () => {
-  const harness = makeHarness();
-  await harness.resume("watched");
-  await harness.resume("other");
-  const controller = new AbortController();
-  const stream = harness.history.follow({ address: { kind: "session", sessionId: "watched" } }, controller.signal);
-  await stream.next();
-  harness.advance(10 * 60 * 1000);
-
-  await harness.tick();
-  assert.deepEqual(harness.disposeCalls.map((call) => call.sessionId), ["other"], "被跟随的会话不能卸");
-  assert.equal(harness.agent("watched")?.id, "watched");
-
-  controller.abort();
-  await stream.next();
-  await harness.tick();
-  assert.deepEqual(
-    harness.disposeCalls.map((call) => call.sessionId),
-    ["other", "watched"],
-    "follow 结束后 watched 变成可卸",
-  );
-});
-
-test("运行中 / durable inbox 有 pending / 有活子代：都不卸；解除后只卸安全的", async () => {
-  const harness = makeHarness();
-  await harness.resume("running", { status: "running" });
-  await harness.resume("pending", { inboxPending: true });
-  await harness.resume("parent");
-  await harness.resume("child", { origin: "subagent", parentSession: "parent", status: "running" });
-  harness.makeResident("child", "parent");
-  harness.advance(11 * 60 * 1000);
-  await harness.tick();
-  assert.deepEqual(harness.disposeCalls, [], "有任一阻塞条件都不得卸载");
-
-  const running = harness.agent("running");
-  running.status = "idle";
-  harness.agent("pending").inbox.hasPending = false;
-  harness.agent("child").status = "idle";
-  await harness.tick();
-  assert.deepEqual(
-    harness.disposeCalls.map((call) => call.sessionId).sort(),
-    ["pending", "running"],
-    "父会话仍有活子代不卸；resident 中的子代理会话本身也不卸",
-  );
-});
-
-test("dispose 失败：落 mem-guard-evict-fail（错误截 200），30 分钟内不再尝试", async () => {
-  const harness = makeHarness();
-  await harness.resume("session-1");
-  harness.failDispose("session-1");
-  harness.advance(10 * 60 * 1000);
-  await harness.tick();
-  const failure = harness.events().find((entry) => entry.kind === "mem-guard-evict-fail");
-  assert.equal(failure?.session, "session-1");
-  assert.equal(failure.error.length, 200, "错误必须截到 200 字符");
-  assert.equal(harness.disposeCalls.length, 1);
-
-  harness.advance(29 * 60 * 1000);
-  await harness.tick();
-  assert.equal(harness.disposeCalls.length, 1, "退避窗口内不得重试");
-
-  harness.clearDisposeFailure("session-1");
-  harness.advance(1 * 60 * 1000);
-  await harness.tick();
-  assert.equal(harness.disposeCalls.length, 2, "30 分钟后退避结束，重试成功");
-  assert.equal(harness.agent("session-1"), void 0);
-});
-
-test("session-controller 有在途 resume/claim：不卸；在途结束后可卸", async () => {
-  const harness = makeHarness();
-  await harness.resume("session-1");
-  harness.sessionController.agents.claims.set("session-1", Promise.resolve());
-  harness.advance(10 * 60 * 1000);
-  await harness.tick();
-  assert.equal(harness.disposeCalls.length, 0, "有在途操作时不能拔掉会话");
-
-  harness.sessionController.agents.claims.delete("session-1");
-  await harness.tick();
-  assert.equal(harness.disposeCalls.length, 1);
-});
-
-test("dispose 后清冷缓存：observation refs=0 才清，coldLogMemo 按 id 清", async () => {
-  const cache = new Map([["session-1", { refs: 0 }], ["session-2", { refs: 1 }]]);
-  const coldLogMemo = new Map([["session-1", { events: [] }], ["session-2", { events: [] }]]);
-  const harness = makeHarness({ observationCache: cache, coldLogMemo });
-  await harness.resume("session-1");
-  await harness.resume("session-2");
-  harness.advance(10 * 60 * 1000);
-  await harness.tick();
-  assert.equal(cache.has("session-1"), false, "refs=0 的冷观察缓存应被点名清退");
-  assert.equal(cache.has("session-2"), true, "仍有 lease 的缓存不能删");
-  assert.equal(coldLogMemo.has("session-1"), false, "persistence 解码缓存按 id 清一条");
-  assert.equal(coldLogMemo.has("session-2"), false, "两个会话都可卸，各自的 coldLogMemo 都清");
-  const events = harness.events().filter((entry) => entry.kind === "mem-guard-evict");
-  assert.equal(events.find((entry) => entry.session === "session-1")?.observationEvicted, true);
-  assert.equal(events.find((entry) => entry.session === "session-2")?.observationEvicted, false);
-  assert.equal(events.find((entry) => entry.session === "session-1")?.coldLogEvicted, true);
-});
-
-test("agent/disposed 清条目：宿主已释放的会话不会被卸载器再 dispose 一次", async () => {
-  const harness = makeHarness();
-  await harness.resume("session-1");
-  await harness.emit("agent/disposed", { agent: harness.agent("session-1") });
-  harness.advance(10 * 60 * 1000);
-  await harness.tick();
-  assert.equal(harness.disposeCalls.length, 0, "条目已随 agent/disposed 删除");
-});
-
-test("子代理会话按 activation 归属：resident 中不卸，已结束（非 resident）按普通判据卸", async () => {
-  const harness = makeHarness();
-  await harness.resume("still-resident", { origin: "subagent" });
-  harness.makeResident("still-resident", "parent");
-  await harness.resume("settled", { origin: "subagent" });
-  harness.advance(10 * 60 * 1000);
-  await harness.tick();
-  assert.deepEqual(
-    harness.disposeCalls.map((call) => call.sessionId),
-    ["settled"],
-    "settle 后 resident 已删的子代理会话不再是豁免对象",
-  );
-  assert.equal(harness.agent("still-resident")?.id, "still-resident");
-});
-
-test("manager 在途 child 操作（ChildLock.tails）不卸；结束后可卸", async () => {
-  const harness = makeHarness();
-  await harness.resume("child", { origin: "subagent" });
-  harness.beginManagerOp("child");
-  harness.advance(10 * 60 * 1000);
-  await harness.tick();
-  assert.equal(harness.disposeCalls.length, 0, "续接/投递在 observe+resume 期间不能被卸载打断");
-  harness.endManagerOp("child");
-  await harness.tick();
-  assert.equal(harness.disposeCalls.length, 1);
-});
-
-test("manager 续接：卸载后重新 resume 被再次捕获，resident 期间保持存活", async () => {
-  const harness = makeHarness();
-  await harness.resume("child", { origin: "subagent" });
-  harness.advance(10 * 60 * 1000);
-  await harness.tick();
-  assert.equal(harness.disposeCalls.length, 1, "先模拟 UI promote 的结束子代理被卸载");
-
-  // 模拟 manager coldResume：在途占锁 → observe/resume → resident.set → 放锁。
-  harness.beginManagerOp("child");
-  await harness.resume("child", { origin: "subagent" });
-  harness.makeResident("child", "parent");
-  harness.endManagerOp("child");
-  harness.advance(10 * 60 * 1000);
-  await harness.tick();
-  assert.equal(harness.disposeCalls.length, 1, "重新 resume 的 handle 被捕获；resident 中不卸");
-
-  harness.dropResident("child");
-  await harness.tick();
-  assert.equal(harness.disposeCalls.length, 2, "settle 删除 resident 后可卸");
-});
-
-test("resident 探针缺失：子代理会话退回旧行为，boot 报 subagentProbe:false", async () => {
-  const harness = makeHarness({ withoutResidentProbe: true });
-  assert.equal(harness.boot().subagentProbe, false);
-  await harness.resume("child", { origin: "subagent" });
-  harness.advance(30 * 60 * 1000);
-  await harness.tick();
-  assert.equal(harness.disposeCalls.length, 0, "拿不到 resident 时子代理会话一律不卸");
-});
-
-test("找不到 follower 探针：保守不卸，并落带原因的 skip（5 分钟限流）", async () => {
-  const harness = makeHarness();
-  // 删掉 history 后 ensureFollowerProbe 无法归属任何 follow，只能保守拒绝。
-  harness.sessionController.history = void 0;
-  await harness.resume("session-1");
-  harness.advance(10 * 60 * 1000);
-  await harness.tick();
-  await harness.tick();
-  assert.equal(harness.disposeCalls.length, 0);
-  const skips = harness.events().filter((entry) => entry.kind === "mem-guard-evict-skip" && entry.reason === "follower-unknown");
-  assert.equal(skips.length, 1, "同一原因 5 分钟内只记一条");
-});
-
-test("CASEOS_EVICT=0：不包装 resume、不装定时器、不落任何事件", async () => {
-  const harness = makeHarness({ disabled: true });
-  assert.equal(harness.intervals.length, 0);
-  assert.equal(harness.disposers.length, 0);
-  assert.deepEqual(harness.monitor(), []);
-  assert.equal(harness.registry.resume, harness.originalResume);
-  await harness.resume("session-1");
-  harness.advance(30 * 60 * 1000);
-  assert.equal(harness.disposeCalls.length, 0);
-});
-
-test("作用域释放：恢复 resume/follow 原方法、清定时器与条目", async () => {
-  const harness = makeHarness();
-  await harness.resume("session-1");
-  harness.advance(10 * 60 * 1000);
+  await harness.resume("leader-1");
+  await harness.resume("child-1", { origin: "subagent", parentSession: "leader-1" });
+  assert.equal(harness.boot().tracked, 0, "boot 早于任何 promote，tracked 如实报 0");
+  const result = await harness.release(["child-1"], "leader-1");
+  assert.equal(result.results[0].result, "released");
+  assert.equal(result.results[0].mode, "dispose");
   harness.disposeScope();
   assert.equal(harness.registry.resume, harness.originalResume, "原型上的 resume 必须恢复原方法");
   assert.equal(harness.history.follow, harness.originalFollow, "history.follow 必须恢复原方法");
   assert.equal(harness.intervals.at(-1).cleared, true);
-  assert.equal(harness.disposeCalls.length, 0, "释放后条目清空，不再卸载");
 });
 
-test("启动自报：激活前已 promote 的会话进 untracked（只上报不动）", async () => {
+test("授权：子代理调用 release_subagent 一律拒绝，且不释放任何目标", async () => {
+  const harness = makeHarness();
+  await harness.resume("leader-1");
+  await harness.resume("child-1", { origin: "subagent", parentSession: "leader-1" });
+  await harness.resume("grandchild", { origin: "subagent", parentSession: "child-1" });
+  await assert.rejects(
+    harness.release(["grandchild"], "child-1"),
+    /只给主会话/,
+    "子代理无权释放子代理",
+  );
+  assert.deepEqual(harness.disposeCalls, []);
+  const refusal = harness.releases().at(-1);
+  assert.equal(refusal.mode, "refused");
+  assert.equal(refusal.reason, "not-leader");
+  assert.equal(refusal.caller, "child-1");
+});
+
+test("授权：目标不是调用方后代 → refused(not-descendant)；目标是主会话 → refused(main-session)", async () => {
+  const harness = makeHarness();
+  await harness.resume("leader-1");
+  await harness.resume("leader-2");
+  await harness.resume("child-2", { origin: "subagent", parentSession: "leader-2" });
+  const foreign = await harness.release(["child-2"], "leader-1");
+  assert.equal(foreign.results[0].result, "refused");
+  assert.equal(foreign.results[0].reason, "not-descendant");
+
+  const self = await harness.release(["leader-1"], "leader-1");
+  assert.equal(self.results[0].result, "refused");
+  assert.equal(self.results[0].reason, "main-session");
+  const otherMain = await harness.release(["leader-2"], "leader-1");
+  assert.equal(otherMain.results[0].reason, "main-session");
+  assert.deepEqual(harness.disposeCalls, []);
+});
+
+test("安全判据逐项拒绝：running / pending inbox / 在途锁 / follow / 活后代 / 在途 claim", async () => {
+  const harness = makeHarness();
+  await harness.resume("leader-1");
+  await harness.resume("running", { origin: "subagent", parentSession: "leader-1", status: "running" });
+  await harness.resume("pending", { origin: "subagent", parentSession: "leader-1", inboxPending: true });
+  await harness.resume("locked", { origin: "subagent", parentSession: "leader-1" });
+  await harness.resume("followed", { origin: "subagent", parentSession: "leader-1" });
+  await harness.resume("claimed", { origin: "subagent", parentSession: "leader-1" });
+  await harness.resume("parent-of-live", { origin: "subagent", parentSession: "leader-1" });
+  await harness.resume("live-child", { origin: "subagent", parentSession: "parent-of-live" });
+  harness.makeResident("live-child", "parent-of-live");
+  harness.beginManagerOp("locked");
+  harness.sessionController.agents.claims.set("claimed", Promise.resolve());
+  const controller = new AbortController();
+  const stream = harness.history.follow({ address: { kind: "session", sessionId: "followed" } }, controller.signal);
+  await stream.next();
+
+  const result = await harness.release(["running", "pending", "locked", "followed", "parent-of-live", "claimed"], "leader-1");
+  const reasons = Object.fromEntries(result.results.map((row) => [row.id, row.reason]));
+  assert.match(reasons.running, /running/);
+  assert.match(reasons.pending, /pending-inbox/);
+  assert.match(reasons.locked, /subagent-operation-in-flight/);
+  assert.match(reasons.followed, /followed/);
+  assert.match(reasons["parent-of-live"], /live-descendant/);
+  assert.match(reasons.claimed, /operation-in-flight/);
+  assert.ok(result.results.every((row) => row.result === "refused"));
+  assert.deepEqual(harness.disposeCalls, [], "任一安全判据不满足都不得释放");
+
+  controller.abort();
+  await stream.next();
+});
+
+test("drain 路径：resident 目标走 drainChildren(exact live parent)，释放后清冷缓存", async () => {
+  const cache = new Map([["child-1", { refs: 0 }], ["child-2", { refs: 1 }]]);
+  const coldLogMemo = new Map([["child-1", { events: [] }], ["child-2", { events: [] }]]);
+  const harness = makeHarness({ observationCache: cache, coldLogMemo });
+  await harness.resume("leader-1");
+  await harness.resume("child-1", { origin: "subagent", parentSession: "leader-1" });
+  await harness.resume("child-2", { origin: "subagent", parentSession: "leader-1" });
+  harness.makeResident("child-1", "leader-1");
+  harness.makeResident("child-2", "leader-1");
+
+  const result = await harness.release(["child-1"], "leader-1");
+
+  assert.equal(result.results[0].result, "released");
+  assert.equal(result.results[0].mode, "drain");
+  assert.deepEqual(harness.drainCalls, [{ parentId: "leader-1", childIds: ["child-1"] }]);
+  assert.equal(harness.agent("child-1"), void 0, "drain 后注册表里没有该 agent");
+  assert.equal(harness.residentSet().has("child-1"), false);
+  assert.equal(cache.has("child-1"), false, "refs=0 的冷观察缓存应被点名清退");
+  assert.equal(cache.has("child-2"), true, "仍有 lease 的缓存不能删");
+  assert.equal(coldLogMemo.has("child-1"), false, "persistence 解码缓存按 id 清一条");
+  assert.equal(coldLogMemo.has("child-2"), true, "其他会话的缓存不动");
+  const line = harness.releases().at(-1);
+  assert.equal(line.caller, "leader-1");
+  assert.equal(line.child, "child-1");
+  assert.equal(line.mode, "drain");
+  assert.equal(line.observationEvicted, true);
+  assert.equal(line.coldLogEvicted, true);
+  assert.equal(typeof line.heapUsedBefore, "number");
+  assert.equal(typeof line.heapUsedAfter, "number");
+});
+
+test("dispose 路径：已在内存但非 resident 的目标走捕获的 handle.dispose", async () => {
+  const harness = makeHarness();
+  await harness.resume("leader-1");
+  await harness.resume("child-1", { origin: "subagent", parentSession: "leader-1" });
+  assert.equal(harness.agent("child-1")?.status, "idle");
+  const result = await harness.release(["child-1"], "leader-1");
+  assert.equal(result.results[0].mode, "dispose");
+  assert.deepEqual(harness.disposeCalls.map((call) => call.sessionId), ["child-1"]);
+  assert.deepEqual(harness.drainCalls, []);
+  assert.equal(harness.agent("child-1"), void 0);
+  assert.equal(harness.releases().at(-1).mode, "dispose");
+});
+
+test("not-loaded：本就不在内存的目标按成功无操作返回 noop，重复释放也幂等", async () => {
+  const harness = makeHarness();
+  await harness.resume("leader-1");
+  await harness.resume("child-1", { origin: "subagent", parentSession: "leader-1" });
+  await harness.release(["child-1"], "leader-1");
+  assert.equal(harness.agent("child-1"), void 0);
+
+  const again = await harness.release(["child-1"], "leader-1");
+  assert.equal(again.results[0].result, "not-loaded", "已释放的后代仍靠 lineage 记忆通过授权");
+  assert.equal(again.results[0].mode, "noop");
+  assert.equal(harness.releases().at(-1).mode, "noop");
+
+  harness.seedSession("never-loaded", { origin: "subagent", parentSession: "leader-1" });
+  const seed = await harness.release(["never-loaded"], "leader-1");
+  assert.equal(seed.results[0].result, "not-loaded");
+  assert.deepEqual(harness.disposeCalls.map((call) => call.sessionId), ["child-1"]);
+});
+
+test("孙代：调用方是祖父时，用孙代的直接父（exact live parent）走 drain", async () => {
+  const harness = makeHarness();
+  await harness.resume("leader-1");
+  await harness.resume("child-1", { origin: "subagent", parentSession: "leader-1" });
+  await harness.resume("grandchild", { origin: "subagent", parentSession: "child-1" });
+  harness.makeResident("grandchild", "child-1");
+
+  const result = await harness.release(["grandchild"], "leader-1");
+
+  assert.equal(result.results[0].mode, "drain");
+  assert.deepEqual(harness.drainCalls, [{ parentId: "child-1", childIds: ["grandchild"] }], "宿主要求 exact live parent");
+  assert.equal(harness.agent("grandchild"), void 0);
+});
+
+test("释放后 send_message 仍可续接：coldResume 重建 agent 并被 resume 包装重新捕获", async () => {
+  const harness = makeHarness();
+  await harness.resume("leader-1");
+  await harness.resume("child-1", { origin: "subagent", parentSession: "leader-1" });
+  harness.makeResident("child-1", "leader-1");
+  await harness.release(["child-1"], "leader-1");
+  assert.equal(harness.agent("child-1"), void 0);
+
+  const messageId = await harness.send("leader-1", "child-1");
+  assert.equal(messageId, "message-1");
+  assert.equal(harness.agent("child-1")?.id, "child-1", "coldResume 重建了子代理");
+  assert.ok(harness.residentSet().has("child-1"), "续接后重新成为 resident");
+  assert.equal(harness.sendCalls.length, 1);
+
+  // 重新捕获的 handle 能被再次释放（drain 路径），证明包装对冷续接生效。
+  const again = await harness.release(["child-1"], "leader-1");
+  assert.equal(again.results[0].mode, "drain", "重建后的 resident 仍可释放");
+  assert.equal(harness.agent("child-1"), void 0);
+});
+
+test("drain 失败 / dispose 失败：目标保持存活，落 refused 并带原因", async () => {
+  const harness = makeHarness();
+  await harness.resume("leader-1");
+  await harness.resume("child-1", { origin: "subagent", parentSession: "leader-1" });
+  harness.failDispose("child-1");
+  const result = await harness.release(["child-1"], "leader-1");
+  assert.equal(result.results[0].result, "refused");
+  assert.match(result.results[0].reason, /dispose-failed/);
+  assert.equal(harness.agent("child-1")?.id, "child-1", "失败不当作已释放");
+  assert.equal(harness.releases().at(-1).mode, "refused");
+});
+
+test("follower 探针缺失：release 保守拒绝，不猜「没人在看」", async () => {
+  const harness = makeHarness();
+  harness.sessionController.history = void 0;
+  await harness.resume("leader-1");
+  await harness.resume("child-1", { origin: "subagent", parentSession: "leader-1" });
+  const result = await harness.release(["child-1"], "leader-1");
+  assert.equal(result.results[0].result, "refused");
+  assert.match(result.results[0].reason, /followed|follower-untracked/);
+  assert.deepEqual(harness.disposeCalls, []);
+});
+
+test("工具注册与 schema：release_subagent 挂在主会话工具面，参数是 agent_ids 数组", async () => {
+  const harness = makeHarness();
+  const tool = harness.tool();
+  assert.ok(tool, "apply 时应注册 release_subagent");
+  assert.equal(tool.parameters.type, "object");
+  assert.equal(tool.parameters.properties.agent_ids.type, "array");
+  assert.equal(tool.parameters.properties.agent_ids.items.type, "string");
+  assert.deepEqual(tool.parameters.required, ["agent_ids"]);
+  assert.equal(tool.parameters.additionalProperties, false);
+  assert.ok(tool.description.includes("只给主会话"));
+  assert.equal(typeof tool.output?.render, "function");
+  const boot = harness.boot();
+  assert.equal(boot.releaseTool, true);
+});
+
+test("子代理工具面：agent/created 时摘掉 release_subagent", async () => {
+  const harness = makeHarness();
+  const restricted = [];
+  const shell = {
+    id: "sub-shell",
+    session: { header: { id: "sub-shell", origin: "subagent", parentSession: "leader-1" } },
+    ctx: {
+      inject: (names, callback) => {
+        assert.deepEqual(names, ["tools"]);
+        callback({ tools: { restrict: (spec) => restricted.push(spec) } });
+      },
+    },
+  };
+  await harness.emit("agent/created", { agent: shell });
+  assert.deepEqual(restricted, [{ deny: ["release_subagent"] }]);
+});
+
+test("扫描遥测：candidates 只数可由主会话释放的已结束子代理，无自动动作", async () => {
+  const harness = makeHarness();
+  await harness.resume("leader-1");
+  await harness.resume("idle-child", { origin: "subagent", parentSession: "leader-1" });
+  await harness.resume("running-child", { origin: "subagent", parentSession: "leader-1", status: "running" });
+  harness.advance(30 * 60 * 1000);
+  await harness.tick();
+  const scan = harness.events().find((entry) => entry.kind === "mem-guard-evict-scan");
+  assert.ok(scan, "首次扫描就落汇总");
+  assert.equal(scan.tracked, 3);
+  assert.equal(scan.candidates, 1, "只数 idle 且无阻塞的子代理");
+  assert.equal(scan.evicted, void 0, "遥测不再报自动卸载");
+  assert.equal(scan.blockers, void 0);
+  assert.equal(scan.followerProbe, "session-controller");
+  assert.equal(scan.subagentProbe, true);
+  assert.equal(typeof scan.heapUsed, "number");
+  assert.deepEqual(harness.disposeCalls, []);
+});
+
+test("启动自报：无 idle/pressure 阈值，仍报 scanMs/tracked/untracked/probe/releaseTool", async () => {
   const harness = makeHarness({ preAgents: [{ id: "pre-promoted", origin: "user" }] });
   const boot = harness.boot();
   assert.equal(boot?.kind, "mem-guard-evict-boot");
@@ -646,109 +645,73 @@ test("启动自报：激活前已 promote 的会话进 untracked（只上报不�
   assert.equal(boot.followerProbe, "session-controller");
   assert.equal(boot.resumePatched, true);
   assert.equal(boot.subagentProbe, true);
+  assert.equal(boot.releaseTool, true);
   assert.equal(typeof boot.scanMs, "number");
-  assert.equal(typeof boot.idleMs, "number");
-
-  harness.advance(30 * 60 * 1000);
-  await harness.tick();
-  assert.equal(harness.disposeCalls.length, 0, "没有 handle 的会话只上报、不卸载");
+  assert.equal(boot.idleMs, void 0, "空闲阈值已删除");
 });
 
-test("env 覆盖扫描间隔与空闲阈值", async () => {
-  const harness = makeHarness({ env: { CASEOS_EVICT_SCAN_MS: 5000, CASEOS_EVICT_IDLE_MS: 60 * 1000 } });
-  assert.equal(harness.intervals.at(-1).ms, 5000);
-  assert.equal(harness.boot().scanMs, 5000);
-  assert.equal(harness.boot().idleMs, 60 * 1000);
-  await harness.resume("session-1");
-  harness.advance(60 * 1000);
-  await harness.tick();
-  assert.equal(harness.disposeCalls.length, 1);
-});
-
-test("包装早于首个 follow：inject 回调在 session-controller provide 的那一刻装上", async () => {
-  // 复现真实启动时序：loader 并发 apply，插件先到、session-controller 后 provide；
-  // 界面第一条 follow 只可能在 host 发 ready 之后到达，因此 inject 回调必须早于它。
+test("inject 补装 follow 包装：session-controller 晚 provide 也不影响首条 follow 归属", async () => {
   const harness = makeHarness({ sessionControllerLate: true });
   assert.equal(harness.history.follow, harness.originalFollow, "provide 之前没有 history 可包装");
-  assert.equal(harness.boot().followerProbe, "deferred", "boot 应如实记「等 inject」，而不是 unavailable");
-
+  assert.equal(harness.boot().followerProbe, "deferred");
   await harness.provideSessionController();
-  assert.notEqual(harness.history.follow, harness.originalFollow, "provide 即装包装，不等首次扫描");
+  assert.notEqual(harness.history.follow, harness.originalFollow);
   const install = harness.events().find((entry) => entry.kind === "mem-guard-evict-follow");
   assert.equal(install?.source, "inject");
-  assert.equal(install?.preexistingFollowers, 0, "provide 时界面还没发起 follow");
-  assert.equal(typeof install?.elapsedMs, "number");
 
-  // 随后到来的第一条 follow 必须被归属：只挡被看的会话，其他空闲会话照卸。
-  await harness.resume("watched");
-  await harness.resume("other");
+  await harness.resume("leader-1");
+  await harness.resume("watched", { origin: "subagent", parentSession: "leader-1" });
   const controller = new AbortController();
   const stream = harness.history.follow({ address: { kind: "session", sessionId: "watched" } }, controller.signal);
   await stream.next();
-  harness.advance(10 * 60 * 1000);
-  await harness.tick();
-  assert.deepEqual(harness.disposeCalls.map((call) => call.sessionId), ["other"], "watched 有活跃 follow，other 可卸");
+  const result = await harness.release(["watched"], "leader-1");
+  assert.match(result.results[0].reason, /followed/);
   controller.abort();
   await stream.next();
+  const after = await harness.release(["watched"], "leader-1");
+  assert.equal(after.results[0].result, "released", "follow 结束后可释放");
 });
 
-test("包装前已存在的 follow 不可归属：保守规则仍在，总数回落即恢复卸载", async () => {
-  const harness = makeHarness();
-  assert.notEqual(harness.history.follow, harness.originalFollow, "服务就绪时 apply 即装包装");
-  // 模拟插件重载残留：包装安装之前就存在的 follow，closeFollowers 里只有裸闭包，取不到会话。
-  const legacyClose = () => {};
-  harness.history.closeFollowers.add(legacyClose);
-  await harness.resume("a");
-  await harness.resume("b");
-  harness.advance(10 * 60 * 1000);
-  await harness.tick();
-  assert.deepEqual(harness.disposeCalls, [], "总数 > 已归属时全部会话保守不卸");
-  const summary = harness.events().find((entry) => entry.kind === "mem-guard-evict-scan");
-  assert.equal(summary?.followerTotal, 1);
-  assert.equal(summary?.followerTracked, 0);
-  assert.equal(summary?.followerUntracked, 1);
-  assert.deepEqual(summary?.blockers, { "follower-untracked": 2 }, "两个会话都被同一条保守规则挡住");
-
-  harness.history.closeFollowers.delete(legacyClose);
-  await harness.tick();
-  assert.deepEqual(
-    harness.disposeCalls.map((call) => call.sessionId).sort(),
-    ["a", "b"],
-    "不可归属的流结束后，卸载恢复",
-  );
+test("CASEOS_EVICT=0：不包装 resume、不装定时器、不注册工具、不落任何事件", async () => {
+  const harness = makeHarness({ disabled: true });
+  assert.equal(harness.intervals.length, 0);
+  assert.equal(harness.disposers.length, 0);
+  assert.deepEqual(harness.monitor(), []);
+  assert.equal(harness.registry.resume, harness.originalResume);
+  assert.equal(harness.tool(), void 0, "关闭后工具也不注册");
+  await harness.resume("session-1");
+  harness.advance(30 * 60 * 1000);
+  assert.equal(harness.disposeCalls.length, 0);
 });
 
-test("扫描汇总：字段齐全，首次即发，之后按 5 分钟节流", async () => {
-  const harness = makeHarness();
-  await harness.resume("idle-session");
-  await harness.resume("busy-session", { status: "running" });
-  harness.advance(10 * 60 * 1000);
-  await harness.tick();
-  const scans = () => harness.events().filter((entry) => entry.kind === "mem-guard-evict-scan");
-  assert.equal(scans().length, 1, "首次扫描就落汇总，方便事后判断为什么没卸");
-  const first = scans()[0];
-  assert.equal(first.tracked, 2);
-  assert.equal(first.candidates, 1);
-  assert.equal(first.evicted, 1);
-  assert.deepEqual(first.blockers, { running: 1 });
-  assert.equal(first.followerTotal, 0);
-  assert.equal(first.followerTracked, 0);
-  assert.equal(first.followerUntracked, 0);
-  assert.equal(first.followerProbe, "session-controller");
-  assert.equal(first.subagentProbe, true);
-  assert.equal(typeof first.heapUsed, "number");
-  assert.equal(first.pressure, false);
-  assert.deepEqual(harness.disposeCalls.map((call) => call.sessionId), ["idle-session"]);
+test("env 只覆盖扫描间隔（CASEOS_EVICT_SCAN_MS），不再有空闲阈值项", () => {
+  const harness = makeHarness({ env: { CASEOS_EVICT_SCAN_MS: 5000 } });
+  assert.equal(harness.intervals.at(-1).ms, 5000);
+  assert.equal(harness.boot().scanMs, 5000);
+  assert.equal(harness.boot().idleMs, void 0);
+});
 
-  harness.advance(5 * 60 * 1000 - 1);
-  await harness.tick();
-  assert.equal(scans().length, 1, "未满 5 分钟不再发");
-  harness.advance(1);
-  await harness.tick();
-  assert.equal(scans().length, 2, "满 5 分钟再发一条");
-  assert.equal(scans()[1].tracked, 1, "汇总读扫描开始时的在册数");
-  assert.equal(scans()[1].evicted, 0);
-  assert.deepEqual(scans()[1].blockers, { running: 1 }, "汇总直接说明这次为什么没卸");
+test("agent/disposed 清条目：宿主已释放的会话不会被重复 dispose", async () => {
+  const harness = makeHarness();
+  await harness.resume("leader-1");
+  await harness.resume("child-1", { origin: "subagent", parentSession: "leader-1" });
+  const child = harness.agent("child-1");
+  harness.dropAgent("child-1");
+  await harness.emit("agent/disposed", { agent: child });
+  const result = await harness.release(["child-1"], "leader-1");
+  assert.equal(result.results[0].result, "not-loaded", "条目已随 agent/disposed 删除");
+  assert.equal(result.results[0].mode, "noop");
+  assert.deepEqual(harness.disposeCalls, []);
+});
+
+test("活着但未捕获 handle（激活前已 promote）：拒绝 not-captured，不谎报 not-loaded", async () => {
+  const harness = makeHarness({ preAgents: [{ id: "pre-child", origin: "subagent", parentSession: "leader-1" }] });
+  await harness.resume("leader-1");
+  const result = await harness.release(["pre-child"], "leader-1");
+  assert.equal(result.results[0].result, "refused");
+  assert.match(result.results[0].reason, /not-captured/);
+  assert.equal(harness.agent("pre-child")?.id, "pre-child", "未捕获的会话不能动");
+  assert.deepEqual(harness.disposeCalls, []);
 });
 
 let failed = 0;

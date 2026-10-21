@@ -17,6 +17,7 @@ import { join } from "node:path";
 import v8 from "node:v8";
 import plugin, {
   bashReadPaths,
+  checkStuck,
   heapLimitBytes,
   memoryDecision,
   proportionalThresholds,
@@ -125,31 +126,10 @@ function makeHarness(options = {}) {
     get: (id) => agentsMap.get(id),
     list: () => [...agentsMap.values()],
   };
-  // hangDrain 模拟宿主 drainChildren 的 await 迟迟不返回：用于验证 check-stuck 自愈。
-  let releaseDrain;
-  const drainGate = options.hangDrain === true
-    ? new Promise((resolve) => {
-      releaseDrain = resolve;
-    })
-    : void 0;
-  // 与宿主 drainChildren 同语义：只释放同一父代理名下的常驻子代理，非常驻 id 是 no-op，
-  // 父代理不匹配直接 UNAUTHORIZED。
+  // drainChildren 只作哨兵：本版看门狗绝不自动释放任何会话，测试断言它一次都不被调用。
   const subagents = {
     async drainChildren(parent, childIds) {
-      if (drainGate !== void 0) await drainGate;
-      if (!parent || !parent.session) throw new Error("parent missing");
-      for (const id of childIds) {
-        const target = agentsMap.get(id);
-        if (target && target.session?.header?.parentSession !== parent.id) {
-          throw new Error(`subagent "${id}" is not a direct child of agent "${parent.id}"`);
-        }
-      }
-      for (const id of childIds) {
-        if (!resident.has(id)) continue;
-        resident.delete(id);
-        agentsMap.delete(id);
-        drained.push(id);
-      }
+      drained.push({ parentId: parent?.id, childIds: [...childIds] });
     },
   };
   const cwd = options.cwd ?? "/workspace";
@@ -184,11 +164,10 @@ function makeHarness(options = {}) {
   if (options.withRelay === true) scoutRelay.apply(ctx);
 
   return {
-    home,
     intervals,
     stderr,
     disposers,
-    drained,
+    drainCalls: drained,
     agents,
     setHeap: (bytes) => {
       heap.value = bytes;
@@ -197,8 +176,9 @@ function makeHarness(options = {}) {
       clock.offset += ms;
     },
     // 子代理落进 agents 注册表；resident 标记它还有常驻 activation。
-    // inboxPending 模拟宿主 durable inbox 里还有排队待跑的输入。
-    primeAgent: (id, { origin, parentSession, status = "idle", inboxPending = false } = {}) => {
+    // inboxPending 模拟宿主 durable inbox 里还有排队待跑的输入；label 是宿主的
+    // `subagent/descriptor` 事件里那条「route · role · description」。
+    primeAgent: (id, { origin, parentSession, status = "idle", inboxPending = false, label } = {}) => {
       const agent = {
         id,
         status,
@@ -209,7 +189,9 @@ function makeHarness(options = {}) {
             ...(origin ? { origin } : {}),
             ...(parentSession ? { parentSession } : {}),
           },
-          snapshotEvents: () => [],
+          snapshotEvents: () => (typeof label === "string"
+            ? [{ type: "subagent/descriptor", data: { version: 3, mode: "continuable", provider: "spawn", label } }]
+            : []),
         },
       };
       agentsMap.set(id, agent);
@@ -223,9 +205,6 @@ function makeHarness(options = {}) {
     post: (exec, result) => harnessWaterfall("tools/post-execute", [exec, result], async () => result),
     // 即时检查是 void 调用：等一轮宏任务让它的微任务链跑完，用例因此不需要 sleep。
     flush: () => new Promise((resolve) => setImmediate(resolve)),
-    releaseDrain: () => {
-      releaseDrain?.();
-    },
     tick: async () => {
       const interval = intervals.at(-1);
       assert.ok(interval, "apply 应注册定时器");
@@ -317,7 +296,7 @@ test("阈值判定：软阈值以下不动作，软/硬阈值边界与冷却、�
   assert.equal(memoryDecision({ ...base, heapUsed: 150, busy: false, lastActionAt: 1000, now: 1000 + 5 * 60 * 1000 }).kind, "soft");
 });
 
-test("软阈值以下：只落 5 分钟 sample，不做回收动作（boot 自报除外）", async () => {
+test("软阈值以下：只落 5 分钟 sample，不做回收动作，也不碰会话（boot 自报除外）", async () => {
   const harness = makeHarness({ heapUsed: 1 * GIB });
   const leader = harness.primeAgent("leader-1");
   harness.primeAgent("child-idle", { origin: "subagent", parentSession: leader.id });
@@ -326,46 +305,146 @@ test("软阈值以下：只落 5 分钟 sample，不做回收动作（boot 自�
   await harness.emit("subagent/end", { id: "child-idle" });
   const actions = harness.actions().filter((entry) => entry.kind !== "mem-guard-sample");
   assert.deepEqual(actions, [], "boot 自报与 5 分钟 sample 不算回收动作");
-  assert.deepEqual(harness.drained, []);
+  assert.deepEqual(harness.drainCalls, []);
 });
 
-test("软阈值：只释放空闲子代理的常驻 activation，落 mem-guard-drain", async () => {
+test("软阈值不再自动 drain：drainChildren 一次都不调用，只回收索引并落软心跳", async () => {
   const harness = makeHarness({ heapUsed: 2.5 * GIB });
   const leader = harness.primeAgent("leader-1");
-  harness.primeAgent("child-idle", { origin: "subagent", parentSession: leader.id, status: "idle" });
-  harness.primeAgent("child-running", { origin: "subagent", parentSession: leader.id, status: "running" });
-  harness.makeResident("child-idle");
-  harness.makeResident("child-running");
-
-  await harness.tick();
-
-  assert.deepEqual(harness.drained, ["child-idle"], "只放空闲子代理");
-  assert.ok(harness.agents.get("child-running"), "运行中子代理必须保留");
-  const line = harness.monitor().find((entry) => entry.kind === "mem-guard-drain");
-  assert.ok(line, "应落 mem-guard-drain");
-  assert.equal(line.released, 1);
-  assert.equal(line.reason, "soft-threshold");
-  assert.equal(typeof line.heapUsed, "number");
-});
-
-test("软阈值：inbox 还有排队输入的 idle 子代理不释放（有活要干）", async () => {
-  const harness = makeHarness({ heapUsed: 2.5 * GIB });
-  const leader = harness.primeAgent("leader-1");
-  harness.primeAgent("child-idle", { origin: "subagent", parentSession: leader.id });
-  harness.primeAgent("child-queued", {
+  const idle = harness.primeAgent("child-idle", { origin: "subagent", parentSession: leader.id, status: "idle" });
+  const running = harness.primeAgent("child-running", { origin: "subagent", parentSession: leader.id, status: "running" });
+  const queued = harness.primeAgent("child-queued", {
     origin: "subagent",
     parentSession: leader.id,
     status: "idle",
     inboxPending: true,
   });
   harness.makeResident("child-idle");
+  harness.makeResident("child-running");
   harness.makeResident("child-queued");
 
   await harness.tick();
 
-  assert.deepEqual(harness.drained, ["child-idle"], "只放 inbox 已清空的子代理");
-  assert.ok(harness.agents.get("child-queued"), "排队中的子代理必须保留");
+  assert.deepEqual(harness.drainCalls, [], "软阈值不替主会话做释放决定");
+  assert.equal(harness.agents.get(idle.id)?.id, "child-idle", "空闲子代理保持存活");
+  assert.equal(harness.agents.get(running.id)?.id, "child-running");
+  assert.equal(harness.agents.get(queued.id)?.id, "child-queued");
+  assert.equal(harness.monitor().some((entry) => entry.kind === "mem-guard-drain"), false, "mem-guard-drain 已下线");
+  assert.ok(harness.monitor().some((entry) => entry.kind === "mem-guard-soft"), "仍落软阈值心跳");
 });
+
+test("压力提示：主会话工具结果后追加非阻断提示，列出 id / 描述 / 是否测绘并落 monitor", async () => {
+  const harness = makeHarness({ heapUsed: 2.5 * GIB });
+  const leader = harness.primeAgent("leader-1");
+  const scout = harness.primeAgent("child-scout", {
+    origin: "subagent",
+    parentSession: "leader-1",
+    label: "verispring · scout · 测绘智能体：建入口表",
+  });
+  const executor = harness.primeAgent("child-exec", {
+    origin: "subagent",
+    parentSession: "leader-1",
+    label: "verispring · executor · 改 session-evictor",
+  });
+
+  const result = await harness.post(
+    { name: "bash", agent: leader },
+    { value: "ok", additionalContexts: ["原有提示"] },
+  );
+  const hint = result.additionalContexts?.[0];
+  assert.equal(hint?.includes("【内存提示】"), true, "主会话工具结果后应追加内存提示");
+  assert.equal(hint.includes(scout.id), true);
+  assert.equal(hint.includes(executor.id), true);
+  assert.equal(hint.includes("测绘"), true);
+  assert.equal(hint.includes("执行"), true);
+  assert.equal(hint.includes("release_subagent"), true);
+  assert.equal(hint.includes("主会话自身永不被自动卸载"), true);
+  assert.deepEqual(result.additionalContexts.slice(1), ["原有提示"], "原有 additionalContexts 必须保留");
+
+  const line = harness.actions().find((entry) => entry.kind === "mem-guard-release-hint");
+  assert.ok(line, "应落 mem-guard-release-hint");
+  assert.equal(line.session, "leader-1");
+  assert.equal(line.heapUsed, 2.5 * GIB);
+  assert.equal(line.softBytes, Math.floor(4 * GIB * 0.6));
+  assert.deepEqual([...line.candidates].sort(), [scout.id, executor.id].sort());
+  assert.equal(harness.drainCalls.length, 0, "提示绝不替主会话释放");
+});
+
+test("压力提示只给主会话：子代理的工具结果不追加提示", async () => {
+  const harness = makeHarness({ heapUsed: 2.5 * GIB });
+  harness.primeAgent("leader-1");
+  const child = harness.primeAgent("child-1", { origin: "subagent", parentSession: "leader-1" });
+  harness.primeAgent("grandchild", { origin: "subagent", parentSession: "child-1" });
+
+  const result = await harness.post({ name: "bash", agent: child }, { value: "ok" });
+
+  assert.equal(result.additionalContexts, void 0);
+  assert.equal(harness.actions().some((entry) => entry.kind === "mem-guard-release-hint"), false);
+});
+
+test("压力提示 5 分钟节流：同一主会话窗口内只提示一次，过后重新提示", async () => {
+  const harness = makeHarness({ heapUsed: 2.5 * GIB });
+  const leader = harness.primeAgent("leader-1");
+  harness.primeAgent("child-1", { origin: "subagent", parentSession: "leader-1" });
+
+  const first = await harness.post({ name: "bash", agent: leader }, { value: "ok" });
+  assert.ok(first.additionalContexts?.length > 0);
+  const second = await harness.post({ name: "bash", agent: leader }, { value: "ok" });
+  assert.equal(second.additionalContexts, void 0, "5 分钟内不再提示");
+  assert.equal(harness.actions().filter((entry) => entry.kind === "mem-guard-release-hint").length, 1);
+
+  harness.advance(5 * 60 * 1000);
+  const third = await harness.post({ name: "bash", agent: leader }, { value: "ok" });
+  assert.ok(third.additionalContexts?.length > 0, "满 5 分钟重新提示");
+  assert.equal(harness.actions().filter((entry) => entry.kind === "mem-guard-release-hint").length, 2);
+});
+
+test("压力提示不越阈值不发：低于软阈值没有提示，也不落事件", async () => {
+  const harness = makeHarness({ heapUsed: 1 * GIB });
+  const leader = harness.primeAgent("leader-1");
+  harness.primeAgent("child-1", { origin: "subagent", parentSession: "leader-1" });
+
+  const result = await harness.post({ name: "bash", agent: leader }, { value: "ok" });
+
+  assert.equal(result.additionalContexts, void 0);
+  assert.equal(harness.actions().some((entry) => entry.kind === "mem-guard-release-hint"), false);
+});
+
+test("压力提示候选过滤：运行中、inbox 有排队、有活后代的子代理不列入", async () => {
+  const harness = makeHarness({ heapUsed: 2.5 * GIB });
+  const leader = harness.primeAgent("leader-1");
+  harness.primeAgent("child-idle", { origin: "subagent", parentSession: "leader-1" });
+  harness.primeAgent("child-running", { origin: "subagent", parentSession: "leader-1", status: "running" });
+  harness.primeAgent("child-queued", {
+    origin: "subagent",
+    parentSession: "leader-1",
+    status: "idle",
+    inboxPending: true,
+  });
+  harness.primeAgent("child-parent", { origin: "subagent", parentSession: "leader-1" });
+  harness.primeAgent("child-live-grandson", { origin: "subagent", parentSession: "child-parent" });
+
+  const result = await harness.post({ name: "bash", agent: leader }, { value: "ok" });
+
+  const line = harness.actions().find((entry) => entry.kind === "mem-guard-release-hint");
+  assert.deepEqual([...line.candidates].sort(), ["child-idle", "child-live-grandson"], "只列可释放的已结束子代理");
+  const hint = result.additionalContexts[0];
+  assert.equal(hint.includes("child-running"), false);
+  assert.equal(hint.includes("child-queued"), false);
+  assert.equal(hint.includes("child-parent"), false);
+  assert.equal(hint.includes("child-live-grandson"), true, "孙代自己已结束且无活后代时可单独释放");
+});
+
+test("压力提示：没有可释放目标就不发提示、不落事件", async () => {
+  const harness = makeHarness({ heapUsed: 2.5 * GIB });
+  const leader = harness.primeAgent("leader-1");
+
+  const result = await harness.post({ name: "bash", agent: leader }, { value: "ok" });
+
+  assert.equal(result.additionalContexts, void 0);
+  assert.equal(harness.actions().some((entry) => entry.kind === "mem-guard-release-hint"), false);
+});
+
 
 test("软阈值：剪掉 scout-relay 里失联的 error 草稿，保留活会话的草稿", async () => {
   const harness = makeHarness({ heapUsed: 2.5 * GIB, withRelay: true });
@@ -457,7 +536,7 @@ test("env 覆盖：检查间隔与软/硬阈值按 CASEOS_MEM_* 生效", async (
   assert.equal(hard.monitor().find((entry) => entry.kind === "mem-guard-skip")?.reason, "hard-threshold-no-auto-restart");
 });
 
-test("subagent/end 即时检查：不等下一轮定时器", async () => {
+test("subagent/end 即时检查：不等下一轮定时器，但不再自动 drain", async () => {
   const harness = makeHarness({ heapUsed: 1 * GIB });
   const leader = harness.primeAgent("leader-1");
   harness.primeAgent("child-idle", { origin: "subagent", parentSession: leader.id });
@@ -465,8 +544,14 @@ test("subagent/end 即时检查：不等下一轮定时器", async () => {
   harness.setHeap(2.5 * GIB);
 
   await harness.emit("subagent/end", { id: "child-idle" });
+  await harness.flush();
 
-  assert.deepEqual(harness.drained, ["child-idle"]);
+  assert.deepEqual(harness.drainCalls, [], "即时检查同样只观测、不释放");
+  assert.ok(harness.agents.get("child-idle"), "已结束子代理仍等主会话决定");
+  assert.ok(
+    harness.monitor().some((entry) => entry.kind === "mem-guard-skip" && entry.reason === "soft-threshold-no-targets"),
+    "即时补的检查仍落软阈值心跳/跳过记录",
+  );
 });
 
 test("CASEOS_MEM_GUARD=0：不装定时器、不挂监听、不留监控（含不落 boot 自报）", async () => {
@@ -699,26 +784,24 @@ test("mem-guard-soft：软阈值越线 5 分钟一条，无论有没有可回收
   assert.equal(typeof heartbeats[0].heapUsed, "number");
 });
 
-test("检查卡死自愈：await 不返回超过 stuck 窗口后记 check-stuck，后续 tick 不再静默", async () => {
-  const harness = makeHarness({ heapUsed: 2.5 * GIB, hangDrain: true });
-  const leader = harness.primeAgent("leader-1");
-  harness.primeAgent("child-idle", { origin: "subagent", parentSession: leader.id });
-  harness.makeResident("child-idle");
+test("检查卡死判定：窗口内不算卡死，越窗才允许抢占 checking（自愈逻辑保留）", () => {
+  const stuckMs = 60 * 1000;
+  assert.equal(checkStuck({ checking: false, startedAt: 0, now: 10 * stuckMs, stuckMs }), false);
+  assert.equal(checkStuck({ checking: true, startedAt: 1000, now: 1000 + stuckMs - 1, stuckMs }), false);
+  assert.equal(checkStuck({ checking: true, startedAt: 1000, now: 1000 + stuckMs, stuckMs }), true);
+  assert.equal(checkStuck({ checking: true, startedAt: 0, now: 10 * stuckMs, stuckMs }), false, "没有开始时刻不误判");
+});
 
-  // 第一次检查卡在 drainChildren 的 await 上；不能 await 它，否则用例本身也卡住。
-  const stuckCheck = harness.tick();
-  await harness.flush();
-  assert.ok(harness.actions().some((entry) => entry.kind === "mem-guard-sample"), "卡死期间 sample 仍要落");
-
-  harness.advance(2 * 60 * 1000);
+test("检查完成后 checking 归位：下一次 tick 照常判定（不会永久静默）", async () => {
+  const harness = makeHarness({ heapUsed: 2.5 * GIB });
+  harness.primeAgent("leader-1");
   await harness.tick();
-  const stuck = harness.actions().find((entry) => entry.kind === "mem-guard-skip" && entry.reason === "check-stuck");
-  assert.ok(stuck, "超过 max(2×checkMs, 60s) 应记 check-stuck");
-  assert.ok(stuck.stuckMs >= 60 * 1000);
-
-  harness.releaseDrain();
-  await stuckCheck;
-  assert.deepEqual(harness.drained, ["child-idle"], "解除后原检查仍按宿主语义释放空闲子代理");
+  const first = harness.monitor().filter((entry) => entry.kind === "mem-guard-skip" && entry.reason === "soft-threshold-no-targets");
+  assert.equal(first.length, 1);
+  harness.advance(5 * 60 * 1000);
+  await harness.tick();
+  const second = harness.monitor().filter((entry) => entry.kind === "mem-guard-skip" && entry.reason === "soft-threshold-no-targets");
+  assert.equal(second.length, 2, "冷却结束后重新尝试，checking 没有被卡死");
 });
 
 let failed = 0;
