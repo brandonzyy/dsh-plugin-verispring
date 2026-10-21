@@ -1,17 +1,18 @@
 // Verispring 派遣门禁（七条代码级强制 + 监控）：
 // 1 规范门：subagent / subagent_fork 调用前，本会话必须出现过《子代理派遣规范》首行标记
 //   （read/bash 结果内容判定，增量扫描会话事件；会话日志是唯一事实源，跨进程重启不丢）。
-// 2 测绘常驻（按可达性判定）：本会话首笔派遣由运行时定为测绘（description 只是展示标签，
-//   模型无法漏写前缀跳过测绘）。当前测绘 id 落 ~/.dsh/caseos/session-state/<会话id>.json
-//   （{version:1, scoutId}；本门唯一写入方，harness 拒绝含未知类型的会话日志）。
-//   常驻的判据是可达，不是标题前缀：子代理每次应询结束都会 settle 成 completed 并移出
+// 2 测绘身份（由派遣意图判定）：description 以「测绘智能体」或「scout」开头 = 测绘派遣，
+//   其余 = 执行派遣；可达性只决定能否派，不改变角色——没有可达测绘时执行派遣被拒
+//   （scout-missing），绝不把它偷偷改写成测绘。测绘派遣总是先注入测绘职责与仓库根地图
+//   全文（只做增量校对）。当前测绘 id 落 ~/.dsh/caseos/session-state/<会话id>.json
+//   （{version:1, scoutId}；本门唯一写入方，harness 拒绝含未知类型的会话日志），只有测绘
+//   派遣成功启动才写。常驻的判据是可达：子代理每次应询结束都会 settle 成 completed 并移出
 //   resident，send_message 走冷恢复，所以 finished/inactive 都不算失联；只有该 id 的
 //   subagent/end stopReason 不是 completed，或领导 send_message 回报 unavailable /
-//   NOT_RESUMABLE，才判定不可达。不可达后下一笔派遣自动接替为测绘，并在 prompt 前注入
-//   上任测绘 id 与仓库根地图全文（只做增量校对）。测绘子代理 deny edit/write。
+//   NOT_RESUMABLE，才判定不可达。测绘子代理 deny edit/write。
 //   子代理自身的角色同样落盘（同目录 <子会话id>.json {role}）：重载后 childPlan 优先读
-//   落盘角色，其次按标题自愈（label 已写为标题），最后才按父会话状态推导——否则常驻测绘
-//   会在内存路由表清空后被静默重归类为执行（v1.3.58 实测事故）。
+//   落盘角色，其次按标题自愈（label 已写为标题），最后只按「本子代理是不是父会话登记的
+//   测绘」兜底——否则常驻测绘会在内存路由表清空后被静默重归类为执行（v1.3.58 实测事故）。
 // 3 地图前置 + 新鲜度：非测绘派遣要求 <会话工作区>/.project-map.md 存在——cwd 取会话
 //   header 的 cwd（桌面宿主进程目录不是项目根），且 .git 或 .manon 在场才认定项目根，否则
 //   放行（fail-open）。没有地图先派测绘（建图 + 入口表），由领导 write 落盘后重派；
@@ -31,10 +32,11 @@
 // 7 任务书与并发（只约束执行派遣）：任务书命中调研型措辞即拒绝（清单见 BRIEF_LINT_TERMS，
 //   CASEOS_BRIEF_LINT=0 关闭）——调研是常驻测绘的职责，执行任务书只写改哪里、改成什么、
 //   怎么验证；同一领导会话里运行中的执行子代理数达上限即拒绝（CASEOS_MAX_EXECUTORS，默认 8；
-//   测绘不计入）。测绘派遣在本次派遣即测绘时直接放行（第 3 条与本节都跳过，建图与调研正是
-//   它要做的事）。这两条与地图门禁的拒绝都记 kind=dispatch-deny 并带规则名，与既有 gate-deny
-//   分开，便于审计哪条规则在拦。派遣回执保留 "started subagent <id>" 前缀原样（宿主与
-//   client.js 的解析契约），追加路由、角色与测绘接替事实。
+//   测绘不计入）。测绘派遣（description 带测绘前缀）直接放行（第 3 条与本节都跳过，建图与
+//   调研正是它要做的事）；没有可达测绘时的执行派遣按 scout-missing 拒绝。任务书、地图门禁与
+//   本节的拒绝都记 kind=dispatch-deny 并带规则名，与既有 gate-deny 分开，便于审计哪条规则在
+//   拦。派遣回执保留 "started subagent <id>" 前缀原样（宿主与 client.js 的解析契约），追加
+//   路由、角色与测绘接替事实。
 // 规范目录按主目录解析（~/.dsh/specs/），搬家无需改码。
 const MARKER = "# 子代理派遣规范";
 const SPEC_FRAGMENT = "specs/子代理派遣规范.md";
@@ -472,12 +474,16 @@ function scoutOwnerOf(scoutId, stateDir) {
   return scoutSessionIndex.get(key);
 }
 
-// 接替测绘的任务书前缀：说清上任测绘为何不可达，并把现有地图全文交底（只做增量校对）。
-function scoutTakeoverPrefix({ previous, reason, cwd }) {
+// 测绘任务书前缀：测绘身份由领导在 description 里明确标注，这里交底职责与现状——上任测绘
+// 为何不可达、仓库地图全文（只做增量校对）。不含任何角色转换；执行派遣永远拿不到它。
+function scoutBriefingPrefix({ previous, reason, cwd }) {
   const mapPath = `${cwd}/${MAP_FILE}`;
-  let text = previous
-    ? `【测绘接替】上任测绘 ${previous} ${reason}，本笔派遣自动接替为测绘智能体。`
-    : `【测绘接替】${reason}，本笔派遣自动定为测绘智能体。`;
+  const lines = [
+    "【测绘智能体】领导以 description 的测绘前缀把本笔派遣标为测绘：只做定位、事实与建图，产出入口表 ≤20 行；"
+      + "只读：不要 edit/write，地图由领导 write 落盘。",
+  ];
+  if (previous) lines.push(`上任测绘 ${previous} 已不可达（${reason}），本笔是接替派遣。`);
+  let text = lines.join("\n");
   try {
     text += `\n仓库已有地图（${mapPath}），只做增量校对：只核对变化部分并回报入口表 ≤20 行，不必重头建图。\n\n`
       + readFileSync(mapPath, "utf8");
@@ -574,7 +580,7 @@ const plugin = {
       if (info?.stopReason === "completed") return;
       const owner = scoutOwnerOf(info?.id, stateDir);
       if (owner && markScoutUnreachable(owner, info?.id, `end=${info?.stopReason}`, stateDir)) {
-        process.stderr.write(`caseos-dispatch-gate: 测绘 ${info?.id} 不可达（${info?.stopReason}），下次派遣自动接替\n`);
+        process.stderr.write(`caseos-dispatch-gate: 测绘 ${info?.id} 不可达（${info?.stopReason}），已标不可达\n`);
       }
     });
     // 子代理自身报错：agent/error 带 agent 与 error，直接记为一条事实（end 只带子代理 id）。
@@ -642,20 +648,22 @@ const plugin = {
       const live = rtc ?? exec.agent?.ctx ?? ctx.root;
       const session = exec.agent?.session;
       const sessionId = sessionIdOf(session);
-      // 角色只看可达性：有可达测绘就派执行，没有（首笔、或上任测绘已失联）就派测绘。
-      // description 只是展示标签，不参与判定。
-      const activeScout = reachableScoutId(sessionId, stateDir);
-      const role = activeScout ? "executor" : "scout";
+      // 角色只看领导写在 description 里的派遣意图：测绘前缀 = 测绘派遣，其余 = 执行派遣。
+      // 可达性不改变角色——旧设计在没有可达测绘时把执行派遣偷换成测绘，已废除（guard 会拒）。
+      const role = isScoutDescription(args.description) ? "scout" : "executor";
       routes = loadRoutes(configFile);
       const route = routes[role];
       const label = String(args.description ?? "").trim();
       const roleLabel = `${routeText(route)} · ${role} · ${label}`;
-      // 派测绘时把"上任为何失联"与仓库根地图全文交底：接替的测绘只做增量校对。
-      const previous = role === "scout" ? readStateFile(sessionId, stateDir) : {};
+      // 测绘派遣一律交底职责与现状；只有上一任已不可达时才带接替事实（回执同源）。
+      const previousState = role === "scout" ? readStateFile(sessionId, stateDir) : {};
+      const previousScout = role === "scout" && previousState.scoutUnreachable
+        ? scoutIdIn(previousState)
+        : void 0;
       const scoutPrefix = role === "scout"
-        ? scoutTakeoverPrefix({
-          previous: scoutIdIn(previous),
-          reason: previous.scoutUnreachable || "本会话尚无可达测绘",
+        ? scoutBriefingPrefix({
+          previous: previousScout,
+          reason: previousState.scoutUnreachable,
           cwd: session?.header?.cwd ?? process.cwd(),
         })
         : "";
@@ -710,7 +718,7 @@ const plugin = {
         subagentId: child.childId,
         route: routeText(route),
         role,
-        ...(role === "scout" && scoutIdIn(previous) ? { replacedScoutId: scoutIdIn(previous) } : {}),
+        ...(previousScout ? { replacedScoutId: previousScout } : {}),
       };
     };
 
@@ -768,7 +776,7 @@ const plugin = {
 
     // 子代理的 provider/model/角色是运行时契约，不能依赖模型是否记得在 tool call 里填写。
     // 官方 tool-subagent 先以 subagent-base 挂载，领导层只暴露本插件的 subagent 入口；
-    // 这样不在官方同名工具作用域上重复注册，角色由会话事件推导（首笔=测绘，其后=执行）。
+    // 这样不在官方同名工具作用域上重复注册，角色由领导的 description 前缀决定。
     const installLeaderTool = async (agent) => {
       if (!agent || agent.session?.header?.origin === "subagent") return;
       if (leaderToolInstalled.has(agent) || leaderToolInstalling.has(agent)) return;
@@ -869,9 +877,12 @@ const plugin = {
       const agents = live.get("agents");
       const parent = agent.parent ?? agent.parentAgent
         ?? agents?.list().find((candidate) => agents.isOwnedBy?.(agent.id, candidate));
-      // 角色判定顺序：本次派遣的队列计划 > 持久化角色文件 > 标题自愈 > 父会话状态推导。
+      // 角色判定顺序：本次派遣的队列计划 > 持久化角色文件 > 标题自愈 > 身份事实兜底。
       // 前两者是修复 v1.3.58 测绘路由漂移的根治面：任何重载后都先回到 spawn 时的角色。
-      const derivedRole = scoutIdIn(readStateFile(sessionIdOf(parent?.session), stateDir)) ? "executor" : "scout";
+      // 兜底只问「本子代理是不是父会话登记的那只测绘」，不按可达性推导——旧设计会把执行
+      // 派遣兜成测绘（本笔修的就是这个转换）。
+      const recordedScout = scoutIdIn(readStateFile(sessionIdOf(parent?.session), stateDir));
+      const derivedRole = recordedScout !== void 0 && recordedScout === agent.id ? "scout" : "executor";
       const role = readChildRole(stateDir, agent.session)
         ?? roleFromTitle(live.get("sessionTitle"), agent.session)
         ?? derivedRole;
@@ -919,7 +930,7 @@ const plugin = {
       return next();
     });
 
-    // 领导续接测绘失败=该测绘不可达（第二事实源）：解除常驻，下一笔派遣自动接替。
+    // 领导续接测绘失败=该测绘不可达（第二事实源）：解除常驻，重派测绘要带测绘前缀。
     ctx.on("tools/result", (exec, result) => {
       if (!exec || !result?.isError || exec.name !== "send_message") return;
       const failure = sendMessageFailure(result);
@@ -928,7 +939,7 @@ const plugin = {
       if (!failure || !sessionId || !scoutId) return;
       if (markScoutUnreachable(sessionId, scoutId, failure, stateDir)) {
         monitorEvent(dshHome, { kind: "scout-unreachable", session: sessionId, child: scoutId, reason: failure });
-        process.stderr.write(`caseos-dispatch-gate: 测绘 ${scoutId} send_message 失败（${failure}），下次派遣自动接替\n`);
+        process.stderr.write(`caseos-dispatch-gate: 测绘 ${scoutId} send_message 失败（${failure}），已标不可达\n`);
       }
     });
 
@@ -983,16 +994,33 @@ const plugin = {
       const state = sessionState(session);
       if (!state.specRead) return deny(denyReason);
       const sessionId = sessionIdOf(session);
-      // 可达性决定下一笔派遣的角色：没有可达测绘时这一笔就是测绘（description 只是标签），
-      // 不受地图前置/新鲜度/任务书/并发约束——建图与调研正是它要做的事。
       const activeScout = reachableScoutId(sessionId, stateDir);
-      if (!activeScout) return undefined;
-      // 有可达测绘时再派测绘才拒绝，判据是可达性与运行期角色，不看 description 前缀。
-      // 应询结束显示 finished/inactive 属正常：send_message 会冷恢复它。
+      // 角色由领导写在 description 里的前缀定：测绘前缀 = 测绘派遣，其余 = 执行派遣。可达性
+      // 只决定能不能派，不再改变角色——旧设计在没有可达测绘时把执行派遣偷换成测绘，已废除。
       if (isScoutDescription(description)) {
+        // 有可达测绘时再派测绘才拒绝（应询结束显示 finished/inactive 属正常：send_message
+        // 会冷恢复它）。测绘派遣不受地图前置/新鲜度/任务书/并发约束——建图与调研正是它要
+        // 做的事；上一任已不可达时放行，按接替派遣处理。
+        if (!activeScout) return undefined;
         return deny(
           `测绘 ${activeScout} 仍可达（应询结束显示 finished/inactive 属正常），用 send_message ${activeScout} 续接；`
-          + "只有它真的不可达（end 非 completed，或 send_message 报 unavailable）时才重派，插件会自动接替并注入地图。",
+          + "只有它真的不可达（end 非 completed，或 send_message 报 unavailable）时才重派：description 用「测绘智能体」或「scout:」开头，插件会按测绘派遣注入职责与地图。",
+        );
+      }
+      // 执行派遣没有可达测绘：拒绝并指路，绝不把本笔派遣悄悄改写成测绘（新规则
+      // scout-missing）。CASEOS_SCOUT=0 关闭测绘架构时不做这条判定。
+      if (!activeScout && process.env.CASEOS_SCOUT !== "0") {
+        const scoutState = readStateFile(sessionId, stateDir);
+        const previous = scoutIdIn(scoutState);
+        const situation = previous
+          ? `本会话没有可达测绘：上一任 ${previous} ${scoutState.scoutUnreachable || "已不可用"}`
+          : "本会话没有可达测绘（还没有派过测绘）";
+        return deny(
+          `${situation}，执行派遣不会被改写成测绘，已拒绝。三条路：`
+          + `① 上一任测绘只是应询结束（finished/inactive 属正常）时，用 send_message ${previous ?? "<测绘 id>"} 续接；`
+          + "② 上一任已不可达或从没有过，就用 subagent 派一只测绘：description 以「测绘智能体」或「scout:」开头，插件会注入测绘职责与仓库地图；"
+          + "③ 仓库尚无地图或地图过期时，先让测绘建图/增量校对，你用 write 落盘 .project-map.md 登记基准后再派执行者。",
+          "scout-missing",
         );
       }
       // 以下只约束执行派遣：调研交给常驻测绘，执行任务书只写改哪里、改成什么、怎么验证。
@@ -1000,8 +1028,11 @@ const plugin = {
         const term = briefLintTerm(prompt);
         if (term) {
           process.stderr.write(`caseos-dispatch-gate: 任务书调研措辞拦截（${term}）\n`);
+          const scoutHint = activeScout
+            ? `send_message ${activeScout}`
+            : "本会话没有可达测绘，先派一只测绘";
           return deny(
-            `任务书含调研型措辞『${term}』：调研交给常驻测绘（send_message ${activeScout}），`
+            `任务书含调研型措辞『${term}』：调研交给常驻测绘（${scoutHint}），`
             + "把它查实的事实写进任务书；执行任务书只写改哪里、改成什么、怎么验证",
             "brief-lint",
           );

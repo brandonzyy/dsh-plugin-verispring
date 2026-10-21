@@ -18,7 +18,7 @@ const LEADER_ALLOW = new Set([
 // 同层二次注册会抛错），这里导出文案供其复用；本文件只瘦身其余派遣工具。
 export const SLIM_DESC = {
   subagent:
-    "派遣执行类工作；任务书须自足。本会话首笔派遣由运行时定为测绘智能体，其后为执行智能体；渠道、模型、思考强度按角色取面板配置，调用里写的无效。默认后台运行，返回子代理 id，结束后有通知；运行中可 send_message 纠偏。",
+    "派遣执行类工作；任务书须自足。是不是测绘由 description 前缀决定（「测绘智能体」或「scout:」开头）；没有可达测绘时派执行者会被拒。渠道、模型、思考强度按角色取面板配置，调用里写的无效。默认后台运行，返回子代理 id，结束后有通知；运行中可 send_message 纠偏。",
   send_message: "向运行中的子代理发消息：纠偏、补充约束或追加任务。",
   interrupt_agent: "让某个子代理停止当前工作。",
   list_agents: "列出你启动的子代理及其状态。",
@@ -71,7 +71,7 @@ const plugin = {
     const scoutClause =
       process.env.CASEOS_SCOUT === "0"
         ? ""
-        : "常驻测绘智能体：派执行任务前，先确保有一个只读智能体常驻（它被硬禁改码）；它的 description 以“测绘智能体”或“scout:”开头均可，识别以运行时角色为准。测绘应询结束显示 finished/inactive 是正常的，send_message 即可续接；测绘不可达时直接重派，插件会自动接替并注入地图。产出=入口表 ≤20 行，由你用 write 落盘为仓库根 .project-map.md；仓库已有该文件时测绘智能体只做增量校对。执行任务书的定位与事实先 send_message 问它（执行者也可用 ask_scout 直接问）。";
+        : "常驻测绘智能体：派执行任务前，先确保有一个只读智能体常驻（它被硬禁改码）；是不是测绘由 description 前缀决定——“测绘智能体”或“scout:”开头派测绘，其余一律是执行派遣，没有可达测绘时派执行者会被拒。测绘应询结束显示 finished/inactive 是正常的，send_message 即可续接；测绘不可达时直接重派（description 照旧带测绘前缀），插件会按测绘派遣注入职责与地图。产出=入口表 ≤20 行，由你用 write 落盘为仓库根 .project-map.md；仓库已有该文件时测绘智能体只做增量校对。执行任务书的定位与事实先 send_message 问它（执行者也可用 ask_scout 直接问）。";
     ctx.systemPrompt.section({
       name: "caseos:leader-dispatch",
       order: ctx.systemPrompt.getSectionOrder("TOOL_SUBAGENT"),

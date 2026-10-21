@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 // 派遣门禁行为测试：纯 node、无依赖，mock ctx 只提供 apply() 实际用到的服务面。
-// 核心不变量「常驻=可达」：可达测绘重复派遣被拒；end 非 completed 或 send_message 报
-// NOT_RESUMABLE 之后重派自动接替为测绘并注入地图；监控只在启动成功后记 start。
+// 核心不变量「测绘身份由 description 前缀决定，可达性只决定能不能派」：没有可达测绘时执行
+// 派遣被拒并记 scout-missing，绝不偷换成测绘；测绘前缀的派遣总是按测绘启动、注入职责与
+// 地图；可达测绘重复派遣被拒；end 非 completed 或 send_message 报 NOT_RESUMABLE 后旧测绘
+// 记不可达，重派测绘在任务书与回执里带接替事实。监控只在启动成功后记 start。
 // 第二组不变量（执行派遣的代码级门禁）：调研型任务书拦截、地图基准登记与新鲜度、
 // 执行子代理并发上限、回执保留 started subagent 前缀并附路由。
 import assert from "node:assert/strict";
@@ -277,26 +279,37 @@ test("测绘 end=completed 仍算可达，不解除常驻", () => {
   assert.match(harness.guard({ description: "scout: 再建一次", prompt: "x" }), /scout-A 仍可达/);
 });
 
-test("测绘 end=error 后重派自动接替为测绘并注入地图全文", async () => {
+test("测绘 end=error 后执行派遣被拒，明示测绘前缀的接替派遣注入地图全文", async () => {
   const harness = makeHarness();
   harness.primeScout("scout-A");
 
   harness.emit("subagent/end", { id: "scout-A", provider: "spawn", stopReason: "error", error: { message: "模型超时" } });
   assert.equal(harness.scoutState().scoutUnreachable, "end=error");
-  // 修订文案已经不带 touch 解锁：description 随便写，可达性说了算。
-  assert.equal(harness.guard({ description: "随便写什么都行", prompt: "增量校对" }), void 0);
 
-  const result = await harness.dispatch({ description: "随便写什么都行", prompt: "增量校对" });
+  // 执行派遣不会被偷换成测绘：直接拒绝，文案给出续接、重派与建图三条路，并点名上一任。
+  const reason = harness.guard({ description: "随便写什么都行", prompt: "增量校对" });
+  assert.equal(typeof reason, "string");
+  assert.match(reason, /没有可达测绘/);
+  assert.match(reason, /scout-A end=error/);
+  assert.match(reason, /send_message scout-A/);
+  assert.match(reason, /「测绘智能体」或「scout:」开头/);
+  assert.match(reason, /地图/);
+  assert.equal(harness.monitor().find((line) => line.kind === "dispatch-deny").rule, "scout-missing");
+
+  // 领导明确标注测绘前缀：按测绘启动，任务书前置职责说明 + 接替事实 + 地图全文。
+  const result = await harness.dispatch({ description: "测绘智能体：增量校对", prompt: "增量校对" });
 
   assert.equal(harness.calls.activation.length, 1);
   const spec = harness.calls.activation[0];
   assert.match(spec.label, / · scout · /);
   const prompt = spec.request.prompt[0].text;
   assert.match(prompt, /【实际路由：scout/);
-  assert.match(prompt, /【测绘接替】上任测绘 scout-A end=error/);
+  assert.match(prompt, /【测绘智能体】/);
+  assert.match(prompt, /上任测绘 scout-A 已不可达（end=error）/);
   assert.match(prompt, /仓库已有地图/);
   assert.ok(prompt.includes("gates/dispatch-gate.js: 派遣门禁"), "地图全文应注入任务书");
   assert.match(prompt, /只做增量校对/);
+  assert.doesNotMatch(prompt, /自动接替|自动定为/);
 
   // 新测绘接任常驻：scoutId 换人，失联标记清空，路由按活上下文落到子代理。
   assert.equal(harness.scoutState().scoutId, result.subagentId);
@@ -308,7 +321,7 @@ test("测绘 end=error 后重派自动接替为测绘并注入地图全文", asy
   assert.ok(harness.calls.rename.some(([, title]) => title.includes(" · scout · ")), "子代理标题应写实际路由");
 });
 
-test("send_message 报 NOT_RESUMABLE 后解除常驻，下一笔派遣可为测绘", async () => {
+test("send_message 报 NOT_RESUMABLE 后旧测绘记不可达，执行派遣被拒、测绘前缀可重派", async () => {
   const harness = makeHarness();
   harness.primeScout("scout-A");
 
@@ -319,6 +332,7 @@ test("send_message 报 NOT_RESUMABLE 后解除常驻，下一笔派遣可为测�
   assert.equal(harness.scoutState().scoutUnreachable, "NOT_RESUMABLE");
   assert.ok(harness.monitor().some((line) => line.kind === "scout-unreachable" && line.child === "scout-A"));
 
+  assert.match(harness.guard({ description: "改代码", prompt: "把 a 改成 b" }), /scout-A NOT_RESUMABLE/);
   assert.equal(harness.guard({ description: "scout: 重派", prompt: "x" }), void 0);
   await harness.dispatch({ description: "scout: 重派", prompt: "x" });
   assert.equal(harness.calls.activation.length, 1);
@@ -446,22 +460,98 @@ test("活 ctx 也失活时给出明确拒绝文案并留失败记录", async () 
   assert.match(failed[0].error, /inactive context/);
 });
 
-test("无地图且无可达测绘时放行测绘（首笔派测绘不受地图门禁拦截）", async () => {
+test("无地图且无可达测绘时，明示测绘前缀的派遣放行（地图门禁不拦测绘）", async () => {
   const harness = makeHarness({ map: false });
+
+  // 执行派遣被拒的理由是没有测绘（scout-missing），不是地图。
+  assert.match(harness.guard({ description: "改代码", prompt: "x" }), /没有可达测绘/);
 
   assert.equal(harness.guard({ description: "测绘智能体：建图", prompt: "x" }), void 0);
   const result = await harness.dispatch({ description: "测绘智能体：建图", prompt: "建图" });
   assert.ok(result.subagentId);
-  assert.match(harness.calls.activation[0].request.prompt[0].text, /【实际路由：scout/);
+  const prompt = harness.calls.activation[0].request.prompt[0].text;
+  assert.match(prompt, /【实际路由：scout/);
+  assert.match(prompt, /【测绘智能体】/);
+  assert.doesNotMatch(prompt, /仓库已有地图/, "没有地图时不注入地图段");
+
+  // 测绘已在常驻：同一份执行任务书改由地图前置门禁拦（缺地图）。
+  assert.match(harness.guard({ description: "改代码", prompt: "x" }), /必须先有项目地图/);
 });
 
-test("无地图派执行者被地图门禁拦下", () => {
+test("有可达测绘但无地图时，执行派遣被地图门禁拦下", () => {
   const harness = makeHarness({ map: false });
   harness.primeScout("scout-A");
 
   const reason = harness.guard({ description: "改代码", prompt: "x" });
   assert.equal(typeof reason, "string");
   assert.match(reason, /\.project-map\.md/);
+  assert.match(reason, /先派测绘智能体/);
+});
+
+test("无可达测绘时执行派遣被拒（scout-missing，文案指路续接/重派/建图）", () => {
+  const harness = makeHarness();
+
+  const reason = harness.guard({ description: "改代码", prompt: "把 a 改成 b" });
+  assert.equal(typeof reason, "string");
+  assert.match(reason, /本会话没有可达测绘（还没有派过测绘），执行派遣不会被改写成测绘/);
+  assert.match(reason, /send_message <测绘 id> 续接/);
+  assert.match(reason, /「测绘智能体」或「scout:」开头/);
+  assert.match(reason, /地图/);
+
+  const line = harness.monitor().find((entry) => entry.kind === "dispatch-deny");
+  assert.ok(line, "拒绝必须落 dispatch-deny");
+  assert.equal(line.rule, "scout-missing");
+  assert.equal(line.tool, "subagent");
+  assert.equal(harness.scoutState(), void 0, "被拒的派遣不得写 scout 字段");
+});
+
+test("测绘前缀的派遣按测绘启动：注册 scoutId，注入职责与地图全文", async () => {
+  const harness = makeHarness();
+
+  assert.equal(harness.guard({ description: "scout: 建图", prompt: "建图" }), void 0);
+  const result = await harness.dispatch({ description: "scout: 建图", prompt: "建图" });
+
+  const spec = harness.calls.activation[0];
+  assert.match(spec.label, / · scout · /);
+  const prompt = spec.request.prompt[0].text;
+  assert.match(prompt, /【实际路由：scout/);
+  assert.match(prompt, /【测绘智能体】/);
+  assert.match(prompt, /只做定位、事实与建图/);
+  assert.match(prompt, /只读：不要 edit\/write/);
+  assert.match(prompt, /仓库已有地图/);
+  assert.ok(prompt.includes("gates/dispatch-gate.js: 派遣门禁"), "地图全文应注入任务书");
+  assert.doesNotMatch(prompt, /自动接替|自动定为/);
+
+  assert.equal(harness.scoutState().scoutId, result.subagentId);
+  assert.equal(harness.monitor().find((line) => line.kind === "subagent-start").role, "scout");
+  const receipt = harness.receipt(result);
+  assert.ok(receipt.startsWith(`started subagent ${result.subagentId}`));
+  assert.match(receipt, /角色：scout/);
+  assert.doesNotMatch(receipt, /已接替不可达测绘/, "首任测绘没有接替事实");
+});
+
+test("执行派遣不写、不改会话的 scout 字段", async () => {
+  const harness = makeHarness();
+  harness.primeScout("scout-A");
+  await harness.dispatch({ description: "改代码", prompt: "把 a 改成 b" });
+  assert.equal(harness.scoutState().scoutId, "scout-A");
+  assert.equal(harness.scoutState().scoutUnreachable, void 0);
+  assert.match(harness.calls.activation[0].label, / · executor · /);
+
+  // 没有测绘时直接调用执行入口（绕过 guard）也不会把子代理记成测绘。
+  const blank = makeHarness();
+  const result = await blank.dispatch({ description: "改代码", prompt: "把 a 改成 b" });
+  assert.match(blank.calls.activation[0].label, / · executor · /);
+  assert.match(blank.calls.activation[0].request.prompt[0].text, /【实际路由：executor/);
+  assert.equal(blank.scoutState(), void 0);
+  assert.equal(result.role, "executor");
+});
+
+test("CASEOS_SCOUT=0 关闭测绘架构时没有测绘也放行执行派遣", async () => {
+  await withEnv({ CASEOS_SCOUT: "0" }, async () => {
+    const harness = makeHarness();
+    assert.equal(harness.guard({ description: "改代码", prompt: "把 a 改成 b" }), void 0);
+  });
 });
 
 test("测绘身份按状态目录隔离：别的 profile 的同名 id 不会互相污染", async () => {
@@ -557,13 +647,17 @@ test("调研措辞带否定前缀时豁免（「不要通读实现」「禁止�
   assert.equal(harness.monitor().filter((entry) => entry.kind === "dispatch-deny" && entry.rule === "brief-lint").length, 2);
 });
 
-test("测绘派遣含调研措辞仍放行（首笔与接替都不受第 1、3 条约束）", async () => {
+test("测绘派遣含调研措辞仍放行（第 1、3 条只约束执行派遣）", async () => {
   const harness = makeHarness();
-  assert.equal(harness.guard({ description: "随便写", prompt: "先调研整个仓库并回报入口表" }), void 0);
+  const args = { description: "测绘智能体：全库巡检", prompt: "先调研整个仓库并回报入口表" };
+  assert.equal(harness.guard(args), void 0);
 
-  const first = await harness.dispatch({ description: "随便写", prompt: "先调研整个仓库并回报入口表" });
+  const first = await harness.dispatch(args);
   assert.ok(first.subagentId);
   assert.match(harness.calls.activation[0].label, / · scout · /);
+
+  // 测绘已在常驻：同一任务书写给执行者仍被调研措辞拦（规则只对执行派遣生效）。
+  assert.match(harness.guard({ description: "改代码", prompt: "先调研一下现状" }), /调研型措辞/);
 });
 
 test("CASEOS_BRIEF_LINT=0 关闭调研措辞拦截", async () => {
@@ -695,7 +789,7 @@ test("派遣回执保留 started subagent 前缀并附路由与角色，测绘�
   harness.primeScout("scout-A");
   harness.emit("subagent/end", { id: "scout-A", provider: "spawn", stopReason: "error" });
 
-  const takeover = await harness.dispatch({ description: "随便写", prompt: "增量校对" });
+  const takeover = await harness.dispatch({ description: "测绘智能体：增量校对", prompt: "增量校对" });
   const takeoverText = harness.receipt(takeover);
   assert.ok(takeoverText.startsWith(`started subagent ${takeover.subagentId}`), `前缀必须原样保留：${takeoverText}`);
   assert.match(takeoverText, /（路由：verispring-ds\/deepseek-flash@high · 角色：scout）/);
