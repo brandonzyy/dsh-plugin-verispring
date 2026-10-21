@@ -23,6 +23,9 @@
         api: anthropic-messages
         baseURL: https://api.verispring.cn
         reasoning: high
+        # 网关 STREAMING_TIMEOUT=300s 与 pi-ai 默认看门狗同为 300s，叠一起容易误杀长流。
+        # 调到 600s（网关侧同步放到 900s），让看门狗只兜真正挂死的流。
+        streamIdleTimeoutMs: 600000
         models:
           - id: claude-opus-5-5
             name: Claude Opus 5.5
@@ -36,6 +39,10 @@
               high: high
               xhigh: xhigh
               max: max
+          # 过渡保留：新派遣已切到 verispring-ds（llm-deepseek）；本条目仅让在途会话跑完。
+          # 待「无会话或子代理在 verispring/deepseek-flash 上运行」后执行
+          # /tmp/dsh-align-phase2.sh 删除本条目。注意 DSH 的默认模型在会话启动时定型，
+          # 删除后仍在跑的旧会话会 UNKNOWN_MODEL（已实测），所以必须等它们收尾。
           - id: deepseek-flash
             name: DeepSeek Flash
             contextWindow: 1000000
@@ -202,7 +209,8 @@
               maxDepth: 1
               agentPreset: verispring-subagent
               agentOptions:
-                provider: verispring
+                # 新派遣走 llm-deepseek 版；在途子代理启动时已钉住旧路由，不受影响。
+                provider: verispring-ds
                 model: deepseek-flash
                 reasoningEffort: high
           - id: tool-subagent-fork
@@ -458,3 +466,41 @@
     # 配置面板：Config schema 提供宿主表单服务；client 组合包页渲染并把模型位落盘到执法面
     - id: verispring-config
       name: './gates/verispring-config.js'
+
+# ---- D4：Verispring 的 deepseek-flash 改走 llm-deepseek（与官方同一适配器）----
+# provider id 用 verispring-ds（displayName「Verispring DeepSeek」），与 pi-ai 的 verispring
+# 并存：pi-ai 那条只服务在途会话与 claude-opus-5-5，llm-deepseek 这条服务新派遣。
+# id 冲突由本插件的 deepseek-gateway 解决（复用 registerDeepSeekProvider——该函数把 provider id
+# 当参数，硬编码只存在于 dsh-llm-deepseek-api-key:37）。
+# 本条目只放在插件组合包里：desktop 与 verispring 两个 profile 都 bundle 它，profile patch
+# 再 insert 一次会同 id 冲突。
+- insert:
+    - id: verispring-deepseek
+      name: 'dsh-plugin-verispring/deepseek-gateway'
+      config:
+        provider: verispring-ds
+        displayName: Verispring DeepSeek
+        apiKeyEnv: VERISPRING_API_KEY
+        baseURL: https://api.verispring.cn
+        thinking: enabled
+        streamIdleTimeoutMs: 600000
+        maxTokens: 256000
+        # 网关 anthropic 出口在「thinking 开 + 短回复」时会重复发一条 message_start
+        # （service/convert.go:336 用 SendResponseCount==1 当首块判据，短流命中两次）。
+        # llm-deepseek 判 MALFORMED_RESPONSE 直接失败（pi-ai 只更新 usage，所以以前没暴露）。
+        # 本开关只丢弃该端点的重复 message_start 帧，其余逐帧透传。网关修复上线并复测后删除。
+        dedupeDuplicateMessageStart: true
+        retryPolicy:
+          mode: normal
+          maxRetries: 4
+          retryableCodes: [TRANSPORT, SERVER, TIMEOUT, RATE_LIMIT, EMPTY_RESPONSE]
+        # 网关 /v1/files 未实现（401）：小图自动回退内联 base64（实测 200）；
+        # 外置阈值保持默认 20MB，不要让大图走到外置路径。
+        models:
+          - id: deepseek-flash
+            name: deepseek-flash
+            contextWindow: 1000000
+            maxTokens: 256000
+            inputModalities: [text, image]
+            systemPromptUpdate: in-history
+            toolUpdate: addition-only
