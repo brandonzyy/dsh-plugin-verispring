@@ -54,7 +54,17 @@ function makeHarness(options = {}) {
     },
   };
 
-  const services = { agents: { get: (id) => agentsMap.get(id), list: () => [...agentsMap.values()] }, subagents };
+  const getCalls = new Map();
+  const services = {
+    agents: {
+      get: (id) => {
+        getCalls.set(id, (getCalls.get(id) ?? 0) + 1);
+        return agentsMap.get(id);
+      },
+      list: () => [...agentsMap.values()],
+    },
+    subagents,
+  };
   // systemPrompt 段落：收集注入文案，按 scope 现算（与 leader-scope 同写法）。
   const sections = new Map();
 
@@ -106,10 +116,16 @@ function makeHarness(options = {}) {
     leaderId,
     sent,
     childAgent,
+    removeAgent: (childId) => agentsMap.delete(childId),
+    getCalls: (childId) => getCalls.get(childId) ?? 0,
     tools: () => registeredTools,
     tool: () => registeredTools.get("ask_scout"),
     emit: async (name, payload) => {
       await Promise.all((listeners.get(name) ?? []).map((callback) => callback(payload)));
+    },
+    /** 测绘会话事件：宿主按 (session, event) 派发，等待循环据此按 marker 取答案。 */
+    emitSession: async (session, event) => {
+      await Promise.all((listeners.get("session/event") ?? []).map((callback) => callback(session, event)));
     },
     /** 领导 send_message 的原调用：返回 pre-execute 决定；upstream 模拟其它门禁的决定 */
     sendMessage: async (targetId, message, caller = leader, upstream = { kind: "allow" }) => {
@@ -143,6 +159,37 @@ const assistantEvent = (text) => ({
   type: "assistant/message",
   data: { message: { content: [{ type: "text", text }] } },
 });
+const turnEndEvent = () => ({ type: "turn/end", data: { turn: 1, reason: { kind: "completed" } } });
+// 计时器记账替身：转发生成真实计时器，只额外记录创建数与未清除数。用来断言等待循环
+// 每轮都由真实计时器让出、结算后不残留（不改变插件看到的计时器语义）。
+function instrumentTimers() {
+  const realSetTimeout = globalThis.setTimeout;
+  const realClearTimeout = globalThis.clearTimeout;
+  const pending = new Set();
+  let created = 0;
+  globalThis.setTimeout = (callback, ms, ...args) => {
+    created += 1;
+    const handle = realSetTimeout(() => {
+      pending.delete(handle);
+      callback(...args);
+    }, ms);
+    pending.add(handle);
+    return handle;
+  };
+  globalThis.clearTimeout = (handle) => {
+    pending.delete(handle);
+    realClearTimeout(handle);
+  };
+  return {
+    created: () => created,
+    pending: () => pending.size,
+    restore: () => {
+      globalThis.setTimeout = realSetTimeout;
+      globalThis.clearTimeout = realClearTimeout;
+    },
+  };
+}
+
 const toolCallEvent = (name, path) => ({
   type: "tool/call",
   data: { name, arguments: JSON.stringify({ path }) },
@@ -219,6 +266,110 @@ test("测绘未在时限内答复时返回超时文案", async () => {
   assert.match(rendered, /已转交测绘 scout-A/);
   assert.match(rendered, /未在时限内答复/);
   assert.equal(harness.monitor().find((entry) => entry.kind === "ask-scout").result, "timeout");
+});
+
+test("测绘在首轮轮询前离场时等待循环不空转，按时限结束且不残留计时器", async () => {
+  const harness = makeHarness({ timeoutMs: 80 });
+  harness.primeScout("scout-A");
+  // 不把 scout-A 放进 agents：模拟 subagent/end 后宿主已把它摘出注册表。
+  const executor = harness.childAgent("exec-1");
+  const timers = instrumentTimers();
+  let value;
+  try {
+    value = await harness.tool().execute({ question: "入口在哪" }, { agent: executor, signal: new AbortController().signal });
+  } finally {
+    timers.restore();
+  }
+
+  assert.equal(value.status, "timeout");
+  // 80ms 时限 / 250ms 计时器间隔：快照轮询只允许首轮加尾轮，绝不能按微任务次数增长。
+  assert.ok(harness.getCalls("scout-A") <= 3, `轮询次数应有界，实际 ${harness.getCalls("scout-A")}`);
+  assert.ok(timers.created() <= 3, `每轮只挂一个计时器，实际创建 ${timers.created()}`);
+  assert.equal(timers.pending(), 0, "结算后不得残留计时器");
+  assert.equal(harness.monitor().find((entry) => entry.kind === "ask-scout").result, "timeout");
+});
+
+test("测绘答完即结算离场时仍按会话事件返回正确答案", async () => {
+  const hooks = {};
+  const harness = makeHarness({
+    timeoutMs: 2000,
+    sendMessage: async (info) => {
+      await hooks.onSend?.(info);
+    },
+  });
+  harness.primeScout("scout-A");
+  const scout = harness.childAgent("scout-A", harness.leaderId, []);
+  const executor = harness.childAgent("exec-1");
+  let asked = "";
+  hooks.onSend = ({ content }) => {
+    asked = content.map((block) => block.text ?? "").join("");
+    // 先让等待循环进入计时器等待，再由事件把答案送达；测绘随后结算离场，
+    // 它的内存快照自始至终是空数组，答案只可能来自会话事件。
+    setImmediate(() => {
+      void (async () => {
+        await harness.emitSession(scout.session, userEvent(asked));
+        await harness.emitSession(scout.session, assistantEvent("入口在 gates/dispatch-gate.js:346"));
+        await harness.emitSession(scout.session, turnEndEvent());
+        harness.removeAgent("scout-A");
+      })();
+    });
+  };
+  const timers = instrumentTimers();
+  let value;
+  try {
+    value = await harness.tool().execute({ question: "入口在哪" }, { agent: executor, signal: new AbortController().signal });
+  } finally {
+    timers.restore();
+  }
+
+  assert.equal(value.status, "answered");
+  assert.equal(value.scoutId, "scout-A");
+  assert.equal(value.answer, "入口在 gates/dispatch-gate.js:346");
+  assert.ok(harness.getCalls("scout-A") <= 2, `首轮之后就由事件送达，实际轮询 ${harness.getCalls("scout-A")}`);
+  assert.equal(timers.pending(), 0, "事件送达后计时器必须清除");
+  assert.match(asked, /【执行者 exec-1 经 ask_scout 提问/);
+  assert.equal(harness.monitor().find((entry) => entry.kind === "ask-scout").result, "answered");
+});
+
+test("测绘结算只带最终输出（没有 turn/end）时也能送达答案", async () => {
+  const hooks = {};
+  const harness = makeHarness({
+    timeoutMs: 2000,
+    sendMessage: async (info) => {
+      await hooks.onSend?.(info);
+    },
+  });
+  harness.primeScout("scout-A");
+  const scout = harness.childAgent("scout-A", harness.leaderId, []);
+  const executor = harness.childAgent("exec-1");
+  hooks.onSend = ({ content }) => {
+    const asked = content.map((block) => block.text ?? "").join("");
+    setImmediate(() => {
+      void (async () => {
+        await harness.emitSession(scout.session, userEvent(asked));
+        // 答完即离场：没有 turn/end，最终输出只在 subagent/end 的 lastAssistantMessage 里。
+        harness.removeAgent("scout-A");
+        await harness.emit("subagent/end", {
+          id: "scout-A",
+          provider: "spawn",
+          stopReason: "completed",
+          lastAssistantMessage: [{ type: "text", text: "入口在 gates/dispatch-gate.js:346" }],
+        });
+      })();
+    });
+  };
+  const timers = instrumentTimers();
+  let value;
+  try {
+    value = await harness.tool().execute({ question: "入口在哪" }, { agent: executor, signal: new AbortController().signal });
+  } finally {
+    timers.restore();
+  }
+
+  assert.equal(value.status, "answered");
+  assert.equal(value.answer, "入口在 gates/dispatch-gate.js:346");
+  assert.equal(timers.pending(), 0, "结算送达后计时器必须清除");
+  assert.equal(harness.monitor().find((entry) => entry.kind === "ask-scout").result, "answered");
 });
 
 test("收尾含非「无」的结构增量段时自动转交测绘", async () => {

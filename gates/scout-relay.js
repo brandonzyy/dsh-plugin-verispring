@@ -20,8 +20,9 @@ import { monitorEvent } from "./monitor-log.js";
 const TOOL_NAME = "ask_scout";
 const ASK_TIMEOUT_ENV = "CASEOS_ASK_SCOUT_TIMEOUT_MS";
 const DEFAULT_ASK_TIMEOUT_MS = 600000;
-// 等测绘答复时的最短轮询间隔：whenIdle 立即 resolve 时也要退让，否则变成忙等。
-const MIN_POLL_MS = 150;
+// 等待测绘答复的计时器间隔（≥250ms）：会话事件缺失时按此节奏重查内存快照；每一轮都必须
+// 先由这个计时器让出宏任务，禁止用「已 resolve 的 Promise」让循环原地空转。
+const POLL_MS = 250;
 const CHECKPOINT_TEXT_LIMIT = 4000;
 const RELAY_ENV = "CASEOS_SCOUT_RELAY";
 // 无可达测绘时的统一拒绝文案：执行者据此把问题写进汇报，由领导处理。
@@ -159,6 +160,102 @@ function answerAfterMarker(events, marker) {
   return answer;
 }
 
+// ---- ask_scout 等待者：答案由测绘会话事件直接送达 --------------------------
+// 测绘答完就可能结算离场（subagent/end 后宿主把它摘出 agents），此后内存快照取不到答案。
+// 等待者在模块层登记、按 marker 关联：测绘会话的 user/message 命中 marker 时武装，
+// 取该轮最后一条非空 assistant 正文，在 turn/end（或测绘结算的 subagent/end 携带的
+// 最终输出）时送达。每次等待结束由 askScout 的 finally 摘除，状态不会跨请求积压。
+const scoutWaiters = new Map();
+
+function openScoutWaiter(scoutId, marker) {
+  const waiter = {
+    marker,
+    candidate: void 0,
+    answer: void 0,
+    armed: false,
+    closed: false,
+    listeners: new Set(),
+  };
+  const waiters = scoutWaiters.get(scoutId) ?? new Set();
+  waiters.add(waiter);
+  scoutWaiters.set(scoutId, waiters);
+  return waiter;
+}
+
+function closeScoutWaiter(scoutId, waiter) {
+  waiter.closed = true;
+  waiter.listeners.clear();
+  const waiters = scoutWaiters.get(scoutId);
+  if (waiters === void 0) return;
+  waiters.delete(waiter);
+  if (waiters.size === 0) scoutWaiters.delete(scoutId);
+}
+
+function deliverScoutAnswer(waiter, answer) {
+  if (waiter.closed || waiter.answer !== void 0) return;
+  if (typeof answer !== "string" || answer === "") return;
+  waiter.answer = answer;
+  for (const listener of [...waiter.listeners]) listener(answer);
+  waiter.listeners.clear();
+}
+
+// 一轮答完才送达：assistant/message 可能只是「我先查一下」这类中间步骤，turn/end 时的
+// 最后一条正文才是这一问的答复。
+function observeScoutSession(session, event) {
+  const scoutId = session?.header?.id;
+  const waiters = typeof scoutId === "string" ? scoutWaiters.get(scoutId) : void 0;
+  if (waiters === void 0) return;
+  if (event?.type === "user/message") {
+    const text = eventText(event);
+    for (const waiter of waiters) {
+      if (!text.includes(waiter.marker)) continue;
+      // 其它 user/message（运行上下文快照、别人的问题）不解除武装：marker 一旦出现，
+      // 其后的 assistant 正文都可能是这一问的答复（与 answerAfterMarker 同判据）。
+      waiter.armed = true;
+      waiter.candidate = void 0;
+    }
+    return;
+  }
+  if (event?.type === "assistant/message") {
+    const text = eventText(event).trim();
+    if (!text) return;
+    for (const waiter of waiters) if (waiter.armed) waiter.candidate = text;
+    return;
+  }
+  if (event?.type !== "turn/end") return;
+  for (const waiter of [...waiters]) {
+    if (waiter.armed) deliverScoutAnswer(waiter, waiter.candidate);
+  }
+}
+
+// 测绘结算：宿主在 subagent/end 里带上最后一条非空 assistant 输出
+// （dsh-subagent/lib/types/lifecycle.js:55-58）。测绘答完立即离场时，这是快照取不到答案的兜底。
+function settleScoutWaiters(info) {
+  const waiters = scoutWaiters.get(info?.id);
+  if (waiters === void 0) return;
+  const final = blocksText(info?.lastAssistantMessage).trim();
+  for (const waiter of [...waiters]) deliverScoutAnswer(waiter, waiter.candidate ?? final);
+}
+
+// 一次等待：计时器是唯一能回到循环顶部的路径；事件先到则提前 resolve，计时器随即清除。
+// 等待者只保留本轮监听器，超时分支自行摘除——长时间等待不会堆积回调或宿主计时器。
+function waitForScoutAnswer(waiter, ms) {
+  if (waiter.answer !== void 0) return Promise.resolve(waiter.answer);
+  return new Promise((resolve) => {
+    let timer;
+    const onAnswer = (answer) => {
+      clearTimeout(timer);
+      waiter.listeners.delete(onAnswer);
+      resolve(answer);
+    };
+    waiter.listeners.add(onAnswer);
+    timer = setTimeout(() => {
+      waiter.listeners.delete(onAnswer);
+      resolve(void 0);
+    }, ms);
+  });
+}
+
 // 改过的文件：tool/call 里 name ∈ {edit, write} 的参数。宿主把 arguments 落成 JSON
 // 字符串（SessionEventMap['tool/call']），模型面也有对象形态，两种都吃。
 function callArguments(data) {
@@ -279,7 +376,6 @@ export default {
     };
     const agentsOf = (agent) => serviceOf(agent, "agents");
     const subagentsOf = (agent) => serviceOf(agent, "subagents");
-    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
     const askTimeoutMs = () => {
       const configured = Number(process.env[ASK_TIMEOUT_ENV]);
       return Number.isFinite(configured) && configured > 0 ? configured : DEFAULT_ASK_TIMEOUT_MS;
@@ -352,47 +448,61 @@ export default {
       const marker = `【执行者 ${childId} 经 ask_scout 提问`;
       const text = `${marker}，请只答事实，带 路径:行号】${question}`;
       const signal = exec?.signal ?? NO_SIGNAL;
+      // 先登记等待者再代发：测绘可能在 sendMessage 返回前就答完（甚至结算离场），
+      // 事件监听必须已经挂上，答案才不会漏。
+      const waiter = openScoutWaiter(scoutId, marker);
       try {
-        await subagents.sendMessage(leader, scoutId, [{ type: "text", text }], { signal });
-      } catch (error) {
-        throw fail(`send-failed:${String(error?.message ?? error).slice(0, 120)}`);
-      }
-
-      const deadline = Date.now() + askTimeoutMs();
-      let interval = 250;
-      for (;;) {
-        const scout = agentsOf(exec.agent)?.get?.(scoutId);
-        const answer = answerAfterMarker(snapshotOf(scout), marker);
-        if (answer !== void 0) {
-          monitorEvent(dshHome, {
-            kind: "ask-scout",
-            child: childId,
-            scout: scoutId,
-            question: question.slice(0, 200),
-            elapsedMs: Date.now() - startedAt,
-            result: "answered",
-          });
-          return { status: "answered", scoutId, answer };
+        try {
+          await subagents.sendMessage(leader, scoutId, [{ type: "text", text }], { signal });
+        } catch (error) {
+          throw fail(`send-failed:${String(error?.message ?? error).slice(0, 120)}`);
         }
-        const remaining = deadline - Date.now();
-        if (remaining <= 0) break;
-        // 测绘冷恢复后才出现在 agents 里：每轮重取。whenIdle 让出这一回合；它可能已
-        // resolve（测绘当时是 idle），所以再垫一个最短轮询间隔，避免无节制空转。
-        const idle = typeof scout?.whenIdle === "function"
-          ? scout.whenIdle().then(() => sleep(MIN_POLL_MS))
-          : Promise.resolve();
-        await Promise.race([idle, sleep(Math.min(remaining, interval))]);
-        interval = Math.min(interval * 2, 2000);
+
+        const deadline = Date.now() + askTimeoutMs();
+        for (;;) {
+          const scout = agentsOf(exec.agent)?.get?.(scoutId);
+          const answer = answerAfterMarker(snapshotOf(scout), marker);
+          if (answer !== void 0) {
+            monitorEvent(dshHome, {
+              kind: "ask-scout",
+              child: childId,
+              scout: scoutId,
+              question: question.slice(0, 200),
+              elapsedMs: Date.now() - startedAt,
+              result: "answered",
+            });
+            return { status: "answered", scoutId, answer };
+          }
+          const remaining = deadline - Date.now();
+          if (remaining <= 0) break;
+          // 每一轮都必须由真实计时器让出宏任务：waitForScoutAnswer 的 await 只有两种结局
+          // ——计时器先触发（回到循环顶部），或等待者带着答案返回。测绘不在内存时事件仍
+          // 能送达（session/event / subagent/end），所以不得再 race 一个即时的 Promise。
+          const delivered = await waitForScoutAnswer(waiter, Math.min(remaining, POLL_MS));
+          if (delivered !== void 0) {
+            monitorEvent(dshHome, {
+              kind: "ask-scout",
+              child: childId,
+              scout: scoutId,
+              question: question.slice(0, 200),
+              elapsedMs: Date.now() - startedAt,
+              result: "answered",
+            });
+            return { status: "answered", scoutId, answer: delivered };
+          }
+        }
+        monitorEvent(dshHome, {
+          kind: "ask-scout",
+          child: childId,
+          scout: scoutId,
+          question: question.slice(0, 200),
+          elapsedMs: Date.now() - startedAt,
+          result: "timeout",
+        });
+        return { status: "timeout", scoutId, answer: "" };
+      } finally {
+        closeScoutWaiter(scoutId, waiter);
       }
-      monitorEvent(dshHome, {
-        kind: "ask-scout",
-        child: childId,
-        scout: scoutId,
-        question: question.slice(0, 200),
-        elapsedMs: Date.now() - startedAt,
-        result: "timeout",
-      });
-      return { status: "timeout", scoutId, answer: "" };
     };
 
     const askTool = {
@@ -552,6 +662,8 @@ export default {
     };
 
     ctx.root.on("subagent/end", async (info) => {
+      // 测绘的最终输出随 end 到达：先给在等的 ask_scout 送达答案，再走收尾事实。
+      settleScoutWaiters(info);
       try {
         await onSubagentEnd(info);
       } catch (error) {
@@ -559,6 +671,20 @@ export default {
           kind: "scout-relay-error",
           child: info?.id,
           stage: "subagent-end",
+          error: String(error?.message ?? error).slice(0, 200),
+        });
+      }
+    });
+
+    // 测绘答复按会话事件到达：即使它答完即结算离场（已不在 agents 里），答案也已经
+    // 按 marker 关联到等待者，不依赖内存快照。
+    ctx.root.on("session/event", (session, event) => {
+      try {
+        observeScoutSession(session, event);
+      } catch (error) {
+        monitorEvent(dshHome, {
+          kind: "scout-relay-error",
+          stage: "session-event",
           error: String(error?.message ?? error).slice(0, 200),
         });
       }
