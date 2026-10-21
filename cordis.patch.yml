@@ -39,19 +39,6 @@
               high: high
               xhigh: xhigh
               max: max
-          # 过渡保留：新派遣已切到 verispring-ds（llm-deepseek）；本条目仅让在途会话跑完。
-          # 待「无会话或子代理在 verispring/deepseek-flash 上运行」后执行
-          # /tmp/dsh-align-phase2.sh 删除本条目。注意 DSH 的默认模型在会话启动时定型，
-          # 删除后仍在跑的旧会话会 UNKNOWN_MODEL（已实测），所以必须等它们收尾。
-          - id: deepseek-flash
-            name: DeepSeek Flash
-            contextWindow: 1000000
-            maxTokens: 384000
-            reasoningEfforts:
-              'off': null
-              low: low
-              high: high
-              max: max
 - id: llm-deepseek
   name: '@deepseek-ai/dsh-llm-deepseek-api-key'
   config:
