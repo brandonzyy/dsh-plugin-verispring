@@ -38,10 +38,13 @@ Verispring three-role session architecture plus a bundled local knowledge graph 
 | `CASEOS_READ_GUARD_ALLOW` | empty | comma-separated path prefixes the read guard always allows (`~` expanded, directory-boundary matching) |
 | `CASEOS_MEM_SOFT_BYTES` | ceiling × 60% | soft heap threshold: best-effort release of idle subagents + pruning of the plugin's own indexes (2.4GiB on a 4GiB ceiling) |
 | `CASEOS_MEM_HARD_BYTES` | ceiling × 80% | hard heap threshold: idle-state `mem-guard-skip` + restart prompt, never an exit (3.2GiB on a 4GiB ceiling) |
+| `CASEOS_EVICT` | on | `0` disables the idle-session evictor at assembly time (no `agents.resume` wrapper, no interval, no events) |
+| `CASEOS_EVICT_SCAN_MS` | `60000` | idle-session scan interval |
+| `CASEOS_EVICT_IDLE_MS` | `600000` | how long a session must be idle before eviction; under heap pressure (≥ ceiling × 50%) the bar drops to 2 minutes |
 
 ### Monitor events
 
-`kind` values in `~/.dsh/verispring-monitor.jsonl`: `subagent-start` / `subagent-start-failed` / `subagent-end` / `subagent-error` (lifecycle + role + route), `child-route-updated`, `role-route-mismatch`, `scout-unreachable`, `scout-tools-restricted` (scout child id; its `edit`/`write` were restricted on `agent/created`), `dispatch-deny` (with `rule`: `scout-missing`, `brief-lint`, `map-baseline-missing`, `map-stale`, `executor-cap`), `gate-deny` (dispatch spec / resident-scout / missing-map denials, plus codestyle and manon), `leader-guard-deny` (with `rule`: `sleep-in-loop`, `sleep-long`, `sleep-background`, `list-agents-repeat`), `leader-write-hint` (with `rule`: `write-whitelist`, `git-mutation`, `package-mutation`, `in-place-edit`, `recursive-remove`, `workspace-redirect` — non-blocking leader write hints), `ask-scout`, `structure-forward`, `checkpoint-saved` / `checkpoint-save-failed` / `checkpoint-injected` / `checkpoint-inject-failed`, `scout-relay-error`, `mem-guard-boot` (activation self-report: `heapLimitBytes`, `nodeArgv`, `pid`, `softBytes`, `hardBytes`, `thresholdsSource`, `checkMs`, `readGuard`, `readGuardMaxBytes`), `mem-guard-drain` / `mem-guard-recycle` / `mem-guard-skip` (heap watchdog: `heapUsed`, `released`, `reason`), `mem-guard-read-deny` (whole-file read guard: `tool`, `session`, `path`, `size`).
+`kind` values in `~/.dsh/verispring-monitor.jsonl`: `subagent-start` / `subagent-start-failed` / `subagent-end` / `subagent-error` (lifecycle + role + route), `child-route-updated`, `role-route-mismatch`, `scout-unreachable`, `scout-tools-restricted` (scout child id; its `edit`/`write` were restricted on `agent/created`), `dispatch-deny` (with `rule`: `scout-missing`, `brief-lint`, `map-baseline-missing`, `map-stale`, `executor-cap`), `gate-deny` (dispatch spec / resident-scout / missing-map denials, plus codestyle and manon), `leader-guard-deny` (with `rule`: `sleep-in-loop`, `sleep-long`, `sleep-background`, `list-agents-repeat`), `leader-write-hint` (with `rule`: `write-whitelist`, `git-mutation`, `package-mutation`, `in-place-edit`, `recursive-remove`, `workspace-redirect` — non-blocking leader write hints), `ask-scout`, `structure-forward`, `checkpoint-saved` / `checkpoint-save-failed` / `checkpoint-injected` / `checkpoint-inject-failed`, `scout-relay-error`, `mem-guard-boot` (activation self-report: `heapLimitBytes`, `nodeArgv`, `pid`, `softBytes`, `hardBytes`, `thresholdsSource`, `checkMs`, `readGuard`, `readGuardMaxBytes`), `mem-guard-drain` / `mem-guard-recycle` / `mem-guard-skip` (heap watchdog: `heapUsed`, `released`, `reason`), `mem-guard-read-deny` (whole-file read guard: `tool`, `session`, `path`, `size`), `mem-guard-sample` (a 5-minute `heapUsed` / `rss` / `heapLimitBytes` growth curve), `mem-guard-soft` (soft-threshold heartbeat, rate-limited to 5 minutes), `mem-guard-evict-boot` (evictor self-report: `scanMs`, `idleMs`, `tracked`, `untracked`), `mem-guard-evict` (successful eviction: `session`, `idleMs`, `heapUsedBefore`, `pressure`, `observationEvicted`, `coldLogEvicted`), `mem-guard-evict-fail` (`error` truncated to 200 chars, `retryAfterMs`), `mem-guard-evict-skip` (`reason`: `follower-unknown`, `scan-failed`).
 
 
 ## Memory guard
@@ -75,6 +78,12 @@ tool result via `tools/post-execute` — one huge result can jump the heap betwe
   relative paths without a resolvable session cwd, and any parse ambiguity (redirections, command
   substitution, unbalanced quotes) are allowed — the guard only fires when it is certain. Root
   context listeners receive every agent's calls, so subagent sessions are covered as well.
+- **Visibility** — even below the soft threshold a `mem-guard-sample` lands every 5 minutes
+  (`heapUsed` / `rss` / `heapLimitBytes`), so the growth curve is visible before the cliff; a soft
+  crossing records `mem-guard-soft` at the same 5-minute cadence whether or not there is anything
+  to reclaim. If a check itself hangs on a host-teardown await for longer than
+  `max(2×checkMs, 60s)`, it records `mem-guard-skip` (`reason: "check-stuck"`) and clears
+  `checking`, so later ticks are not silenced forever.
 - **Hard threshold** — only in the idle state (no running subagent and no tool activity for 90s) it
   records `mem-guard-skip` and prints a restart prompt on stderr. It does **not** exit the host:
   `main.js` treats any host close — exit 0 included — as a failed stop and never respawns the child
@@ -84,6 +93,52 @@ tool result via `tools/post-execute` — one huge result can jump the heap betwe
 
 Kill switch: `CASEOS_MEM_GUARD=0` (no interval, no listeners, no boot line — the read guard is part of
 this gate, so it goes too; `CASEOS_READ_GUARD=0` turns off only the read guard).
+
+## Idle-session evictor (session-evictor)
+
+The memory guard only releases subagent activations; **the parent sessions the UI opened** stay
+resident forever. The promote chain in session-controller drops the `dispose` from the
+`{ agent, dispose }` returned by `ctx.agents.resume()` (`dsh-api-session-controller/lib/index.js:
+396-403`), while the resume owner is the long-lived controller scope (`dsh-agent/lib/index.js:
+466-470`) — so every followed session (including the many subagent sessions in caseos workflows)
+lives until the host exits.
+
+`gates/session-evictor.js` wraps `AgentRegistry.prototype.resume` at activation. `ctx.agents` is a
+cordis traceable proxy: every method access re-reads `resume` from the prototype chain
+(`cordis/lib/index.js:84-157`, `:675`, `:686`, `:763-764`), so session-controller's
+`this.ctx.agents.resume` necessarily passes through the wrapper. The wrapper only records the
+handle on the side and returns it unchanged. After eviction, `resolve()` sees no live agent in its
+first line, so the next access promotes again and is captured again — no host change required.
+Sessions promoted before activation cannot be tracked; they are reported in
+`mem-guard-evict-boot.untracked` and otherwise left alone.
+
+**Eviction criteria** (all must hold):
+
+- not a subagent session (those activations belong to the `subagents` manager and are released by
+  the memory guard's `drainChildren`);
+- `agent.status === "idle"` and the durable inbox has no pending input;
+- no live child agent (idle residents included: disposing the parent would tear down child scopes,
+  so the host's own drain goes first);
+- no in-flight `resume` / `claim`;
+- no UI follow stream: `sessionController.history.follow` is wrapped to track active followers per
+  session id; follows from before the wrapper existed cannot be attributed and conservatively block
+  every eviction while they are open;
+- at least `CASEOS_EVICT_IDLE_MS` since the last `session/event`, `agent/status` or tool call.
+
+**What eviction frees**: `handle.dispose()` stops the loop, awaits idle, unwinds the scope, closes
+the persistence handle and finally `detachAgent` / `detachSession`
+(`dsh-agent-loop/lib/index.js:1740-1810`), so the SessionStore (`dsh-session:1886-1893`) and
+AgentRegistry (`dsh-agent:544`) entries disappear. The evictor also deletes the target's
+`sessionQuery._observations.cache` entry when `refs === 0` (the cold-observation cache holds up to
+5 sessions, `dsh-session-query/lib/index.js:327-341`); the persistence `coldLogMemo` (at most 2
+entries) is pruned by session id as rebuildable cache; the session-controller assistant-stream
+cache is dropped by its own `agent/disposed` listener. An evicted session that the UI reopens or that receives
+a new message cold-resumes through the normal promote path, so nothing is lost.
+
+**Heap pressure**: at `heapUsed ≥ ceiling × 50%` the idle bar drops to 2 minutes and candidates are
+evicted oldest-first. A failed dispose (including a 60s timeout) records `mem-guard-evict-fail` and
+backs that session off for 30 minutes; success records `mem-guard-evict` with `heapUsedBefore`.
+Kill switch: `CASEOS_EVICT=0`.
 
 ### Heap ceiling: 4GB is a V8 build limit — launch flags cannot move it (measured)
 

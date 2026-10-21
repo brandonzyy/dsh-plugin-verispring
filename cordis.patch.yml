@@ -6,7 +6,7 @@
 # Agent Preset；dispatch-gate 与 tool-subagent 均显式指定该 preset。
 # 本组合包一个 patch 文件做两件事：
 #   1) 子代理工具默认路由使用执行智能体配置（continuable 后台、maxDepth 1 不派孙代理）；
-#   2) insert 代码级门禁插件（gates/ 目录，含 host 内存看门狗）。
+#   2) insert 代码级门禁插件（gates/ 目录，含 host 内存看门狗与空闲会话卸载器）。
 # 代码级兜底在 dispatch-gate：即便调用显式指定其它 provider/model 也会被忽略，路由按
 # 角色从面板配置（verispring.json）强制注入。两个 preset 的 tool-subagent 都关闭
 # modelSelectionSettings：开启时 subagent 工具注册进每个 agent 自己的层，dispatch-gate 的
@@ -455,6 +455,10 @@
     # 告警（main.js 对 host 子进程任何 exit 都算失败停止，不会自动重启）。CASEOS_MEM_GUARD=0 关闭。
     - id: caseos-memory-guard
       name: './gates/memory-guard.js'
+    # 空闲会话卸载器：包装 agents.resume 捕获 promote 丢掉的 handle，空闲且无 follower/活子代/
+    # pending 输入时 dispose()，让 Session.log 真正释放；CASEOS_EVICT=0 关闭，阈值见 README。
+    - id: caseos-session-evictor
+      name: './gates/session-evictor.js'
     # 配置面板：Config schema 提供宿主表单服务；client 组合包页渲染并把模型位落盘到执法面
     - id: verispring-config
       name: './gates/verispring-config.js'

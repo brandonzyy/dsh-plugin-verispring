@@ -26,9 +26,14 @@
 // CASEOS_MEM_SOFT_BYTES / CASEOS_MEM_HARD_BYTES 默认按 V8 顶棚比例（60% / 80%，4GiB 顶棚即
 // 2.4GiB / 3.2GiB）；显式设置时按 env 覆盖。drain/recycle 共享 5 分钟冷却；硬阈值不参与冷却
 // （只告警，不改状态）。采样在 subagent/end 与 tools/post-execute 之后各即时补一次。
+// 观测面：每 5 分钟一条 mem-guard-sample（不管阈值的增长曲线）；软阈值越线每 5 分钟一条
+// mem-guard-soft（无论有没有可回收目标）。检查自身若卡在 await 上（drainChildren 等宿主释放
+// 不返回），超过 max(2×checkMs, 60s) 记 skip=check-stuck 并把 checking 置回，避免之后所有
+// 定时器 tick 都在 checking 守卫处静默 return——上一轮 56 分钟零事件、直到 4.0GiB OOM 的
+// 唯一静默路径就是这里。
 // 动作落 monitor：kind = mem-guard-boot（激活自报：heapLimitBytes / nodeArgv / pid /
-// thresholdsSource / checkMs / readGuard）/ mem-guard-drain / mem-guard-recycle /
-// mem-guard-skip / mem-guard-read-deny。
+// thresholdsSource / checkMs / readGuard）/ mem-guard-sample / mem-guard-soft / mem-guard-drain /
+// mem-guard-recycle / mem-guard-skip / mem-guard-read-deny。
 import fs from "node:fs";
 import { homedir } from "node:os";
 import { basename, isAbsolute, resolve } from "node:path";
@@ -53,6 +58,7 @@ const FALLBACK_HEAP_LIMIT_BYTES = 4 * GIB;
 const SOFT_RATIO = 0.6;
 const HARD_RATIO = 0.8;
 const COOLDOWN_MS = 5 * 60 * 1000;
+const SAMPLE_MS = 5 * 60 * 1000;
 const IDLE_MS = 90 * 1000;
 // 宿主 workingDirectory.ensure 要求 AbortSignal；调用没带 signal 时给一个永不触发的。
 const NO_SIGNAL = new AbortController().signal;
@@ -465,6 +471,12 @@ export default {
     let lastActionAt = 0;
     // 一次回收可能跨多个采样周期（drainChildren 等宿主释放完成），定时器与即时检查不得叠加。
     let checking = false;
+    // 卡死自愈与观测节流：sample 是增长曲线，soft 是越线心跳，二者都按 5 分钟一条。
+    const stuckMs = Math.max(checkMs * 2, 60 * 1000);
+    let checkStartedAt = 0;
+    let checkToken = 0;
+    let lastSampleAt = 0;
+    let lastSoftReportAt = 0;
 
     // 已排队待跑的输入（宿主 durable inbox 投影）：这样的空闲子代理还有活要干，不能当「已完成」。
     // inbox 属 agent-loop 的内部面，取不到就按「有活」保守处理，只放确认清空的。
@@ -541,13 +553,56 @@ export default {
     };
 
     const runCheck = async () => {
-      if (checking) return;
-      checking = true;
+      const now = Date.now();
+      let heapUsed;
       try {
-        const heapUsed = process.memoryUsage().heapUsed;
-        const now = Date.now();
+        const usage = process.memoryUsage();
+        heapUsed = usage.heapUsed;
+        // 先落 sample 再看 checking：即使回收卡在 await 上，增长曲线也不会整段消失。
+        if (now - lastSampleAt >= SAMPLE_MS) {
+          lastSampleAt = now;
+          monitorEvent(dshHome, {
+            kind: "mem-guard-sample",
+            heapUsed,
+            rss: usage.rss,
+            heapTotal: usage.heapTotal,
+            external: usage.external,
+            arrayBuffers: usage.arrayBuffers,
+            heapLimitBytes: limit,
+          });
+        }
+      } catch (error) {
+        monitorEvent(dshHome, { kind: "mem-guard-skip", reason: "check-failed", error: String(error?.message ?? error).slice(0, 200) });
+        return;
+      }
+      if (checking) {
+        const stuckFor = now - checkStartedAt;
+        if (stuckFor < stuckMs) return;
+        // 回收 await 不返回时不能永远占着 checking：否则之后每次 tick 都在这里静默 return。
+        monitorEvent(dshHome, { kind: "mem-guard-skip", reason: "check-stuck", stuckMs: stuckFor, heapUsed });
+        checkToken += 1;
+        checking = false;
+      }
+      const token = ++checkToken;
+      checking = true;
+      checkStartedAt = now;
+      try {
         const decision = memoryDecision({ heapUsed, softBytes, hardBytes, busy: isBusy(now), lastActionAt, now });
         if (decision.kind === "below") return;
+        if (decision.kind === "soft" || decision.kind === "cooldown") {
+          // 越软阈值就留一条心跳；无论有没有可回收目标、是否在冷却，5 分钟限流一条。
+          if (now - lastSoftReportAt >= SAMPLE_MS) {
+            lastSoftReportAt = now;
+            monitorEvent(dshHome, {
+              kind: "mem-guard-soft",
+              reason: "soft-threshold",
+              decision: decision.kind,
+              heapUsed,
+              softBytes,
+              ...(decision.kind === "cooldown" ? { remainingMs: decision.remainingMs } : {}),
+            });
+          }
+        }
         if (decision.kind === "cooldown") {
           monitorEvent(dshHome, { kind: "mem-guard-skip", reason: "cooldown", heapUsed, remainingMs: decision.remainingMs });
           return;
@@ -579,7 +634,7 @@ export default {
       } catch (error) {
         monitorEvent(dshHome, { kind: "mem-guard-skip", reason: "check-failed", error: String(error?.message ?? error).slice(0, 200) });
       } finally {
-        checking = false;
+        if (checkToken === token) checking = false;
       }
     };
 

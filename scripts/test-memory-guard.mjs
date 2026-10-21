@@ -125,10 +125,18 @@ function makeHarness(options = {}) {
     get: (id) => agentsMap.get(id),
     list: () => [...agentsMap.values()],
   };
+  // hangDrain 模拟宿主 drainChildren 的 await 迟迟不返回：用于验证 check-stuck 自愈。
+  let releaseDrain;
+  const drainGate = options.hangDrain === true
+    ? new Promise((resolve) => {
+      releaseDrain = resolve;
+    })
+    : void 0;
   // 与宿主 drainChildren 同语义：只释放同一父代理名下的常驻子代理，非常驻 id 是 no-op，
   // 父代理不匹配直接 UNAUTHORIZED。
   const subagents = {
     async drainChildren(parent, childIds) {
+      if (drainGate !== void 0) await drainGate;
       if (!parent || !parent.session) throw new Error("parent missing");
       for (const id of childIds) {
         const target = agentsMap.get(id);
@@ -215,6 +223,9 @@ function makeHarness(options = {}) {
     post: (exec, result) => harnessWaterfall("tools/post-execute", [exec, result], async () => result),
     // 即时检查是 void 调用：等一轮宏任务让它的微任务链跑完，用例因此不需要 sleep。
     flush: () => new Promise((resolve) => setImmediate(resolve)),
+    releaseDrain: () => {
+      releaseDrain?.();
+    },
     tick: async () => {
       const interval = intervals.at(-1);
       assert.ok(interval, "apply 应注册定时器");
@@ -306,14 +317,15 @@ test("阈值判定：软阈值以下不动作，软/硬阈值边界与冷却、�
   assert.equal(memoryDecision({ ...base, heapUsed: 150, busy: false, lastActionAt: 1000, now: 1000 + 5 * 60 * 1000 }).kind, "soft");
 });
 
-test("软阈值以下：tick 与 subagent/end 都不产生动作（boot 自报除外）", async () => {
+test("软阈值以下：只落 5 分钟 sample，不做回收动作（boot 自报除外）", async () => {
   const harness = makeHarness({ heapUsed: 1 * GIB });
   const leader = harness.primeAgent("leader-1");
   harness.primeAgent("child-idle", { origin: "subagent", parentSession: leader.id });
   harness.makeResident("child-idle");
   await harness.tick();
   await harness.emit("subagent/end", { id: "child-idle" });
-  assert.deepEqual(harness.actions(), [], "boot 自报不算动作");
+  const actions = harness.actions().filter((entry) => entry.kind !== "mem-guard-sample");
+  assert.deepEqual(actions, [], "boot 自报与 5 分钟 sample 不算回收动作");
   assert.deepEqual(harness.drained, []);
 });
 
@@ -644,6 +656,69 @@ test("tools/post-execute 即时检查：结果落地后不等定时器就补一�
   const line = harness.actions().find((entry) => entry.kind === "mem-guard-skip" && entry.reason === "soft-threshold-no-targets");
   assert.ok(line, "post-execute 后应立即补一次检查");
   assert.equal(line.heapUsed, 2.5 * GIB);
+});
+
+test("mem-guard-sample：阈值以下也每 5 分钟一条，带 heapUsed/rss/顶棚", async () => {
+  const harness = makeHarness({ heapUsed: 1 * GIB });
+  await harness.tick();
+  harness.advance(4 * 60 * 1000);
+  await harness.tick();
+  assert.equal(
+    harness.actions().filter((entry) => entry.kind === "mem-guard-sample").length,
+    1,
+    "不足 5 分钟不重复采样",
+  );
+
+  harness.advance(60 * 1000);
+  await harness.tick();
+  const samples = harness.actions().filter((entry) => entry.kind === "mem-guard-sample");
+  assert.equal(samples.length, 2, "满 5 分钟再落一条");
+  assert.equal(samples[1].heapUsed, 1 * GIB);
+  assert.equal(samples[1].rss, 1 * GIB);
+  assert.equal(samples[1].heapLimitBytes, 4 * GIB);
+});
+
+test("mem-guard-soft：软阈值越线 5 分钟一条，无论有没有可回收目标", async () => {
+  const harness = makeHarness({ heapUsed: 2.5 * GIB });
+  harness.primeAgent("leader-1");
+  await harness.tick();
+  harness.advance(60 * 1000);
+  await harness.tick();
+  assert.equal(
+    harness.actions().filter((entry) => entry.kind === "mem-guard-soft").length,
+    1,
+    "5 分钟内只落一条越线心跳",
+  );
+
+  harness.advance(4 * 60 * 1000);
+  await harness.tick();
+  const heartbeats = harness.actions().filter((entry) => entry.kind === "mem-guard-soft");
+  assert.equal(heartbeats.length, 2, "满 5 分钟再落一条");
+  assert.equal(heartbeats[0].reason, "soft-threshold");
+  assert.equal(heartbeats[0].softBytes, Math.floor(4 * GIB * 0.6));
+  assert.equal(typeof heartbeats[0].heapUsed, "number");
+});
+
+test("检查卡死自愈：await 不返回超过 stuck 窗口后记 check-stuck，后续 tick 不再静默", async () => {
+  const harness = makeHarness({ heapUsed: 2.5 * GIB, hangDrain: true });
+  const leader = harness.primeAgent("leader-1");
+  harness.primeAgent("child-idle", { origin: "subagent", parentSession: leader.id });
+  harness.makeResident("child-idle");
+
+  // 第一次检查卡在 drainChildren 的 await 上；不能 await 它，否则用例本身也卡住。
+  const stuckCheck = harness.tick();
+  await harness.flush();
+  assert.ok(harness.actions().some((entry) => entry.kind === "mem-guard-sample"), "卡死期间 sample 仍要落");
+
+  harness.advance(2 * 60 * 1000);
+  await harness.tick();
+  const stuck = harness.actions().find((entry) => entry.kind === "mem-guard-skip" && entry.reason === "check-stuck");
+  assert.ok(stuck, "超过 max(2×checkMs, 60s) 应记 check-stuck");
+  assert.ok(stuck.stuckMs >= 60 * 1000);
+
+  harness.releaseDrain();
+  await stuckCheck;
+  assert.deepEqual(harness.drained, ["child-idle"], "解除后原检查仍按宿主语义释放空闲子代理");
 });
 
 let failed = 0;
