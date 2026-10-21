@@ -17,9 +17,12 @@
 //   session-state 文件与会话日志里，剪掉的条目按需重建），不碰在用的条目。
 //
 // 开关与阈值（CASEOS_* 惯例）：CASEOS_MEM_GUARD=0 全关；CASEOS_MEM_CHECK_MS 默认 60000；
-// CASEOS_MEM_SOFT_BYTES 默认 2.4GiB；CASEOS_MEM_HARD_BYTES 默认 3.2GiB。
-// drain/recycle 共享 5 分钟冷却；硬阈值不参与冷却（只告警，不改状态）。
-// 动作落 monitor：kind = mem-guard-drain / mem-guard-recycle / mem-guard-skip。
+// CASEOS_MEM_SOFT_BYTES / CASEOS_MEM_HARD_BYTES 默认按 V8 顶棚比例（60% / 80%，4GiB 顶棚即
+// 2.4GiB / 3.2GiB）；显式设置时按 env 覆盖。drain/recycle 共享 5 分钟冷却；硬阈值不参与冷却
+// （只告警，不改状态）。
+// 动作落 monitor：kind = mem-guard-boot（激活自报：heapLimitBytes / nodeArgv / pid /
+// thresholdsSource）/ mem-guard-drain / mem-guard-recycle / mem-guard-skip。
+import v8 from "node:v8";
 import { homedir } from "node:os";
 import { monitorEvent } from "./monitor-log.js";
 import { releaseIdleCaches as releaseDispatchCaches } from "./dispatch-gate.js";
@@ -31,14 +34,36 @@ const SOFT_BYTES_ENV = "CASEOS_MEM_SOFT_BYTES";
 const HARD_BYTES_ENV = "CASEOS_MEM_HARD_BYTES";
 const DEFAULT_CHECK_MS = 60000;
 const GIB = 1024 ** 3;
-const DEFAULT_SOFT_BYTES = Math.round(2.4 * GIB);
-const DEFAULT_HARD_BYTES = Math.round(3.2 * GIB);
+const FALLBACK_HEAP_LIMIT_BYTES = 4 * GIB;
+const SOFT_RATIO = 0.6;
+const HARD_RATIO = 0.8;
 const COOLDOWN_MS = 5 * 60 * 1000;
 const IDLE_MS = 90 * 1000;
 
 function envNumber(name, fallback) {
   const value = Number(process.env[name]);
   return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+// 少了「显式设置」与「未设置」的区分，比例阈值就无从判断该不该让位给 env。
+function envNumberExplicit(name) {
+  const value = Number(process.env[name]);
+  return Number.isFinite(value) && value > 0 ? value : void 0;
+}
+
+// 顶棚按进程实际读数取（V8 构建上限会吃掉过大的 --max-old-space-size，见 README）；
+// 读不到时退回 4GiB，让阈值等价于旧行为而不是把看门狗整个拖垮。
+export function heapLimitBytes() {
+  try {
+    const limit = v8.getHeapStatistics().heap_size_limit;
+    if (Number.isFinite(limit) && limit > 0) return limit;
+  } catch {}
+  return FALLBACK_HEAP_LIMIT_BYTES;
+}
+
+// 比例阈值是纯函数：测试可直接核对 4GiB / 8GiB 顶棚的 60% / 80% 取值。
+export function proportionalThresholds(limit) {
+  return { softBytes: Math.floor(limit * SOFT_RATIO), hardBytes: Math.floor(limit * HARD_RATIO) };
 }
 
 // 短路顺序即处置优先级：未越软阈值不动作；越硬阈值只告警（忙闲决定 reason 与提示）；冷却
@@ -63,9 +88,26 @@ export default {
 
     const dshHome = ctx.profileContext?.home ?? process.env.DSH_HOME ?? `${homedir()}/.dsh`;
     const checkMs = envNumber(CHECK_MS_ENV, DEFAULT_CHECK_MS);
-    const softBytes = envNumber(SOFT_BYTES_ENV, DEFAULT_SOFT_BYTES);
-    const hardBytes = envNumber(HARD_BYTES_ENV, DEFAULT_HARD_BYTES);
+    const limit = heapLimitBytes();
+    const proportional = proportionalThresholds(limit);
+    const softEnv = envNumberExplicit(SOFT_BYTES_ENV);
+    const hardEnv = envNumberExplicit(HARD_BYTES_ENV);
+    const softBytes = softEnv ?? proportional.softBytes;
+    const hardBytes = hardEnv ?? proportional.hardBytes;
+    const thresholdsSource = softEnv === void 0 && hardEnv === void 0 ? "proportional" : "env";
     const root = ctx.root ?? ctx;
+
+    // 顶棚与阈值来源是后续一切实证的锚点：宿主换了堆上限（或哪天上游抬了顶）这里能直接看出来。
+    monitorEvent(dshHome, {
+      kind: "mem-guard-boot",
+      heapLimitBytes: limit,
+      softBytes,
+      hardBytes,
+      thresholdsSource,
+      checkMs,
+      pid: process.pid,
+      nodeArgv: process.execArgv,
+    });
 
     // 服务只在用时现取：面板改配置会重跑 apply，闭包里读到的旧作用域会失活。
     const service = (name) => {

@@ -33,30 +33,125 @@ Verispring 三角色会话架构 + 本地知识图谱 manon，大幅度优化主
 | `CASEOS_ASK_SCOUT_TIMEOUT_MS` | `600000` | `ask_scout` 等测绘答复的时限，超时返回超时文案 |
 | `CASEOS_MEM_GUARD` | 开 | `0` 在装配时关闭 host 内存看门狗（不装定时器、不挂监听） |
 | `CASEOS_MEM_CHECK_MS` | `60000` | host 堆内存检查间隔 |
-| `CASEOS_MEM_SOFT_BYTES` | 2.4GiB | 软阈值：尽力释放空闲子代理 + 剪本插件的只增索引 |
-| `CASEOS_MEM_HARD_BYTES` | 3.2GiB | 硬阈值：空闲态记 `mem-guard-skip` + 重启提示（绝不退出） |
+| `CASEOS_MEM_SOFT_BYTES` | 顶棚 × 60% | 软阈值：尽力释放空闲子代理 + 剪本插件的只增索引（4GiB 顶棚即 2.4GiB） |
+| `CASEOS_MEM_HARD_BYTES` | 顶棚 × 80% | 硬阈值：空闲态记 `mem-guard-skip` + 重启提示（绝不退出；4GiB 顶棚即 3.2GiB） |
 
 ### monitor 事件
 
-`~/.dsh/verispring-monitor.jsonl` 的 `kind`：`subagent-start` / `subagent-start-failed` / `subagent-end` / `subagent-error`（生命周期 + 角色 + 路由）、`child-route-updated`、`role-route-mismatch`、`scout-unreachable`、`dispatch-deny`（带 `rule`：`scout-missing`、`brief-lint`、`map-baseline-missing`、`map-stale`、`executor-cap`）、`gate-deny`（派遣规范门/测绘常驻/缺地图，以及 codestyle 与 manon 的拒绝）、`leader-guard-deny`（带 `rule`：`sleep-in-loop`、`sleep-long`、`sleep-background`、`list-agents-repeat`）、`leader-write-hint`（带 `rule`：`write-whitelist`、`git-mutation`、`package-mutation`、`in-place-edit`、`recursive-remove`、`workspace-redirect`——非阻断的领导写入提示）、`ask-scout`、`structure-forward`、`checkpoint-saved` / `checkpoint-save-failed` / `checkpoint-injected` / `checkpoint-inject-failed`、`scout-relay-error`、`mem-guard-drain` / `mem-guard-recycle` / `mem-guard-skip`（内存看门狗：`heapUsed`、释放条数 `released`、`reason`）。
+`~/.dsh/verispring-monitor.jsonl` 的 `kind`：`subagent-start` / `subagent-start-failed` / `subagent-end` / `subagent-error`（生命周期 + 角色 + 路由）、`child-route-updated`、`role-route-mismatch`、`scout-unreachable`、`dispatch-deny`（带 `rule`：`scout-missing`、`brief-lint`、`map-baseline-missing`、`map-stale`、`executor-cap`）、`gate-deny`（派遣规范门/测绘常驻/缺地图，以及 codestyle 与 manon 的拒绝）、`leader-guard-deny`（带 `rule`：`sleep-in-loop`、`sleep-long`、`sleep-background`、`list-agents-repeat`）、`leader-write-hint`（带 `rule`：`write-whitelist`、`git-mutation`、`package-mutation`、`in-place-edit`、`recursive-remove`、`workspace-redirect`——非阻断的领导写入提示）、`ask-scout`、`structure-forward`、`checkpoint-saved` / `checkpoint-save-failed` / `checkpoint-injected` / `checkpoint-inject-failed`、`scout-relay-error`、`mem-guard-boot`（激活自报：`heapLimitBytes`、`nodeArgv`、`pid`、`softBytes`、`hardBytes`、`thresholdsSource`、`checkMs`）、`mem-guard-drain` / `mem-guard-recycle` / `mem-guard-skip`（内存看门狗：`heapUsed`、释放条数 `released`、`reason`）。
 
 ## 内存看门狗（memory-guard）
 
 host 进程把点开的会话整份常驻、永不淘汰，跑久了必然 OOM。`gates/memory-guard.js` 在 host 内读
 `process.memoryUsage()`（每 `CASEOS_MEM_CHECK_MS`，默认 60s；`subagent/end` 时立即补一次）：
 
-- **软阈值（默认 heapUsed 2.4GiB，`CASEOS_MEM_SOFT_BYTES`）**——尽力回收。空闲且 durable inbox 已清
-  空的子代理（`status === "idle"`）走宿主自己的 `subagents.drainChildren(parent, childIds)` 释放
-  （之后 `send_message` 冷恢复；运行中的、还有排队输入的一律不碰），同时按活会话剪掉本插件自己的
-  只增索引。记 `mem-guard-drain` / `mem-guard-recycle`；drain 与 recycle 共享 5 分钟冷却。
-- **硬阈值（默认 heapUsed 3.2GiB，`CASEOS_MEM_HARD_BYTES`）**——只在空闲态（无运行中子代理、近 90s
-  无工具活动）记 `mem-guard-skip` 并在 stderr 提示人工重启。**不退出 host**：`main.js` 把 host 子进程
-  的任何 close（含 exit 0）都当作失败停止且不会重新 spawn，靠退出触发重启只会打断当前 desktop 后端。
-  插件也拿不到释放「常驻父会话」的 API——这正是硬阈值只能提示重启的原因。
+- **启动自报**——激活时往 `~/.dsh/verispring-monitor.jsonl` 追加一条 `mem-guard-boot`：
+  `heapLimitBytes`（`v8.getHeapStatistics().heap_size_limit`）、`nodeArgv`（`process.execArgv`）、
+  `pid`、`softBytes` / `hardBytes`、`thresholdsSource`（`proportional` / `env`）、`checkMs`。这是判断
+  「顶棚到底是多少、有没有真的变」的唯一锚点：阈值、实证读数与宿主真实堆上限都从这条线读。
+- **阈值按顶棚比例**——默认 soft = `floor(heapLimitBytes × 0.6)`、hard = `floor(heapLimitBytes × 0.8)`：
+  4GiB 顶棚即 2.4GiB / 3.2GiB（与旧版固定值同档），8GiB 顶棚自动抬到 4.8GiB / 6.4GiB。
+  `CASEOS_MEM_SOFT_BYTES` / `CASEOS_MEM_HARD_BYTES` 显式设置时按 env 覆盖（可只覆盖一侧），此时
+  `thresholdsSource: "env"`。读不到 V8 顶棚时按 4GiB 兜底，不会让看门狗整个失活。
+- **软阈值**——尽力回收。空闲且 durable inbox 已清空的子代理（`status === "idle"`）走宿主自己的
+  `subagents.drainChildren(parent, childIds)` 释放（之后 `send_message` 冷恢复；运行中的、还有排队
+  输入的一律不碰），同时按活会话剪掉本插件自己的只增索引。记 `mem-guard-drain` /
+  `mem-guard-recycle`；drain 与 recycle 共享 5 分钟冷却。
+- **硬阈值**——只在空闲态（无运行中子代理、近 90s 无工具活动）记 `mem-guard-skip` 并在 stderr
+  提示人工重启。**不退出 host**：`main.js` 把 host 子进程的任何 close（含 exit 0）都当作失败停止
+  且不会重新 spawn，靠退出触发重启只会打断当前 desktop 后端（热重启接缝见下节，插件层不可达）。
 - `mem-guard-skip` 还记录忙态、冷却跳过与回收失败，一律带 `heapUsed`（必要时 `hardBytes` /
   `released` / `reason`）。
 
-一键全关：`CASEOS_MEM_GUARD=0`。
+一键全关：`CASEOS_MEM_GUARD=0`（连 boot 自报也不落）。
+
+### 堆顶棚：4GB 是 V8 构建硬上限，启动参数抬不动（实测）
+
+v2 原本要把顶棚抬到 128GB 机器该有的水平。本机实测的结论是**抬不动**，且原因不在 DSH 的注入路径：
+
+| 实验（只读、临时进程、结束即退） | 结果 |
+|---|---|
+| `ELECTRON_RUN_AS_NODE=1 "<app>" --max-old-space-size=1024/2048/3072/4095 -e 'console.log(require("v8").getHeapStatistics().heap_size_limit)'` | 1.09 / 2.09 / 3.09 / 4.09GiB，线性跟随参数 |
+| 同上，参数取 4097 / 4352 / 4608 / 5120 / 6144 / 8192 / 12288 / 16384 / 32768 | **全部 4395630592（4.09GiB）**，old space 精确封顶 4096MiB |
+| 系统 node（26.11.1）`NODE_OPTIONS=--max-old-space-size=8192` | 8.09GiB，正常生效（对照证明参数本身没问题） |
+| 进程内 `v8.setFlagsFromString("--max-old-space-size=8192")` | 仍 4.09GiB（堆在 isolate 创建时已配置好） |
+
+原因：app 内置 Electron 44.7.0 / V8 15.2 的 `process.config.variables` 为
+`v8_enable_pointer_compression=1`、`v8_enable_sandbox=1`；指针压缩把同一进程的 V8 堆硬限在 4GB
+（Electron 官方博客 [Electron and the V8 Memory Cage](https://www.electronjs.org/zh/blog/v8-memory-cage)）。
+超过 4GB 的 `--max-old-space-size` 被 V8 静默截到 4096MiB，所以 **NODE_OPTIONS、给 spawn 加参数、
+换 node 二进制都无效**——这是构建期属性，不是运行期可调项。
+
+注入路径本身是通的（供上游修复时参考，均为只读取证）：
+- `~/.dsh/{deepseek,manon,verispring}.env` 不被宿主读取；宿主只在启动时读 `<DSH_HOME>/.env` 与
+  调用目录 `.env`（`dsh-app-boot` 的 `loadLayeredEnv`），且 `NODE_OPTIONS` 属 bootstrap-only 名单，
+  写了会被直接拒绝；即便不拒，`.env` 也是在 host 进程内加载，V8 早已完成初始化。
+- 登录 shell 里 `export NODE_OPTIONS=...` 会进 host 的 spawn env：`main.js` 读登录 shell 环境后按
+  **黑名单**只剔除 `DSH_` / `ELECTRON_` 前缀（`mergeLoginShellEnvironment`），`NODE_OPTIONS` 原样
+  透传；Electron 只在「父进程签名不是本 app」时剥离它（macOS 安全策略），而 host 的父进程就是本
+  app，不会被剥。所以这条链是通的——只是被 4GB 上限吃掉。
+
+**用户可执行的一次性验证（只读，不修改任何文件）**：
+
+```bash
+# 8192 被 V8 截到 4096MiB：输出 4395630592
+ELECTRON_RUN_AS_NODE=1 "/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSeek Harness" \
+  --max-old-space-size=8192 -e 'console.log(require("v8").getHeapStatistics().heap_size_limit)'
+
+# 对照：普通 node 同参数输出 8690597888（说明参数与命令都写对了）
+node --max-old-space-size=8192 -e 'console.log(require("v8").getHeapStatistics().heap_size_limit)'
+```
+
+App（⌘Q 后重开）每次激活都会写 `mem-guard-boot`，核对当前真实顶棚与阈值来源：
+
+```bash
+grep '"kind":"mem-guard-boot"' "${DSH_HOME:-$HOME/.dsh}/verispring-monitor.jsonl" | tail -1
+```
+
+**为什么没有「抬顶棚」指令**：在本二进制上不存在。要真正超过 4GB 只能换构建/换宿主形态（均属上游）：
+
+1. 上游用 `v8_enable_pointer_compression=false`（sandbox 需相应调整）重建 Electron——代价是内存占用
+   上升、GC 变慢，Electron 官方不建议为个别 app 这么做；
+2. 把 host 拆成多进程/多 isolate，让每组会话各有 4GB 顶棚（架构改动）；
+3. 治本仍是淘汰会话事件史（`Session.log` 只增不减）与「点开即整份常驻」的 promote 行为。
+
+**app.asar 补丁方案（最小 diff，仅供配合去指针压缩的 Electron 重建；单独打上不生效）**：
+
+```diff
+--- a/lib/main.js   DesktopHostProcess.start()
++++ b/lib/main.js
+ const child = spawn(this.node, [
++  "--max-old-space-size=8192",
+   "--expose-internals",
+```
+
+风险清单：改 `app.asar` 破坏代码签名与 asar integrity（`EnableEmbeddedAsarIntegrityValidation` 开启时
+直接拒绝启动）；每次应用更新覆盖；macOS Gatekeeper/quarantine 需重签名；非官方支持路径；且实测 V8 仍
+截到 4.09GiB，收益为零。**本仓库不修改 /Applications 下任何文件**。
+
+### 后端热重启：插件层不可达（上游 ask）
+
+理想状态是硬阈值 + 空闲时「热重启 host」：host 重新 spawn、会话从磁盘恢复，1–2 秒无感循环。取证结论
+是**没有插件可达的接缝**：
+
+- `DesktopBackendController.start()` 只有三个调用点：启动时 `reconcileBackend`（main.js:13178 →
+  :12313）、更新安装失败后的恢复（:12283）。host 任意退出（含 exit 0）→ `fail` → `errorState` →
+  `reportFatal(..., "host")`（:12254-12257）→ 原生崩溃对话框；对话框的 Restart 是 `app.relaunch()`
+  + quit（:11844-11848）——整 app 重启且必须用户点击。
+- main 的 IPC 通道表（`DESKTOP_IPC`，:6981-7008）没有 restart/reload；host 控制协议只有
+  `shutdown-complete` / `ready` / `platform-session` / `fatal` / `quit-inspection` / `update-tasks`
+  （`dsh-desktop-host/lib/index.js:252-360`）；渲染端 `client.js` 只能触达 host 的 HTTP/WS，够不到
+  Electron main。
+- 因此 v2 不实现「recycle 触发 host 重启」：硬阈值保持「monitor + stderr 提示人工重启」。
+
+**上游 ask 原文（可直接提 issue）**：
+
+> Expose a host recycle path to the plugin/renderer layer: add e.g. a `dsh-desktop:recycle-host` IPC
+> (`assertProductSender`) that runs `await backend.stop(); await backend.start(prepareHostEnvironment);
+> await navigateMain(applicationUrl);` gated on the host's idle check, so a plugin inside the host
+> (memory-guard) can request a warm backend restart when the V8 heap approaches its 4GB build limit.
+> Today `DesktopBackendController.start()` is reachable only from startup and update-recovery, and a
+> host exit only opens the fatal dialog.
 
 ## 回执制（不轮询）
 

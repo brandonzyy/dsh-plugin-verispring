@@ -33,12 +33,12 @@ Verispring three-role session architecture plus a bundled local knowledge graph 
 | `CASEOS_ASK_SCOUT_TIMEOUT_MS` | `600000` | how long `ask_scout` waits for the scout's answer before returning a timeout |
 | `CASEOS_MEM_GUARD` | on | `0` disables the host memory watchdog at assembly time (no interval, no listeners) |
 | `CASEOS_MEM_CHECK_MS` | `60000` | host heap check interval |
-| `CASEOS_MEM_SOFT_BYTES` | 2.4GiB | soft heap threshold: best-effort release of idle subagents + pruning of the plugin's own indexes |
-| `CASEOS_MEM_HARD_BYTES` | 3.2GiB | hard heap threshold: idle-state `mem-guard-skip` + restart prompt (never an exit) |
+| `CASEOS_MEM_SOFT_BYTES` | ceiling × 60% | soft heap threshold: best-effort release of idle subagents + pruning of the plugin's own indexes (2.4GiB on a 4GiB ceiling) |
+| `CASEOS_MEM_HARD_BYTES` | ceiling × 80% | hard heap threshold: idle-state `mem-guard-skip` + restart prompt, never an exit (3.2GiB on a 4GiB ceiling) |
 
 ### Monitor events
 
-`kind` values in `~/.dsh/verispring-monitor.jsonl`: `subagent-start` / `subagent-start-failed` / `subagent-end` / `subagent-error` (lifecycle + role + route), `child-route-updated`, `role-route-mismatch`, `scout-unreachable`, `dispatch-deny` (with `rule`: `scout-missing`, `brief-lint`, `map-baseline-missing`, `map-stale`, `executor-cap`), `gate-deny` (dispatch spec / resident-scout / missing-map denials, plus codestyle and manon), `leader-guard-deny` (with `rule`: `sleep-in-loop`, `sleep-long`, `sleep-background`, `list-agents-repeat`), `leader-write-hint` (with `rule`: `write-whitelist`, `git-mutation`, `package-mutation`, `in-place-edit`, `recursive-remove`, `workspace-redirect` — non-blocking leader write hints), `ask-scout`, `structure-forward`, `checkpoint-saved` / `checkpoint-save-failed` / `checkpoint-injected` / `checkpoint-inject-failed`, `scout-relay-error`, `mem-guard-drain` / `mem-guard-recycle` / `mem-guard-skip` (heap watchdog: `heapUsed`, `released`, `reason`).
+`kind` values in `~/.dsh/verispring-monitor.jsonl`: `subagent-start` / `subagent-start-failed` / `subagent-end` / `subagent-error` (lifecycle + role + route), `child-route-updated`, `role-route-mismatch`, `scout-unreachable`, `dispatch-deny` (with `rule`: `scout-missing`, `brief-lint`, `map-baseline-missing`, `map-stale`, `executor-cap`), `gate-deny` (dispatch spec / resident-scout / missing-map denials, plus codestyle and manon), `leader-guard-deny` (with `rule`: `sleep-in-loop`, `sleep-long`, `sleep-background`, `list-agents-repeat`), `leader-write-hint` (with `rule`: `write-whitelist`, `git-mutation`, `package-mutation`, `in-place-edit`, `recursive-remove`, `workspace-redirect` — non-blocking leader write hints), `ask-scout`, `structure-forward`, `checkpoint-saved` / `checkpoint-save-failed` / `checkpoint-injected` / `checkpoint-inject-failed`, `scout-relay-error`, `mem-guard-boot` (activation self-report: `heapLimitBytes`, `nodeArgv`, `pid`, `softBytes`, `hardBytes`, `thresholdsSource`, `checkMs`), `mem-guard-drain` / `mem-guard-recycle` / `mem-guard-skip` (heap watchdog: `heapUsed`, `released`, `reason`).
 
 
 ## Memory guard
@@ -47,22 +47,124 @@ The host process keeps every opened session resident and never evicts it, so a l
 eventually dies of an OOM. `gates/memory-guard.js` watches `process.memoryUsage()` from inside the
 host (every `CASEOS_MEM_CHECK_MS`, default 60s, plus immediately on `subagent/end`):
 
-- **Soft threshold (default heapUsed 2.4GiB, `CASEOS_MEM_SOFT_BYTES`)** — best-effort recovery.
-  Idle subagents (`status === "idle"`) with an empty durable inbox are released through the host's
-  own `subagents.drainChildren(parent, childIds)` (a later `send_message` cold-resumes them; running
-  children and children with queued input are never touched), and the plugin's own append-only
-  indexes are pruned of entries whose session is gone. Recorded as `mem-guard-drain` /
-  `mem-guard-recycle`; drain and recycle share a 5-minute cooldown.
-- **Hard threshold (default heapUsed 3.2GiB, `CASEOS_MEM_HARD_BYTES`)** — only in the idle state
-  (no running subagent and no tool activity for 90s) it records `mem-guard-skip` and prints a
-  restart prompt on stderr. It does **not** exit the host: `main.js` treats any host close — exit 0
-  included — as a failed stop and never respawns the child, so "exit to trigger a restart" would
-  only kill the app's backend. The resident parent session itself has no unload API from a plugin,
-  which is exactly why the restart prompt is the hard-threshold action.
+- **Boot self-report** — on activation it appends `mem-guard-boot` to `~/.dsh/verispring-monitor.jsonl`
+  with `heapLimitBytes` (`v8.getHeapStatistics().heap_size_limit`), `nodeArgv` (`process.execArgv`),
+  `pid`, `softBytes` / `hardBytes`, `thresholdsSource` (`proportional` / `env`) and `checkMs`. This is
+  the anchor for every claim about the ceiling: read the host's real heap limit here, not the RAM size.
+- **Thresholds are a fraction of the ceiling** — soft = `floor(heapLimitBytes × 0.6)`,
+  hard = `floor(heapLimitBytes × 0.8)`: 2.4GiB / 3.2GiB on a 4GiB ceiling (the old fixed band),
+  4.8GiB / 6.4GiB on an 8GiB ceiling. `CASEOS_MEM_SOFT_BYTES` / `CASEOS_MEM_HARD_BYTES` override either
+  side explicitly and set `thresholdsSource: "env"` (overriding one side leaves the other proportional).
+  When V8 statistics are unavailable the guard falls back to a 4GiB ceiling instead of going inactive.
+- **Soft threshold** — best-effort recovery. Idle subagents (`status === "idle"`) with an empty durable
+  inbox are released through the host's own `subagents.drainChildren(parent, childIds)` (a later
+  `send_message` cold-resumes them; running children and children with queued input are never touched),
+  and the plugin's own append-only indexes are pruned of entries whose session is gone. Recorded as
+  `mem-guard-drain` / `mem-guard-recycle`; drain and recycle share a 5-minute cooldown.
+- **Hard threshold** — only in the idle state (no running subagent and no tool activity for 90s) it
+  records `mem-guard-skip` and prints a restart prompt on stderr. It does **not** exit the host:
+  `main.js` treats any host close — exit 0 included — as a failed stop and never respawns the child
+  (see "Backend recycle" below for why the plugin cannot trigger one).
 - `mem-guard-skip` also records the busy case, cooldown skips and recovery failures, always with
   `heapUsed` (plus `hardBytes` / `released` / `reason` where they apply).
 
-Kill switch: `CASEOS_MEM_GUARD=0`.
+Kill switch: `CASEOS_MEM_GUARD=0` (no interval, no listeners, and no boot line).
+
+### Heap ceiling: 4GB is a V8 build limit — launch flags cannot move it (measured)
+
+v2 set out to raise the ceiling to what a 128GB machine deserves. On this machine the measured answer
+is that **the ceiling cannot be raised**, and the injection path is not the reason:
+
+| Experiment (read-only, throwaway process) | Result |
+|---|---|
+| `ELECTRON_RUN_AS_NODE=1 "<app>" --max-old-space-size=1024/2048/3072/4095 -e 'console.log(require("v8").getHeapStatistics().heap_size_limit)'` | 1.09 / 2.09 / 3.09 / 4.09GiB, tracking the flag |
+| Same with 4097 / 4352 / 4608 / 5120 / 6144 / 8192 / 12288 / 16384 / 32768 | **all 4395630592 (4.09GiB)**; old space is clamped at exactly 4096MiB |
+| System node (26.11.1) with `NODE_OPTIONS=--max-old-space-size=8192` | 8.09GiB, works — the flag itself is fine |
+| In-process `v8.setFlagsFromString("--max-old-space-size=8192")` | still 4.09GiB (the heap is configured when the isolate is created) |
+
+The app bundles Electron 44.7.0 / V8 15.2 with `v8_enable_pointer_compression=1` and
+`v8_enable_sandbox=1`; pointer compression hard-limits one process's V8 heap to 4GB (see Electron's
+[Electron and the V8 Memory Cage](https://www.electronjs.org/blog/v8-memory-cage)). Any
+`--max-old-space-size` above 4GB is silently clamped to 4096MiB, so **NODE_OPTIONS, extra spawn
+arguments and even a different node binary are all ineffective** — this is a build-time property, not
+a runtime knob.
+
+The injection path itself does work (kept here for the upstream fix):
+- `~/.dsh/{deepseek,manon,verispring}.env` is not read by the host at all; the host only loads
+  `<DSH_HOME>/.env` and the invoking directory's `.env` (`dsh-app-boot`'s `loadLayeredEnv`), and
+  `NODE_OPTIONS` is on the bootstrap-only list there, so a `.env` may not set it; even if accepted it
+  is loaded inside the host process after V8 has already been configured.
+- `export NODE_OPTIONS=...` in the login shell does reach the host's spawn environment: `main.js`
+  reads the login-shell environment and filters it by a **blocklist** of `DSH_` / `ELECTRON_` prefixes
+  only (`mergeLoginShellEnvironment`), so `NODE_OPTIONS` passes through. Electron only strips it when
+  the parent process signature is not the app itself (macOS hardening); the host's parent *is* the app,
+  so it is kept. The chain is live — it is just eaten by the 4GB cap.
+
+**One-shot user verification (read-only, touches no files):**
+
+```bash
+# outputs 4395630592: 8192 is clamped to 4096MiB
+ELECTRON_RUN_AS_NODE=1 "/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSeek Harness" \
+  --max-old-space-size=8192 -e 'console.log(require("v8").getHeapStatistics().heap_size_limit)'
+
+# control: plain node prints 8690597888, so the command and flag are right
+node --max-old-space-size=8192 -e 'console.log(require("v8").getHeapStatistics().heap_size_limit)'
+```
+
+Every activation writes `mem-guard-boot`, so after a ⌘Q + relaunch you can check the real ceiling:
+
+```bash
+grep '"kind":"mem-guard-boot"' "${DSH_HOME:-$HOME/.dsh}/verispring-monitor.jsonl" | tail -1
+```
+
+**Why there is no "raise the ceiling" command:** because this binary cannot do it. Exceeding 4GB
+requires an upstream/host-shape change: (1) rebuild Electron with `v8_enable_pointer_compression=false`
+(adjusting the sandbox; Electron discourages it for memory/GC reasons); (2) shard the host into
+multiple processes/isolates so each session group gets its own 4GB ceiling; or (3) fix the actual
+retention — the append-only `Session.log` and the promote-on-open behavior — rather than the ceiling.
+
+**app.asar patch (minimal diff; only useful together with a pointer-compression-free Electron build,
+ineffective on its own):**
+
+```diff
+--- a/lib/main.js   DesktopHostProcess.start()
++++ b/lib/main.js
+ const child = spawn(this.node, [
++  "--max-old-space-size=8192",
+   "--expose-internals",
+```
+
+Risks: editing `app.asar` breaks the code signature and asar integrity (`EnableEmbeddedAsarIntegrityValidation`
+refuses to start when it is on); every app update overwrites it; macOS Gatekeeper/quarantine needs a
+re-sign; it is unsupported; and the measured V8 clamp still yields 4.09GiB, so the benefit is zero.
+**This repository modifies nothing under /Applications.**
+
+### Backend recycle: not reachable from a plugin (upstream ask)
+
+The ideal would be a hard-threshold, idle-state "host recycle": respawn the host, restore sessions from
+disk, and turn heap reclamation into a 1–2s invisible loop. The evidence says **no plugin-reachable seam
+exists**:
+
+- `DesktopBackendController.start()` has exactly three call sites: `reconcileBackend` at startup
+  (main.js:13178 → :12313) and the update-install-failure recovery (:12283). Any host exit (exit 0
+  included) → `fail` → `errorState` → `reportFatal(..., "host")` (:12254-12257) → native crash dialog;
+  the dialog's Restart button is `app.relaunch()` + quit (:11844-11848): a whole-app restart, and a
+  user click is required.
+- The main-process IPC table (`DESKTOP_IPC`, :6981-7008) has no restart/reload channel; the host
+  control protocol only carries `shutdown-complete` / `ready` / `platform-session` / `fatal` /
+  `quit-inspection` / `update-tasks` (`dsh-desktop-host/lib/index.js:252-360`); the renderer
+  (`client.js`) only reaches the host's HTTP/WS, not Electron main.
+- v2 therefore does not implement recycle-triggered host restart; the hard threshold stays
+  "monitor + stderr restart prompt".
+
+**Upstream ask (ready to file):**
+
+> Expose a host recycle path to the plugin/renderer layer: add e.g. a `dsh-desktop:recycle-host` IPC
+> (`assertProductSender`) that runs `await backend.stop(); await backend.start(prepareHostEnvironment);
+> await navigateMain(applicationUrl);` gated on the host's idle check, so a plugin inside the host
+> (memory-guard) can request a warm backend restart when the V8 heap approaches its 4GB build limit.
+> Today `DesktopBackendController.start()` is reachable only from startup and update-recovery, and a
+> host exit only opens the fatal dialog.
 
 ## Receipts instead of polling
 
