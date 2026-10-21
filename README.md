@@ -43,7 +43,7 @@ Verispring three-role session architecture plus a bundled local knowledge graph 
 
 ### Monitor events
 
-`kind` values in `~/.dsh/verispring-monitor.jsonl`: `subagent-start` / `subagent-start-failed` / `subagent-end` / `subagent-error` (lifecycle + role + route), `child-route-updated`, `role-route-mismatch`, `scout-unreachable`, `scout-tools-restricted` (scout child id; its `edit`/`write` were restricted on `agent/created`), `dispatch-deny` (with `rule`: `scout-missing`, `brief-lint`, `map-baseline-missing`, `map-stale`, `executor-cap`), `gate-deny` (dispatch spec / resident-scout / missing-map denials, plus codestyle and manon), `leader-guard-deny` (with `rule`: `sleep-in-loop`, `sleep-long`, `sleep-background`, `list-agents-repeat`), `leader-write-hint` (with `rule`: `write-whitelist`, `git-mutation`, `package-mutation`, `in-place-edit`, `recursive-remove`, `workspace-redirect` — non-blocking leader write hints), `ask-scout`, `structure-forward`, `checkpoint-saved` / `checkpoint-save-failed` / `checkpoint-injected` / `checkpoint-inject-failed`, `scout-relay-error`, `mem-guard-boot` (activation self-report: `heapLimitBytes`, `nodeArgv`, `pid`, `softBytes`, `hardBytes`, `thresholdsSource`, `checkMs`, `readGuard`, `readGuardMaxBytes`), `mem-guard-recycle` / `mem-guard-skip` (heap watchdog: `heapUsed`, `released`, `reason`), `mem-guard-read-deny` (whole-file read guard: `tool`, `session`, `path`, `size`), `mem-guard-sample` (a 5-minute `heapUsed` / `rss` / `heapLimitBytes` growth curve), `mem-guard-soft` (soft-threshold heartbeat, rate-limited to 5 minutes), `mem-guard-release-hint` (non-blocking leader hint after a tool result while over the soft threshold: `session`, `heapUsed`, `softBytes`, `candidates`), `mem-guard-release` (leader-requested subagent release: `caller`, `child`, `mode`: `drain` / `dispose` / `noop` / `refused`, `reason`, `heapUsedBefore`, `heapUsedAfter`), `mem-guard-evict-boot` (release gate self-report: `scanMs`, `tracked`, `untracked`, `releaseTool`, `subagentProbe`), `mem-guard-evict-follow` (follow-wrapper install: `source`, `preexistingFollowers`, `elapsedMs`), `mem-guard-evict-scan` (5-minute telemetry: `tracked`, `candidates`, `resident`, `followerTotal`, `followerTracked`, `followerUntracked`, `followerProbe`, `subagentProbe`, `heapUsed`), `mem-guard-evict-skip` (`reason`: `scan-failed`).
+`kind` values in `~/.dsh/verispring-monitor.jsonl`: `subagent-start` / `subagent-start-failed` / `subagent-end` / `subagent-error` (lifecycle + role + route), `child-route-updated`, `role-route-mismatch`, `scout-unreachable`, `scout-tools-restricted` (scout child id; its `edit`/`write` were restricted on `agent/created`), `dispatch-deny` (with `rule`: `scout-missing`, `brief-lint`, `map-baseline-missing`, `map-stale`, `executor-cap`), `gate-deny` (dispatch spec / resident-scout / missing-map denials, plus codestyle and manon), `leader-guard-deny` (with `rule`: `sleep-in-loop`, `sleep-long`, `sleep-background`, `list-agents-repeat`), `leader-write-hint` (with `rule`: `write-whitelist`, `git-mutation`, `package-mutation`, `in-place-edit`, `recursive-remove`, `workspace-redirect` — non-blocking leader write hints), `ask-scout`, `structure-forward`, `checkpoint-saved` / `checkpoint-save-failed` / `checkpoint-injected` / `checkpoint-inject-failed`, `scout-relay-error`, `mem-guard-boot` (activation self-report: `heapLimitBytes`, `nodeArgv`, `pid`, `softBytes`, `hardBytes`, `thresholdsSource`, `checkMs`, `readGuard`, `readGuardMaxBytes`), `mem-guard-recycle` / `mem-guard-skip` (heap watchdog: `heapUsed`, `released`, `reason`), `mem-guard-read-deny` (whole-file read guard: `tool`, `session`, `path`, `size`), `mem-guard-sample` (a 5-minute `heapUsed` / `rss` / `heapLimitBytes` growth curve), `mem-guard-soft` (soft-threshold heartbeat, rate-limited to 5 minutes), `mem-guard-release-hint` (non-blocking leader hint after a tool result while over the soft threshold: `session`, `heapUsed`, `softBytes`, `candidates`), `mem-guard-release` (leader-requested subagent release: `caller`, `child`, `mode`: `drain` / `dispose` / `noop` / `refused`, `reason`, `heapUsedBefore`, `heapUsedAfter`), `mem-guard-evict-boot` (release gate self-report at apply time: `scanMs`, `tracked`, `untracked`, `releaseTool`, `subagentProbe`), `mem-guard-evict-tool` (final tool-registration state: `tool`, `registered`, `via`: `root` / `inject`, `elapsedMs`), `mem-guard-evict-follow` (follow-wrapper install: `source`, `preexistingFollowers`, `elapsedMs`), `mem-guard-evict-scan` (5-minute telemetry: `tracked`, `candidates`, `resident`, `followerTotal`, `followerTracked`, `followerUntracked`, `followerProbe`, `subagentProbe`, `heapUsed`), `mem-guard-evict-skip` (`reason`: `scan-failed`).
 
 
 ## Memory guard
@@ -136,6 +136,20 @@ Authorization and safety:
   active follows per session id; follows installed before the wrapper cannot be attributed and
   conservatively refuse every release while they are open (`follower-untracked`).
 
+Refusal reasons (the `reason` field in the tool result and in `mem-guard-release`):
+
+| Reason | Meaning |
+|---|---|
+| `main-session` | the target (or the caller) is a main session, not a subagent |
+| `not-descendant` | the live/persisted `parentSession` chain does not reach the caller |
+| `unknown-session` | neither a live/in-process header nor a persisted header exists for this id |
+| `header-unreadable` | a persisted header exists but could not be read within 5s, or is corrupt/unsupported |
+| `not-captured` | the agent is live, but no `dispose` handle was captured (promoted before activation) |
+| `drain-parent-not-live` | the resident target's direct parent is no longer a live agent |
+| `running`, `pending-inbox`, `operation-in-flight`, `subagent-operation-in-flight`, `live-descendant`, `followed`, `follower-untracked` | the target is not settled or not safe to release right now |
+| `not-leader` | the caller is a subagent (the tool is leader-only) |
+| `subagents-unavailable`, `still-registered`, `drain-failed: …`, `dispose-failed: …` | a host precondition disappeared or the release call failed; the target stays alive |
+
 **Release path**: if the target is still in `subagents.manager.resident`, the gate calls the host's
 `subagents.drainChildren(parent, [id])`; the host requires the **exact live direct parent**
 (`dsh-subagent/lib/index.js:1372-1383`), so when the leader is the grandparent the gate uses the
@@ -144,7 +158,13 @@ activation's own direct parent, which must still be a live agent (otherwise `dra
 grandchild. For a settled-but-loaded subagent the gate calls the captured `handle.dispose()`; a
 target that is not in memory at all returns `not-loaded` (successful no-op), while a live agent
 promoted before activation (no captured handle) is refused as `not-captured` rather than falsely
-reported as released. Every attempt records
+reported as released. Lineage for a not-in-memory target comes from its **persisted session
+header**: `ctx.get("sessionPersistence").stat(id)` reads only the first line — or only the header
+Zstandard frame, in bounded 8KB chunks (`dsh-session-persistence-jsonl/lib/index.js:2570-2601`,
+`:3352-3403`) — and never parses the event log, promotes, or calls `observeSession`. A persisted
+descendant that is not loaded is `not-loaded`; a missing header is `unknown-session`; the resolved
+parent is written back to the in-process lineage memory so repeat calls do not read the file again,
+and the ancestor walk is capped at 32 levels. Every attempt records
 `mem-guard-release` (`caller`, `child`, `mode`: `drain` / `dispose` / `noop` / `refused`, `reason`,
 `heapUsedBefore`, `heapUsedAfter`).
 
@@ -166,6 +186,11 @@ boot event means "waiting for session-controller"; the actual install is recorde
 `elapsedMs`). Every five minutes `mem-guard-evict-scan` reports `tracked`, `candidates` (finished
 subagents the leader could release right now), `resident`, `followerTotal`, `followerTracked`,
 `followerUntracked`, `followerProbe`, `subagentProbe`, `heapUsed`.
+
+Tool-registration telemetry is split on purpose: `mem-guard-evict-boot.releaseTool` is the apply-time
+snapshot (it can be `false` when the `tools` service has not provided yet), while
+`mem-guard-evict-tool` records the final state after either the root registration or the
+`ctx.inject(["tools"], …)` fallback completes (`registered`, `via`: `root` / `inject`, `elapsedMs`).
 
 When the heap crosses the soft threshold, the memory guard appends the non-blocking
 `mem-guard-release-hint` to the leader's next tool result (see above); it lists the same candidates

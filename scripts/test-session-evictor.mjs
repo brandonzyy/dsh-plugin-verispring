@@ -144,7 +144,38 @@ function makeHarness(options = {}) {
   const sessionController = { history, agents: { resumes: new Map(), claims: new Map() } };
   const observationCache = options.observationCache ?? new Map();
   const coldLogMemo = options.coldLogMemo ?? new Map();
-  const sessionQuery = { _observations: { cache: observationCache } };
+  const observeCalls = [];
+  const sessionQuery = {
+    _observations: { cache: observationCache },
+    // 释放授权不得走整份事件观察（OOM 成因）；一旦被调用即记账并失败。
+    async observeSession(sessionId) {
+      observeCalls.push(sessionId);
+      throw new Error("release 授权不得 observeSession（整份事件观察）");
+    },
+  };
+  // 持久化头的轻量替身：只回答被点名的 id，返回 {header, sizeBytes, formatStatus}。
+  // 整份日志读取入口一律记账并抛错——授权若碰它们，测试必须失败。
+  const storedHeaders = new Map();
+  const storedFailures = new Set();
+  const statCalls = [];
+  let fullLogReads = 0;
+  const rejectFullLog = () => {
+    fullLogReads += 1;
+    throw new Error("release 授权不得整份读日志");
+  };
+  const sessionPersistence = {
+    coldLogMemo,
+    async stat(sessionId) {
+      statCalls.push(sessionId);
+      if (storedFailures.has(sessionId)) throw new Error(`stored header unreadable: ${sessionId}`);
+      const spec = storedHeaders.get(sessionId);
+      if (spec === void 0) return void 0;
+      return { header: makeSession(sessionId, spec).header, sizeBytes: 4096, formatStatus: "current" };
+    },
+    requireStoredLog: rejectFullLog,
+    readStoredLog: rejectFullLog,
+    loadStoredMigration: rejectFullLog,
+  };
 
   const resident = new Map();
   const locks = { tails: new Map() };
@@ -192,6 +223,7 @@ function makeHarness(options = {}) {
   const restrictCalls = [];
   const toolsService = {
     register(definition) {
+      if (options.toolsFail === true) throw new Error("tools register unavailable");
       if (tools.has(definition.name)) throw new Error(`tool "${definition.name}" is already registered`);
       tools.set(definition.name, definition);
     },
@@ -210,11 +242,11 @@ function makeHarness(options = {}) {
     agents: registry,
     sessions: { get: (id) => sessionStore.get(id) },
     sessionQuery,
-    sessionPersistence: { coldLogMemo },
+    sessionPersistence,
     subagents,
-    tools: toolsService,
     profileContext: { home },
   };
+  if (options.toolsLate !== true) services.tools = toolsService;
   if (options.sessionControllerLate !== true) services.sessionController = sessionController;
   const listeners = new Map();
   const disposers = [];
@@ -223,7 +255,7 @@ function makeHarness(options = {}) {
     profileContext: { home },
     agents: registry,
     sessions: services.sessions,
-    tools: toolsService,
+    tools: options.toolsLate === true ? void 0 : toolsService,
     get: (name) => services[name],
     on: (name, callback) => {
       listeners.set(name, [...(listeners.get(name) ?? []), callback]);
@@ -270,10 +302,26 @@ function makeHarness(options = {}) {
         }
       }
     },
+    provideTools: async () => {
+      services.tools = toolsService;
+      await Promise.resolve();
+      for (const request of injectRequests) {
+        if (request.active && request.names.every((name) => services[name] !== void 0)) {
+          request.callback({ tools: toolsService });
+        }
+      }
+    },
     resume: async (sessionId, spec = {}) => {
       specs.set(sessionId, { ...(specs.get(sessionId) ?? {}), ...spec });
       return registry.resume({ resumeSessionId: sessionId });
     },
+    // 只落持久化头，不放进 sessions/agents：模拟重启后已结束、不在内存的子代理。
+    seedStored: (id, spec = {}) => storedHeaders.set(id, spec),
+    forgetStored: (id) => storedHeaders.delete(id),
+    failStored: (id) => storedFailures.add(id),
+    statCalls: () => [...statCalls],
+    fullLogReads: () => fullLogReads,
+    observeCalls: () => [...observeCalls],
     seedSession,
     agent: agentOf,
     dropAgent: (id) => {
@@ -314,6 +362,7 @@ function makeHarness(options = {}) {
     monitor: () => readJsonl(`${home}/verispring-monitor.jsonl`),
     events: () => readJsonl(`${home}/verispring-monitor.jsonl`).filter((entry) => entry.kind !== "mem-guard-evict-boot"),
     boot: () => readJsonl(`${home}/verispring-monitor.jsonl`).find((entry) => entry.kind === "mem-guard-evict-boot"),
+    toolEvents: () => readJsonl(`${home}/verispring-monitor.jsonl`).filter((entry) => entry.kind === "mem-guard-evict-tool"),
     releases: () => readJsonl(`${home}/verispring-monitor.jsonl`).filter((entry) => entry.kind === "mem-guard-release"),
   };
 }
@@ -527,6 +576,94 @@ test("not-loaded：本就不在内存的目标按成功无操作返回 noop，�
   assert.deepEqual(harness.disposeCalls.map((call) => call.sessionId), ["child-1"]);
 });
 
+test("重启后未加载后代：只读持久化首行授权，返回 not-loaded 且不读整份日志", async () => {
+  const harness = makeHarness();
+  await harness.resume("leader-1");
+  harness.seedStored("cold-child", { origin: "subagent", parentSession: "leader-1" });
+  const result = await harness.release(["cold-child"], "leader-1");
+  assert.equal(result.results[0].result, "not-loaded");
+  assert.equal(result.results[0].mode, "noop");
+  assert.deepEqual(harness.statCalls(), ["cold-child"], "只对点名的 id 读一次持久化头");
+  assert.equal(harness.fullLogReads(), 0, "授权不得读整份事件日志");
+  assert.deepEqual(harness.observeCalls(), [], "授权不得走 observeSession");
+
+  // 查到的父子关系回填 knownParents：文件读不到后重复调用仍按后代返回 not-loaded。
+  harness.forgetStored("cold-child");
+  const again = await harness.release(["cold-child"], "leader-1");
+  assert.equal(again.results[0].result, "not-loaded");
+  assert.deepEqual(harness.statCalls(), ["cold-child"], "第二次靠已记住的 lineage，不再读盘");
+});
+
+test("重启后未加载非后代：持久化头链不到调用方 → not-descendant", async () => {
+  const harness = makeHarness();
+  await harness.resume("leader-1");
+  await harness.resume("leader-2");
+  harness.seedStored("foreign", { origin: "subagent", parentSession: "leader-2" });
+  const result = await harness.release(["foreign"], "leader-1");
+  assert.equal(result.results[0].result, "refused");
+  assert.equal(result.results[0].reason, "not-descendant");
+  assert.deepEqual(harness.statCalls(), ["foreign"]);
+  assert.deepEqual(harness.disposeCalls, []);
+});
+
+test("未知 id：内存与持久化头都查不到 → unknown-session", async () => {
+  const harness = makeHarness();
+  await harness.resume("leader-1");
+  const result = await harness.release(["ghost"], "leader-1");
+  assert.equal(result.results[0].result, "refused");
+  assert.equal(result.results[0].reason, "unknown-session");
+  assert.deepEqual(harness.statCalls(), ["ghost"]);
+  assert.equal(harness.releases().at(-1).reason, "unknown-session");
+});
+
+test("持久化头是主会话：origin 不是 subagent → main-session", async () => {
+  const harness = makeHarness();
+  await harness.resume("leader-1");
+  harness.seedStored("cold-main", { origin: "user" });
+  const result = await harness.release(["cold-main"], "leader-1");
+  assert.equal(result.results[0].result, "refused");
+  assert.equal(result.results[0].reason, "main-session");
+  assert.deepEqual(harness.statCalls(), ["cold-main"]);
+  assert.deepEqual(harness.disposeCalls, []);
+});
+
+test("重启后的孙代：中间层不在内存也按持久化头逐层判定", async () => {
+  const harness = makeHarness();
+  await harness.resume("leader-1");
+  harness.seedStored("cold-mid", { origin: "subagent", parentSession: "leader-1" });
+  harness.seedStored("cold-deep", { origin: "subagent", parentSession: "cold-mid" });
+  const result = await harness.release(["cold-deep"], "leader-1");
+  assert.equal(result.results[0].result, "not-loaded");
+  assert.equal(result.results[0].mode, "noop");
+  assert.deepEqual(harness.statCalls(), ["cold-deep", "cold-mid"], "每层只读一次首行");
+  assert.equal(harness.fullLogReads(), 0);
+});
+
+test("持久化祖先链超过 32 层：停止查找并拒绝，不无限读盘", async () => {
+  const harness = makeHarness();
+  await harness.resume("leader-1");
+  for (let index = 0; index < 40; index += 1) {
+    harness.seedStored(`chain-${index}`, {
+      origin: "subagent",
+      parentSession: index === 39 ? "leader-1" : `chain-${index + 1}`,
+    });
+  }
+  const result = await harness.release(["chain-0"], "leader-1");
+  assert.equal(result.results[0].result, "refused");
+  assert.equal(result.results[0].reason, "not-descendant");
+  assert.equal(harness.statCalls().length, 32, "最多查 32 层，超出即停");
+});
+
+test("持久化头读取失败：拒绝 header-unreadable，不猜后代/未知", async () => {
+  const harness = makeHarness();
+  await harness.resume("leader-1");
+  harness.failStored("broken-child");
+  const result = await harness.release(["broken-child"], "leader-1");
+  assert.equal(result.results[0].result, "refused");
+  assert.equal(result.results[0].reason, "header-unreadable");
+  assert.deepEqual(harness.statCalls(), ["broken-child"]);
+});
+
 test("孙代：调用方是祖父时，用孙代的直接父（exact live parent）走 drain", async () => {
   const harness = makeHarness();
   await harness.resume("leader-1");
@@ -597,6 +734,41 @@ test("工具注册与 schema：release_subagent 挂在主会话工具面，参�
   assert.equal(typeof tool.output?.render, "function");
   const boot = harness.boot();
   assert.equal(boot.releaseTool, true);
+});
+
+test("工具注册遥测：root 注册成功落 mem-guard-evict-tool(registered:true, via:root)", async () => {
+  const harness = makeHarness();
+  const events = harness.toolEvents();
+  assert.equal(events.length, 1, "注册终态只落一条");
+  assert.equal(events[0].tool, "release_subagent");
+  assert.equal(events[0].registered, true);
+  assert.equal(events[0].via, "root");
+  assert.equal(typeof events[0].elapsedMs, "number");
+  assert.equal(harness.boot().releaseTool, true, "boot 快照与终态一致");
+});
+
+test("工具注册遥测：tools 晚 provide → boot 快照 false，补装后 registered:true via:inject", async () => {
+  const harness = makeHarness({ toolsLate: true });
+  assert.equal(harness.boot().releaseTool, false, "boot 只报 apply 时刻的真实状态");
+  assert.deepEqual(harness.toolEvents(), [], "补装完成前不落终态事件");
+  assert.equal(harness.tool(), void 0);
+  await harness.provideTools();
+  const events = harness.toolEvents();
+  assert.equal(events.length, 1);
+  assert.equal(events[0].registered, true);
+  assert.equal(events[0].via, "inject");
+  assert.equal(typeof events[0].elapsedMs, "number");
+  assert.ok(harness.tool());
+});
+
+test("工具注册遥测：注册失败落 registered:false，不谎报可用", async () => {
+  const harness = makeHarness({ toolsFail: true });
+  const events = harness.toolEvents();
+  assert.equal(events.length, 1);
+  assert.equal(events[0].registered, false);
+  assert.equal(events[0].via, "inject");
+  assert.equal(harness.boot().releaseTool, false);
+  assert.equal(harness.tool(), void 0);
 });
 
 test("子代理工具面：agent/created 时摘掉 release_subagent", async () => {

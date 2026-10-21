@@ -37,7 +37,8 @@
 // CASEOS_EVICT_SCAN_MS 默认 60000（只决定遥测扫描间隔，不触发释放）。
 // monitor：mem-guard-release（caller、child、mode=drain|dispose|noop|refused、reason、
 // heapUsedBefore/After、observationEvicted/coldLogEvicted）/ mem-guard-release-hint（由
-// memory-guard 落：软阈值后给主会话的非阻断提示）/ mem-guard-evict-boot / mem-guard-evict-follow
+// memory-guard 落：软阈值后给主会话的非阻断提示）/ mem-guard-evict-boot（apply 时刻快照）/
+// mem-guard-evict-tool（工具注册终态：registered、via=root|inject、elapsedMs）/ mem-guard-evict-follow
 // （follow 包装装上时一条：source=apply|inject|scan|release、preexistingFollowers、elapsedMs）/
 // mem-guard-evict-scan（每 5 分钟一条汇总：tracked、candidates、resident、followerTotal、
 // followerTracked、followerUntracked、followerProbe、subagentProbe、heapUsed）/
@@ -55,6 +56,10 @@ const DISPOSE_TIMEOUT_MS = 60 * 1000;
 const ERROR_LIMIT = 200;
 const UNTRACKED_LIMIT = 10;
 const LINEAGE_LIMIT = 512;
+// 内存外祖先链的查找上限：每层只读一次会话首行，损坏/成环的链不会触发无界磁盘查找。
+const LINEAGE_LOOKUP_LIMIT = 32;
+// 单次持久化头读取的上限：超时 abort 宿主的首行/首帧读循环（persistence.stat 的 signal）。
+const STORED_HEADER_TIMEOUT_MS = 5000;
 // 原型补丁用全局 symbol 标记：插件重载时能从旧包装里取出 original，避免把包装套在包装上。
 const RESUME_PATCH = Symbol.for("caseos.session-evictor.resume");
 const FOLLOW_PATCH = Symbol.for("caseos.session-evictor.follow");
@@ -224,8 +229,8 @@ export default {
     const sessions = ctx.sessions;
     // sessionId → { handle, agent, subagent }：resume 包装捕获的释放句柄。
     const entries = new Map();
-    // 子会话 id → 直接父会话 id。活会话优先读 header；已释放/未加载的目标靠这份记忆继续
-    // 授权（noop 与重复调用才判得出「是不是我的后代」）。
+    // 子会话 id → 直接父会话 id：本进程见过的血缘。活会话优先读 header；内存里没有的目标先查
+    // 这份记忆，再只读持久化头。从持久化头查到的关系回填这里，重复调用不再读盘。
     const knownParents = new Map();
     const activeFollowers = new Map();
     let resumePatch;
@@ -292,6 +297,86 @@ export default {
         return parent;
       }
       return knownParents.get(sessionId);
+    };
+
+    // 内存外的授权事实来自持久化会话头。rc.2 的 persistence.stat(id) 只读首行（zstd 时只解第一
+    // 个帧，均按 8KB 块读：dsh-session-persistence-jsonl/lib/index.js:2570-2601、:3352-3403），
+    // 不解析事件日志、不 promote、不走 observeSession——会话动辄几十 MB 时这是唯一可用的轻量入口。
+    const storedHeader = async (sessionId) => {
+      const backend = service("sessionPersistence");
+      if (typeof backend?.stat !== "function") return { status: "unavailable" };
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), STORED_HEADER_TIMEOUT_MS);
+      if (typeof timer?.unref === "function") timer.unref();
+      try {
+        const stored = await backend.stat(sessionId, { signal: controller.signal });
+        if (stored?.header === void 0) return { status: "missing" };
+        return { status: "found", header: stored.header };
+      } catch (error) {
+        return { status: "failed", error };
+      } finally {
+        clearTimeout(timer);
+      }
+    };
+
+    // 直接父：活头 → 本进程记忆 → 持久化头。持久化头只在被问到的 id 上读一次首行。
+    const resolveParent = async (sessionId) => {
+      const live = headerOf(sessionId);
+      if (live !== void 0) {
+        const parent = live.parentSession ?? knownParents.get(sessionId);
+        if (typeof parent === "string") rememberParent(sessionId, parent);
+        return { parent, source: "live" };
+      }
+      if (knownParents.has(sessionId)) {
+        return { parent: knownParents.get(sessionId), source: "memory" };
+      }
+      const stored = await storedHeader(sessionId);
+      if (stored.status === "found") {
+        const parent = stored.header.parentSession;
+        if (typeof parent === "string") rememberParent(sessionId, parent);
+        return { parent, source: "stored" };
+      }
+      return { parent: void 0, source: stored.status };
+    };
+
+    // 目标身份：活头优先，其次本进程记忆的 lineage，最后才为这一个 id 读持久化头。
+    const resolveTarget = async (childId) => {
+      const live = headerOf(childId);
+      if (live !== void 0) {
+        const parent = live.parentSession ?? knownParents.get(childId);
+        if (typeof parent === "string") rememberParent(childId, parent);
+        return { status: "found", source: "live", header: live, parent };
+      }
+      if (knownParents.has(childId)) {
+        return { status: "found", source: "memory", header: void 0, parent: knownParents.get(childId) };
+      }
+      const stored = await storedHeader(childId);
+      if (stored.status === "found") {
+        const parent = stored.header.parentSession;
+        if (typeof parent === "string") rememberParent(childId, parent);
+        return { status: "found", source: "stored", header: stored.header, parent };
+      }
+      if (stored.status === "failed") return { status: "unreadable", error: stored.error };
+      return { status: "unknown" };
+    };
+
+    // 沿 parentSession 链判断后代；内存外的每一层按需读持久化头，层数有上限。
+    const descendsFromStored = async (id, ancestorId) => {
+      const visited = new Set();
+      let current = id;
+      let lookups = 0;
+      while (typeof current === "string" && current !== "") {
+        if (current === ancestorId) return "descendant";
+        if (visited.has(current)) return "not-descendant";
+        visited.add(current);
+        lookups += 1;
+        if (lookups > LINEAGE_LOOKUP_LIMIT) return "not-descendant";
+        const { parent, source } = await resolveParent(current);
+        if (source === "failed") return "header-unreadable";
+        if (typeof parent !== "string") return "not-descendant";
+        current = parent;
+      }
+      return "not-descendant";
     };
 
     const removeEntry = (sessionId) => entries.delete(sessionId);
@@ -459,13 +544,24 @@ export default {
       const before = heapUsed();
       const refuse = (reason) => emitRelease(callerId, childId, "refused", reason, before);
       if (childId === callerId) return refuse("main-session");
-      const header = headerOf(childId);
-      const parentId = header?.parentSession ?? knownParents.get(childId);
-      if (header !== void 0 && header.origin !== "subagent") return refuse("main-session");
-      if (typeof parentId !== "string") return refuse("not-descendant");
-      if (!descendsFrom(childId, callerId, parentOf)) return refuse("not-descendant");
+      // 重启后子代理不在 agents/sessions 里，父子关系只能来自持久化会话头；只查被点名的 id。
+      const target = await resolveTarget(childId);
+      if (target.status === "unknown") return refuse("unknown-session");
+      if (target.status === "unreadable") return refuse("header-unreadable");
+      if (target.header !== void 0 && target.header.origin !== "subagent") return refuse("main-session");
+      if (typeof target.parent !== "string") return refuse("not-descendant");
+      const lineage = await descendsFromStored(childId, callerId);
+      if (lineage === "header-unreadable") return refuse("header-unreadable");
+      if (lineage !== "descendant") return refuse("not-descendant");
 
       const agent = agents?.get?.(childId);
+      const resident = subagentResident();
+      const entry = entries.get(childId);
+      // 不在内存就是成功无操作：没有可释放的对象，运行中/follow 等安全判据不适用。
+      if (agent === void 0 && resident?.has?.(childId) !== true && entry?.handle === void 0) {
+        return emitRelease(callerId, childId, "noop", void 0, before);
+      }
+
       const blockers = releaseBlockers(
         { sessionId: childId, agent },
         {
@@ -477,7 +573,6 @@ export default {
       );
       if (blockers.length > 0) return refuse(blockers.join(","));
 
-      const resident = subagentResident();
       if (resident?.has?.(childId) === true) {
         const activation = resident.get(childId);
         const directParent = activation?.parent;
@@ -505,7 +600,6 @@ export default {
         });
       }
 
-      const entry = entries.get(childId);
       if (entry?.handle === void 0 || typeof entry.handle.dispose !== "function") {
         // 还活着但本插件没有捕获到 handle（激活前就存在、或走了别的 resume 路径）：
         // 不能谎报 not-loaded——它在内存里，只是我们无法安全释放。
@@ -559,7 +653,8 @@ export default {
       description:
         "释放主会话名下的已结束子代理的内存（只给主会话）。目标必须是你派出的后代，且当前未运行、"
         + "durable inbox 无 pending、manager 无在途操作、无界面跟随、无活的后代。常驻 release 走宿主 "
-        + "drainChildren，其余走本插件捕获的 handle.dispose；本就不在内存的返回 not-loaded。"
+        + "drainChildren，其余走本插件捕获的 handle.dispose；本就不在内存（含重启后只剩持久化会话头的）"
+        + "返回 not-loaded。血缘判定优先活会话头，内存里没有时只读持久化会话头（首行），不读事件日志。"
         + "释放后仍可用 send_message 续接（会自动从磁盘冷恢复）。主会话自身永不被自动卸载。",
       parameters: {
         type: "object",
@@ -613,22 +708,51 @@ export default {
       },
     };
 
-    const registerReleaseTool = (registry) => {
-      if (releaseToolRegistered || registry === void 0 || typeof registry.register !== "function") return;
+    // 注册终态单独落一条：boot 事件写于 apply 时刻，tools 服务晚 provide 时那里的 releaseTool
+    // 只是快照；本事件在 root/inject 任一路径出结果后写一次，registered 才是最终事实。
+    let releaseToolReported = false;
+    const reportReleaseTool = (registered, via) => {
+      if (releaseToolReported) return;
+      releaseToolReported = true;
+      monitorEvent(dshHome, {
+        kind: "mem-guard-evict-tool",
+        tool: TOOL_NAME,
+        registered,
+        via,
+        elapsedMs: Date.now() - bootAt,
+      });
+    };
+
+    const canInject = typeof ctx.inject === "function";
+    const registerReleaseTool = (registry, via) => {
+      if (releaseToolRegistered) return true;
+      if (registry === void 0 || typeof registry.register !== "function") return false;
       try {
         registry.register(releaseTool);
         releaseToolRegistered = true;
+        reportReleaseTool(true, via);
+        return true;
       } catch (error) {
         process.stderr.write(`caseos-session-evictor: ${TOOL_NAME} 注册失败: ${errorText(error)}\n`);
+        return false;
       }
     };
+    let registeredFromRoot = false;
     try {
-      registerReleaseTool(root.tools);
+      registeredFromRoot = registerReleaseTool(root.tools, "root");
     } catch {}
-    if (!releaseToolRegistered) {
-      try {
-        ctx.inject(["tools"], (rtc) => registerReleaseTool(rtc?.tools ?? root.tools));
-      } catch {}
+    if (!registeredFromRoot) {
+      if (canInject) {
+        try {
+          ctx.inject(["tools"], (rtc) => {
+            if (!registerReleaseTool(rtc?.tools ?? root.tools, "inject")) reportReleaseTool(false, "inject");
+          });
+        } catch {
+          reportReleaseTool(false, "inject");
+        }
+      } else {
+        reportReleaseTool(false, "root");
+      }
     }
 
     // 每 5 分钟一条扫描汇总：candidates 是「当前可由主会话释放的已结束子代理」计数。
@@ -684,7 +808,6 @@ export default {
 
     resumePatch = installResumePatch(agents, track);
     installFollowerProbe("apply");
-    const canInject = typeof ctx.inject === "function";
     // 会话控制器与插件条目由 loader 并发 apply（cordis-plugin-loader/src/config/group.ts:56），
     // apply 时它可能还没 provide。inject 回调在服务 provide 的那一刻触发（cordis/lib/index.js:
     // 800-856、:1306-1343），仍早于 host 向 shell 发 ready（dsh-desktop-host/lib/index.js:328 →

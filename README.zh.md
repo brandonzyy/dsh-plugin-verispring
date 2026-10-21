@@ -43,7 +43,7 @@ Verispring 三角色会话架构 + 本地知识图谱 manon，大幅度优化主
 
 ### monitor 事件
 
-`~/.dsh/verispring-monitor.jsonl` 的 `kind`：`subagent-start` / `subagent-start-failed` / `subagent-end` / `subagent-error`（生命周期 + 角色 + 路由）、`child-route-updated`、`role-route-mismatch`、`scout-unreachable`、`scout-tools-restricted`（带测绘子代理 id；其 `edit`/`write` 已在 `agent/created` 时摘除）、`dispatch-deny`（带 `rule`：`scout-missing`、`brief-lint`、`map-baseline-missing`、`map-stale`、`executor-cap`）、`gate-deny`（派遣规范门/测绘常驻/缺地图，以及 codestyle 与 manon 的拒绝）、`leader-guard-deny`（带 `rule`：`sleep-in-loop`、`sleep-long`、`sleep-background`、`list-agents-repeat`）、`leader-write-hint`（带 `rule`：`write-whitelist`、`git-mutation`、`package-mutation`、`in-place-edit`、`recursive-remove`、`workspace-redirect`——非阻断的领导写入提示）、`ask-scout`、`structure-forward`、`checkpoint-saved` / `checkpoint-save-failed` / `checkpoint-injected` / `checkpoint-inject-failed`、`scout-relay-error`、`mem-guard-boot`（激活自报：`heapLimitBytes`、`nodeArgv`、`pid`、`softBytes`、`hardBytes`、`thresholdsSource`、`checkMs`、`readGuard`、`readGuardMaxBytes`）、`mem-guard-recycle` / `mem-guard-skip`（内存看门狗：`heapUsed`、释放条数 `released`、`reason`）、`mem-guard-read-deny`（整读门：`tool`、`session`、`path`、`size`）、`mem-guard-sample`（每 5 分钟的 `heapUsed` / `rss` / `heapLimitBytes` 增长曲线）、`mem-guard-soft`（软阈值越线心跳，5 分钟限流）、`mem-guard-release-hint`（软阈值期间主会话下一次工具结果后的非阻断提示：`session`、`heapUsed`、`softBytes`、`candidates`）、`mem-guard-release`（主会话点名释放子代理：`caller`、`child`、`mode`：`drain` / `dispose` / `noop` / `refused`、`reason`、`heapUsedBefore`、`heapUsedAfter`）、`mem-guard-evict-boot`（释放器自报：`scanMs`、`tracked`、`untracked`、`releaseTool`、`subagentProbe`）、`mem-guard-evict-follow`（follow 包装安装：`source`、`preexistingFollowers`、`elapsedMs`）、`mem-guard-evict-scan`（每 5 分钟遥测：`tracked`、`candidates`、`resident`、`followerTotal`、`followerTracked`、`followerUntracked`、`followerProbe`、`subagentProbe`、`heapUsed`）、`mem-guard-evict-skip`（`reason`：`scan-failed`）。
+`~/.dsh/verispring-monitor.jsonl` 的 `kind`：`subagent-start` / `subagent-start-failed` / `subagent-end` / `subagent-error`（生命周期 + 角色 + 路由）、`child-route-updated`、`role-route-mismatch`、`scout-unreachable`、`scout-tools-restricted`（带测绘子代理 id；其 `edit`/`write` 已在 `agent/created` 时摘除）、`dispatch-deny`（带 `rule`：`scout-missing`、`brief-lint`、`map-baseline-missing`、`map-stale`、`executor-cap`）、`gate-deny`（派遣规范门/测绘常驻/缺地图，以及 codestyle 与 manon 的拒绝）、`leader-guard-deny`（带 `rule`：`sleep-in-loop`、`sleep-long`、`sleep-background`、`list-agents-repeat`）、`leader-write-hint`（带 `rule`：`write-whitelist`、`git-mutation`、`package-mutation`、`in-place-edit`、`recursive-remove`、`workspace-redirect`——非阻断的领导写入提示）、`ask-scout`、`structure-forward`、`checkpoint-saved` / `checkpoint-save-failed` / `checkpoint-injected` / `checkpoint-inject-failed`、`scout-relay-error`、`mem-guard-boot`（激活自报：`heapLimitBytes`、`nodeArgv`、`pid`、`softBytes`、`hardBytes`、`thresholdsSource`、`checkMs`、`readGuard`、`readGuardMaxBytes`）、`mem-guard-recycle` / `mem-guard-skip`（内存看门狗：`heapUsed`、释放条数 `released`、`reason`）、`mem-guard-read-deny`（整读门：`tool`、`session`、`path`、`size`）、`mem-guard-sample`（每 5 分钟的 `heapUsed` / `rss` / `heapLimitBytes` 增长曲线）、`mem-guard-soft`（软阈值越线心跳，5 分钟限流）、`mem-guard-release-hint`（软阈值期间主会话下一次工具结果后的非阻断提示：`session`、`heapUsed`、`softBytes`、`candidates`）、`mem-guard-release`（主会话点名释放子代理：`caller`、`child`、`mode`：`drain` / `dispose` / `noop` / `refused`、`reason`、`heapUsedBefore`、`heapUsedAfter`）、`mem-guard-evict-boot`（释放器 apply 时刻自报：`scanMs`、`tracked`、`untracked`、`releaseTool`、`subagentProbe`）、`mem-guard-evict-tool`（工具注册终态：`tool`、`registered`、`via`：`root` / `inject`、`elapsedMs`）、`mem-guard-evict-follow`（follow 包装安装：`source`、`preexistingFollowers`、`elapsedMs`）、`mem-guard-evict-scan`（每 5 分钟遥测：`tracked`、`candidates`、`resident`、`followerTotal`、`followerTracked`、`followerUntracked`、`followerProbe`、`subagentProbe`、`heapUsed`）、`mem-guard-evict-skip`（`reason`：`scan-failed`）。
 
 ## 内存看门狗（memory-guard）
 
@@ -120,14 +120,32 @@ host 把每次 promote 的会话整份常驻：session-controller 的 promote �
 - 目标没有 UI follow 流：`sessionController.history.follow` 包装按 sessionId 归属活跃 follow；
   包装安装前就存在的 follow 无法归属，此时保守拒绝（`follower-untracked`）。
 
+拒绝原因（工具结果的 `reason` 与 `mem-guard-release.reason`）：
+
+| 原因 | 含义 |
+|---|---|
+| `main-session` | 目标（或调用方）是主会话，不是子代理 |
+| `not-descendant` | 活/持久化 `parentSession` 链到不了调用方 |
+| `unknown-session` | 内存内外的会话头都查不到这个 id |
+| `header-unreadable` | 持久化头存在但在 5s 内读不出，或已损坏/版本不支持 |
+| `not-captured` | agent 还活着，但本插件没捕获到 `dispose` handle（激活前已 promote） |
+| `drain-parent-not-live` | resident 目标的直接父已不在 agents 注册表 |
+| `running`、`pending-inbox`、`operation-in-flight`、`subagent-operation-in-flight`、`live-descendant`、`followed`、`follower-untracked` | 目标还没结束，或此刻释放不安全 |
+| `not-leader` | 调用方是子代理（工具只给主会话） |
+| `subagents-unavailable`、`still-registered`、`drain-failed: …`、`dispose-failed: …` | 宿主前置条件消失或释放调用失败；目标保持存活 |
+
 **释放路径**：目标仍在 `subagents.manager.resident` → 调宿主 `subagents.drainChildren(parent,
 [id])`，宿主要求 **exact live direct parent**（`dsh-subagent/lib/index.js:1372-1383`）；调用方是
 祖父时用该 activation 自己的直接父，且它必须仍在 agents 注册表里（否则 `drain-parent-not-live`）。
 不用 `drainDescendants`（`:1334`）：它释放 root 的全部后代，不能只挑一个孙代。已 settle 但仍在
 内存的目标走捕获的 `handle.dispose()`；本就不在内存的返回 `not-loaded`（成功无操作）；
-活着但本插件没捕获到 handle 的（激活前已 promote）返回 `not-captured`，不谎报已释放。每次尝试
-都落 `mem-guard-release`（`caller`、`child`、`mode`：`drain` / `dispose` / `noop` / `refused`、
-`reason`、`heapUsedBefore`、`heapUsedAfter`）。
+活着但本插件没捕获到 handle 的（激活前已 promote）返回 `not-captured`，不谎报已释放。不在内存的
+目标，其血缘来自**持久化会话头**：`ctx.get("sessionPersistence").stat(id)` 只读首行——zstd 时只解
+头部帧，均按 8KB 块读（`dsh-session-persistence-jsonl/lib/index.js:2570-2601`、`:3352-3403`）——
+不解析事件日志、不 promote、不走 `observeSession`。持久化头显示是后代且未加载 → `not-loaded`；
+查不到头 → `unknown-session`；查到的父子关系回填进程内 lineage，重复调用不再读盘，祖先链最多查
+32 层。每次尝试都落 `mem-guard-release`（`caller`、`child`、`mode`：`drain` / `dispose` / `noop` /
+`refused`、`reason`、`heapUsedBefore`、`heapUsedAfter`）。
 
 **释放效果**：`handle.dispose()` 会 stop loop → await idle → 拆 scope → 关持久化 handle →
 `detachAgent` / `detachSession`（`dsh-agent-loop/lib/index.js:1740-1810`），SessionStore
@@ -144,6 +162,10 @@ boot 的 `followerProbe:"deferred"` 表示在等服务 provide，实际安装另
 每 5 分钟落 `mem-guard-evict-scan`：`tracked`、`candidates`（当前可释放的已结束子代理数）、
 `resident`、`followerTotal`、`followerTracked`、`followerUntracked`、`followerProbe`、
 `subagentProbe`、`heapUsed`。
+
+工具注册遥测分两条：`mem-guard-evict-boot.releaseTool` 是 apply 时刻快照（`tools` 服务尚未
+provide 时可以是 `false`）；root 注册或 `ctx.inject(["tools"], …)` 兜底完成后，
+`mem-guard-evict-tool` 落终态（`registered`、`via`：`root` / `inject`、`elapsedMs`）。
 
 堆越过软阈值时，内存看门狗会在主会话下一次工具结果后追加非阻断的
 `mem-guard-release-hint`（见上节），列出的正是同一批候选；它自己绝不释放任何东西。
