@@ -102,6 +102,14 @@ session-controller 的 `resolve()` 首行 `liveAgent()` 落空，下一次访问
 包装捕获——不需要任何宿主改动。激活前已经 promote 的会话拿不到 handle，只在
 `mem-guard-evict-boot` 的 `untracked` 里上报，不动它们。
 
+follow 归属包装在 host 启动阶段就安装：apply 先试装，若 session-controller 尚未 provide，则用
+`ctx.inject(["sessionController"], …)` 在服务可用时立即补装，故界面首条 follow 前包装已就位。
+boot 的 `followerProbe:"deferred"` 表示在等服务 provide，实际安装另落 `mem-guard-evict-follow`
+（`source`、`preexistingFollowers`、`elapsedMs`）；`preexistingFollowers>0` 表示存在无法归属的旧流
+（阻塞名 `follower-untracked`），此时保守全不卸。另每 5 分钟落 `mem-guard-evict-scan`：`tracked`、
+`candidates`、`evicted`、`blockers`（原因→计数）、`followerTotal`、`followerTracked`、
+`followerUntracked`、`followerProbe`、`subagentProbe`（附 `heapUsed`、`pressure`），直接回答「为什么没卸」。
+
 **卸载判据**（全部满足；任一不满足就不碰）：
 
 - 子代理来源会话按 **activation 归属**：id 仍在 `subagents` manager 的 `resident`（活 activation）

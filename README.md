@@ -112,6 +112,17 @@ first line, so the next access promotes again and is captured again — no host 
 Sessions promoted before activation cannot be tracked; they are reported in
 `mem-guard-evict-boot.untracked` and otherwise left alone.
 
+The follow-attribution wrapper is installed during Host startup: `apply` tries immediately, and if
+`session-controller` has not provided yet, `ctx.inject(["sessionController"], …)` installs it the
+moment the service appears — before the shell's first follow. `followerProbe: "deferred"` in the
+boot event means "waiting for session-controller"; the actual install is recorded by
+`mem-guard-evict-follow` (`source`, `preexistingFollowers`, `elapsedMs`). A nonzero
+`preexistingFollowers` means pre-wrapper followers cannot be attributed (blocker
+`follower-untracked`), and the conservative rule blocks all evictions. Every five minutes
+`mem-guard-evict-scan` reports `tracked`, `candidates`, `evicted`, `blockers` (reason → count),
+`followerTotal`, `followerTracked`, `followerUntracked`, `followerProbe`, `subagentProbe` (plus
+`heapUsed`, `pressure`), making "why nothing was evicted" directly readable.
+
 **Eviction criteria** (all must hold):
 
 - subagent-origin sessions are judged by **activation ownership**: while the id is still in the
