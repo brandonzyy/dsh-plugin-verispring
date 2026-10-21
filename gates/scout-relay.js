@@ -31,6 +31,26 @@ const FAILED_STOP_REASONS = new Set(["error", "aborted", "refusal"]);
 // 插件自己发起的调用没有调用方信号可用；用永不中止的信号满足宿主「必须给 signal」的契约。
 const NO_SIGNAL = new AbortController().signal;
 
+// agent/error 与 subagent/end 分两条事件到达：错误正文先落这里，end 时取用。模块层才能在
+// apply 重跑（面板改配置）时保留在途草稿。
+const agentErrors = new Map();
+
+// 内存治理（gates/memory-guard.js 调用）：end 迟迟不到时草稿会积压，按活会话剪掉；活会话的
+// 草稿必须保留，否则收尾检查点会丢错误正文。返回释放的条目数（monitor 的 released）。
+export function releaseIdleCaches(liveAgents) {
+  const ids = new Set();
+  for (const agent of liveAgents ?? []) {
+    if (agent?.id !== void 0) ids.add(agent.id);
+  }
+  let released = 0;
+  for (const id of agentErrors.keys()) {
+    if (ids.has(id)) continue;
+    agentErrors.delete(id);
+    released += 1;
+  }
+  return released;
+}
+
 function readCaseosState(file) {
   try {
     return JSON.parse(readFileSync(file, "utf8")) ?? {};
@@ -448,8 +468,6 @@ export default {
     });
 
     // ---- P4 + P5：子代理收尾事实 ----------------------------------------
-    // agent/error 与 subagent/end 分两条事件到达：错误正文先落这里，end 时取用。
-    const agentErrors = new Map();
 
     const forwardStructureDelta = async (childId, leaderId, text) => {
       const delta = extractStructureDelta(text);

@@ -31,10 +31,32 @@ Verispring 三角色会话架构 + 本地知识图谱 manon，大幅度优化主
 | `CASEOS_LEADER_WRITE_ALLOW` | 空 | 以 `:` 分隔的额外可写路径前缀（领导 `edit`/`write`） |
 | `CASEOS_SCOUT_RELAY` | 开 | `0` 不注册 `ask_scout`，且停止转交、检查点与提示注入 |
 | `CASEOS_ASK_SCOUT_TIMEOUT_MS` | `600000` | `ask_scout` 等测绘答复的时限，超时返回超时文案 |
+| `CASEOS_MEM_GUARD` | 开 | `0` 在装配时关闭 host 内存看门狗（不装定时器、不挂监听） |
+| `CASEOS_MEM_CHECK_MS` | `60000` | host 堆内存检查间隔 |
+| `CASEOS_MEM_SOFT_BYTES` | 2.4GiB | 软阈值：尽力释放空闲子代理 + 剪本插件的只增索引 |
+| `CASEOS_MEM_HARD_BYTES` | 3.2GiB | 硬阈值：空闲态记 `mem-guard-skip` + 重启提示（绝不退出） |
 
 ### monitor 事件
 
-`~/.dsh/verispring-monitor.jsonl` 的 `kind`：`subagent-start` / `subagent-start-failed` / `subagent-end` / `subagent-error`（生命周期 + 角色 + 路由）、`child-route-updated`、`role-route-mismatch`、`scout-unreachable`、`dispatch-deny`（带 `rule`：`scout-missing`、`brief-lint`、`map-baseline-missing`、`map-stale`、`executor-cap`）、`gate-deny`（派遣规范门/测绘常驻/缺地图，以及 codestyle 与 manon 的拒绝）、`leader-guard-deny`（带 `rule`：`sleep-in-loop`、`sleep-long`、`sleep-background`、`list-agents-repeat`）、`leader-write-hint`（带 `rule`：`write-whitelist`、`git-mutation`、`package-mutation`、`in-place-edit`、`recursive-remove`、`workspace-redirect`——非阻断的领导写入提示）、`ask-scout`、`structure-forward`、`checkpoint-saved` / `checkpoint-save-failed` / `checkpoint-injected` / `checkpoint-inject-failed`、`scout-relay-error`。
+`~/.dsh/verispring-monitor.jsonl` 的 `kind`：`subagent-start` / `subagent-start-failed` / `subagent-end` / `subagent-error`（生命周期 + 角色 + 路由）、`child-route-updated`、`role-route-mismatch`、`scout-unreachable`、`dispatch-deny`（带 `rule`：`scout-missing`、`brief-lint`、`map-baseline-missing`、`map-stale`、`executor-cap`）、`gate-deny`（派遣规范门/测绘常驻/缺地图，以及 codestyle 与 manon 的拒绝）、`leader-guard-deny`（带 `rule`：`sleep-in-loop`、`sleep-long`、`sleep-background`、`list-agents-repeat`）、`leader-write-hint`（带 `rule`：`write-whitelist`、`git-mutation`、`package-mutation`、`in-place-edit`、`recursive-remove`、`workspace-redirect`——非阻断的领导写入提示）、`ask-scout`、`structure-forward`、`checkpoint-saved` / `checkpoint-save-failed` / `checkpoint-injected` / `checkpoint-inject-failed`、`scout-relay-error`、`mem-guard-drain` / `mem-guard-recycle` / `mem-guard-skip`（内存看门狗：`heapUsed`、释放条数 `released`、`reason`）。
+
+## 内存看门狗（memory-guard）
+
+host 进程把点开的会话整份常驻、永不淘汰，跑久了必然 OOM。`gates/memory-guard.js` 在 host 内读
+`process.memoryUsage()`（每 `CASEOS_MEM_CHECK_MS`，默认 60s；`subagent/end` 时立即补一次）：
+
+- **软阈值（默认 heapUsed 2.4GiB，`CASEOS_MEM_SOFT_BYTES`）**——尽力回收。空闲且 durable inbox 已清
+  空的子代理（`status === "idle"`）走宿主自己的 `subagents.drainChildren(parent, childIds)` 释放
+  （之后 `send_message` 冷恢复；运行中的、还有排队输入的一律不碰），同时按活会话剪掉本插件自己的
+  只增索引。记 `mem-guard-drain` / `mem-guard-recycle`；drain 与 recycle 共享 5 分钟冷却。
+- **硬阈值（默认 heapUsed 3.2GiB，`CASEOS_MEM_HARD_BYTES`）**——只在空闲态（无运行中子代理、近 90s
+  无工具活动）记 `mem-guard-skip` 并在 stderr 提示人工重启。**不退出 host**：`main.js` 把 host 子进程
+  的任何 close（含 exit 0）都当作失败停止且不会重新 spawn，靠退出触发重启只会打断当前 desktop 后端。
+  插件也拿不到释放「常驻父会话」的 API——这正是硬阈值只能提示重启的原因。
+- `mem-guard-skip` 还记录忙态、冷却跳过与回收失败，一律带 `heapUsed`（必要时 `hardBytes` /
+  `released` / `reason`）。
+
+一键全关：`CASEOS_MEM_GUARD=0`。
 
 ## 回执制（不轮询）
 

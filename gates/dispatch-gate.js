@@ -537,6 +537,40 @@ function takeRoutePlan(parent) {
   return plan;
 }
 
+// 内存治理（gates/memory-guard.js 调用）：剪掉不再有活会话的索引条目。这四个索引都只增不减
+// （pendingRoutePlans 还以 Agent 对象为键，父会话卸载后仍被强引用）；权威事实在 session-state
+// 文件与会话日志里，剪掉的条目按需惰性重建，活会话的条目一律保留。传活 Agent 列表而不是
+// id 集合：pendingRoutePlans 的键是对象。返回释放的条目数（monitor 的 released）。
+export function releaseIdleCaches(liveAgents) {
+  const ids = new Set();
+  const objects = new Set();
+  for (const agent of liveAgents ?? []) {
+    if (agent === void 0 || agent === null) continue;
+    objects.add(agent);
+    if (agent.id !== void 0) ids.add(agent.id);
+  }
+  let released = 0;
+  for (const [key, sessionId] of scoutSessionIndex) {
+    if (ids.has(sessionId)) continue;
+    scoutSessionIndex.delete(key);
+    // 该目录的懒重建标记一并失效：下次按状态文件重新索引，不缺当前在用的条目。
+    const separator = key.indexOf("\u0000");
+    if (separator > 0) indexedStateDirs.delete(key.slice(0, separator));
+    released += 1;
+  }
+  for (const id of childRoutePlans.keys()) {
+    if (ids.has(id)) continue;
+    childRoutePlans.delete(id);
+    released += 1;
+  }
+  for (const parent of pendingRoutePlans.keys()) {
+    if (objects.has(parent)) continue;
+    pendingRoutePlans.delete(parent);
+    released += 1;
+  }
+  return released;
+}
+
 function renameChildTitle(ctx, childId, title) {
   const sessionTitle = ctx?.get?.("sessionTitle");
   const child = ctx?.get?.("agents")?.get(childId);

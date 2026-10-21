@@ -20,7 +20,7 @@
   "main": "./gates/dispatch-gate.js",
   "scripts": {
     "smoke": "node scripts/smoke-test.mjs",
-    "test": "node scripts/test-dispatch-gate.mjs && node scripts/test-leader-guard.mjs && node scripts/test-scout-relay.mjs && node scripts/smoke-test.mjs"
+    "test": "node scripts/test-dispatch-gate.mjs && node scripts/test-leader-guard.mjs && node scripts/test-scout-relay.mjs && node scripts/test-memory-guard.mjs && node scripts/smoke-test.mjs"
   },
   "exports": {
     ".": "./gates/dispatch-gate.js",

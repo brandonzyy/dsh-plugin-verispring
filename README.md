@@ -31,11 +31,38 @@ Verispring three-role session architecture plus a bundled local knowledge graph 
 | `CASEOS_LEADER_WRITE_ALLOW` | empty | `:`-separated extra path prefixes the leader may `edit`/`write` |
 | `CASEOS_SCOUT_RELAY` | on | `0` unregisters `ask_scout` and stops forwarding/checkpointing/prompt injection |
 | `CASEOS_ASK_SCOUT_TIMEOUT_MS` | `600000` | how long `ask_scout` waits for the scout's answer before returning a timeout |
+| `CASEOS_MEM_GUARD` | on | `0` disables the host memory watchdog at assembly time (no interval, no listeners) |
+| `CASEOS_MEM_CHECK_MS` | `60000` | host heap check interval |
+| `CASEOS_MEM_SOFT_BYTES` | 2.4GiB | soft heap threshold: best-effort release of idle subagents + pruning of the plugin's own indexes |
+| `CASEOS_MEM_HARD_BYTES` | 3.2GiB | hard heap threshold: idle-state `mem-guard-skip` + restart prompt (never an exit) |
 
 ### Monitor events
 
-`kind` values in `~/.dsh/verispring-monitor.jsonl`: `subagent-start` / `subagent-start-failed` / `subagent-end` / `subagent-error` (lifecycle + role + route), `child-route-updated`, `role-route-mismatch`, `scout-unreachable`, `dispatch-deny` (with `rule`: `scout-missing`, `brief-lint`, `map-baseline-missing`, `map-stale`, `executor-cap`), `gate-deny` (dispatch spec / resident-scout / missing-map denials, plus codestyle and manon), `leader-guard-deny` (with `rule`: `sleep-in-loop`, `sleep-long`, `sleep-background`, `list-agents-repeat`), `leader-write-hint` (with `rule`: `write-whitelist`, `git-mutation`, `package-mutation`, `in-place-edit`, `recursive-remove`, `workspace-redirect` — non-blocking leader write hints), `ask-scout`, `structure-forward`, `checkpoint-saved` / `checkpoint-save-failed` / `checkpoint-injected` / `checkpoint-inject-failed`, `scout-relay-error`.
+`kind` values in `~/.dsh/verispring-monitor.jsonl`: `subagent-start` / `subagent-start-failed` / `subagent-end` / `subagent-error` (lifecycle + role + route), `child-route-updated`, `role-route-mismatch`, `scout-unreachable`, `dispatch-deny` (with `rule`: `scout-missing`, `brief-lint`, `map-baseline-missing`, `map-stale`, `executor-cap`), `gate-deny` (dispatch spec / resident-scout / missing-map denials, plus codestyle and manon), `leader-guard-deny` (with `rule`: `sleep-in-loop`, `sleep-long`, `sleep-background`, `list-agents-repeat`), `leader-write-hint` (with `rule`: `write-whitelist`, `git-mutation`, `package-mutation`, `in-place-edit`, `recursive-remove`, `workspace-redirect` — non-blocking leader write hints), `ask-scout`, `structure-forward`, `checkpoint-saved` / `checkpoint-save-failed` / `checkpoint-injected` / `checkpoint-inject-failed`, `scout-relay-error`, `mem-guard-drain` / `mem-guard-recycle` / `mem-guard-skip` (heap watchdog: `heapUsed`, `released`, `reason`).
 
+
+## Memory guard
+
+The host process keeps every opened session resident and never evicts it, so a long-running host
+eventually dies of an OOM. `gates/memory-guard.js` watches `process.memoryUsage()` from inside the
+host (every `CASEOS_MEM_CHECK_MS`, default 60s, plus immediately on `subagent/end`):
+
+- **Soft threshold (default heapUsed 2.4GiB, `CASEOS_MEM_SOFT_BYTES`)** — best-effort recovery.
+  Idle subagents (`status === "idle"`) with an empty durable inbox are released through the host's
+  own `subagents.drainChildren(parent, childIds)` (a later `send_message` cold-resumes them; running
+  children and children with queued input are never touched), and the plugin's own append-only
+  indexes are pruned of entries whose session is gone. Recorded as `mem-guard-drain` /
+  `mem-guard-recycle`; drain and recycle share a 5-minute cooldown.
+- **Hard threshold (default heapUsed 3.2GiB, `CASEOS_MEM_HARD_BYTES`)** — only in the idle state
+  (no running subagent and no tool activity for 90s) it records `mem-guard-skip` and prints a
+  restart prompt on stderr. It does **not** exit the host: `main.js` treats any host close — exit 0
+  included — as a failed stop and never respawns the child, so "exit to trigger a restart" would
+  only kill the app's backend. The resident parent session itself has no unload API from a plugin,
+  which is exactly why the restart prompt is the hard-threshold action.
+- `mem-guard-skip` also records the busy case, cooldown skips and recovery failures, always with
+  `heapUsed` (plus `hardBytes` / `released` / `reason` where they apply).
+
+Kill switch: `CASEOS_MEM_GUARD=0`.
 
 ## Receipts instead of polling
 

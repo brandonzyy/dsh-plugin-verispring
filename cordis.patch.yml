@@ -6,12 +6,13 @@
 # Agent Preset；dispatch-gate 与 tool-subagent 均显式指定该 preset。
 # 本组合包一个 patch 文件做两件事：
 #   1) 子代理工具默认路由使用执行智能体配置（continuable 后台、maxDepth 1 不派孙代理）；
-#   2) insert 三个代码级门禁插件（gates/ 目录）。
+#   2) insert 代码级门禁插件（gates/ 目录，含 host 内存看门狗）。
 # 代码级兜底在 dispatch-gate：即便调用显式指定其它 provider/model 也会被忽略，路由按
 # 角色从面板配置（verispring.json）强制注入。两个 preset 的 tool-subagent 都关闭
 # modelSelectionSettings：开启时 subagent 工具注册进每个 agent 自己的层，dispatch-gate 的
 # 路由包装无法同层遮蔽，领导面 restrict 也点不到它。
-# 逃生开关：CASEOS_SCOUT=0 关闭领导分工条款；各门禁拒绝信息均含可满足的解锁步骤。
+# 逃生开关：CASEOS_SCOUT=0 关闭领导分工条款；CASEOS_MEM_GUARD=0 关闭内存看门狗；
+# 各门禁拒绝信息均含可满足的解锁步骤。
 # 换网关：在配置面板分别选择测绘智能体与执行智能体的渠道、模型、思考强度。
 - id: llm-pi-ai
   name: '@deepseek-ai/dsh-llm-pi-ai'
@@ -450,6 +451,10 @@
       name: './gates/manon-bridge.js'
     - id: caseos-scout-relay
       name: './gates/scout-relay.js'
+    # host 内存看门狗：软阈值释放空闲子代理的常驻 activation 并剪本插件只增索引；硬阈值只
+    # 告警（main.js 对 host 子进程任何 exit 都算失败停止，不会自动重启）。CASEOS_MEM_GUARD=0 关闭。
+    - id: caseos-memory-guard
+      name: './gates/memory-guard.js'
     # 配置面板：Config schema 提供宿主表单服务；client 组合包页渲染并把模型位落盘到执法面
     - id: verispring-config
       name: './gates/verispring-config.js'
