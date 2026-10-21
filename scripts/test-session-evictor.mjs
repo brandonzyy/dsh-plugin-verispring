@@ -6,7 +6,13 @@
 // - dispose = unregister agent + remove session（dsh-agent:544、dsh-session:1886-1893），
 //   之后 agents.get(sessionId) 为 undefined。
 // - follow 是 AsyncGenerator，挂在 sessionController.history 上；closeFollowers 是全局 Set，
-//   不按会话归属（dsh-api-session-controller/lib/index.js:1440-1467、:1523-1528）。
+//   元素是 follow 生成器体里创建的裸闭包（没有 sessionId/address），因此只能按「包装时登记
+//   是哪个会话在迭代」归属，包装之前就已存在的流不可归属（dsh-api-session-controller/lib/index.js:
+//   1444、:1523-1528、:1624）。
+// - session-controller 与插件条目由 loader 并发 apply（cordis-plugin-loader/src/config/group.ts:56），
+//   所以 history 可能晚于插件 apply 才 provide；cordis 的 ctx.inject 回调在 provide 时唤醒
+//   （cordis/lib/index.js:1600、:800-856、:1306-1343），早于 host 向 shell 发 ready
+//   （dsh-desktop-host/lib/index.js:328 → :342-346），即早于界面第一条 follow。
 // - 冷观察缓存是 sessionQuery._observations.cache，条目带 refs（dsh-session-query/lib/index.js:
 //   327-341、:449-475）；refs > 0 不得清退。
 // - 子代理归属看 manager 的 resident：set 在 agents.resume 之后（dsh-subagent/lib/index.js:1850），
@@ -154,14 +160,17 @@ function makeHarness(options = {}) {
   const services = {
     agents: registry,
     sessions: { get: (id) => sessionStore.get(id) },
-    sessionController,
     sessionQuery,
     sessionPersistence: { coldLogMemo },
     subagents,
     profileContext: { home },
   };
+  // sessionControllerLate：loader 并发 apply 条目（cordis-plugin-loader/src/config/group.ts:56），
+  // 插件 apply 时 session-controller 可能还没 provide，稍后由它的 fiber provide 唤醒 inject 回调。
+  if (options.sessionControllerLate !== true) services.sessionController = sessionController;
   const listeners = new Map();
   const disposers = [];
+  const injectRequests = [];
   const toolNextCalls = { count: 0 };
   const ctx = {
     profileContext: { home },
@@ -175,6 +184,17 @@ function makeHarness(options = {}) {
     effect: (factory) => {
       const disposer = factory();
       if (typeof disposer === "function") disposers.push(disposer);
+    },
+    // cordis 的 ctx.inject（cordis/lib/index.js:1600）：依赖齐备时回调立即执行，否则等 provide。
+    inject: (names, callback) => {
+      const request = { names, callback, active: true };
+      injectRequests.push(request);
+      if (names.every((name) => services[name] !== void 0)) callback();
+      return {
+        dispose: () => {
+          request.active = false;
+        },
+      };
     },
   };
   ctx.root = ctx;
@@ -191,6 +211,15 @@ function makeHarness(options = {}) {
     originalResume,
     originalFollow,
     disabled: options.disabled === true,
+    // 模拟 session-controller 的 fiber 稍后 provide：cordis 在 _reload 里先过一轮微任务再执行
+    // 回调（cordis/lib/index.js:1349-1360），这里同样等一个微任务再唤醒仍在等待的 inject 回调。
+    provideSessionController: async () => {
+      services.sessionController = sessionController;
+      await Promise.resolve();
+      for (const request of injectRequests) {
+        if (request.active && request.names.every((name) => services[name] !== void 0)) request.callback();
+      }
+    },
     resume: async (sessionId, spec = {}) => {
       specs.set(sessionId, { ...(specs.get(sessionId) ?? {}), ...spec });
       return registry.resume({ resumeSessionId: sessionId });
@@ -634,6 +663,92 @@ test("env 覆盖扫描间隔与空闲阈值", async () => {
   harness.advance(60 * 1000);
   await harness.tick();
   assert.equal(harness.disposeCalls.length, 1);
+});
+
+test("包装早于首个 follow：inject 回调在 session-controller provide 的那一刻装上", async () => {
+  // 复现真实启动时序：loader 并发 apply，插件先到、session-controller 后 provide；
+  // 界面第一条 follow 只可能在 host 发 ready 之后到达，因此 inject 回调必须早于它。
+  const harness = makeHarness({ sessionControllerLate: true });
+  assert.equal(harness.history.follow, harness.originalFollow, "provide 之前没有 history 可包装");
+  assert.equal(harness.boot().followerProbe, "deferred", "boot 应如实记「等 inject」，而不是 unavailable");
+
+  await harness.provideSessionController();
+  assert.notEqual(harness.history.follow, harness.originalFollow, "provide 即装包装，不等首次扫描");
+  const install = harness.events().find((entry) => entry.kind === "mem-guard-evict-follow");
+  assert.equal(install?.source, "inject");
+  assert.equal(install?.preexistingFollowers, 0, "provide 时界面还没发起 follow");
+  assert.equal(typeof install?.elapsedMs, "number");
+
+  // 随后到来的第一条 follow 必须被归属：只挡被看的会话，其他空闲会话照卸。
+  await harness.resume("watched");
+  await harness.resume("other");
+  const controller = new AbortController();
+  const stream = harness.history.follow({ address: { kind: "session", sessionId: "watched" } }, controller.signal);
+  await stream.next();
+  harness.advance(10 * 60 * 1000);
+  await harness.tick();
+  assert.deepEqual(harness.disposeCalls.map((call) => call.sessionId), ["other"], "watched 有活跃 follow，other 可卸");
+  controller.abort();
+  await stream.next();
+});
+
+test("包装前已存在的 follow 不可归属：保守规则仍在，总数回落即恢复卸载", async () => {
+  const harness = makeHarness();
+  assert.notEqual(harness.history.follow, harness.originalFollow, "服务就绪时 apply 即装包装");
+  // 模拟插件重载残留：包装安装之前就存在的 follow，closeFollowers 里只有裸闭包，取不到会话。
+  const legacyClose = () => {};
+  harness.history.closeFollowers.add(legacyClose);
+  await harness.resume("a");
+  await harness.resume("b");
+  harness.advance(10 * 60 * 1000);
+  await harness.tick();
+  assert.deepEqual(harness.disposeCalls, [], "总数 > 已归属时全部会话保守不卸");
+  const summary = harness.events().find((entry) => entry.kind === "mem-guard-evict-scan");
+  assert.equal(summary?.followerTotal, 1);
+  assert.equal(summary?.followerTracked, 0);
+  assert.equal(summary?.followerUntracked, 1);
+  assert.deepEqual(summary?.blockers, { "follower-untracked": 2 }, "两个会话都被同一条保守规则挡住");
+
+  harness.history.closeFollowers.delete(legacyClose);
+  await harness.tick();
+  assert.deepEqual(
+    harness.disposeCalls.map((call) => call.sessionId).sort(),
+    ["a", "b"],
+    "不可归属的流结束后，卸载恢复",
+  );
+});
+
+test("扫描汇总：字段齐全，首次即发，之后按 5 分钟节流", async () => {
+  const harness = makeHarness();
+  await harness.resume("idle-session");
+  await harness.resume("busy-session", { status: "running" });
+  harness.advance(10 * 60 * 1000);
+  await harness.tick();
+  const scans = () => harness.events().filter((entry) => entry.kind === "mem-guard-evict-scan");
+  assert.equal(scans().length, 1, "首次扫描就落汇总，方便事后判断为什么没卸");
+  const first = scans()[0];
+  assert.equal(first.tracked, 2);
+  assert.equal(first.candidates, 1);
+  assert.equal(first.evicted, 1);
+  assert.deepEqual(first.blockers, { running: 1 });
+  assert.equal(first.followerTotal, 0);
+  assert.equal(first.followerTracked, 0);
+  assert.equal(first.followerUntracked, 0);
+  assert.equal(first.followerProbe, "session-controller");
+  assert.equal(first.subagentProbe, true);
+  assert.equal(typeof first.heapUsed, "number");
+  assert.equal(first.pressure, false);
+  assert.deepEqual(harness.disposeCalls.map((call) => call.sessionId), ["idle-session"]);
+
+  harness.advance(5 * 60 * 1000 - 1);
+  await harness.tick();
+  assert.equal(scans().length, 1, "未满 5 分钟不再发");
+  harness.advance(1);
+  await harness.tick();
+  assert.equal(scans().length, 2, "满 5 分钟再发一条");
+  assert.equal(scans()[1].tracked, 1, "汇总读扫描开始时的在册数");
+  assert.equal(scans()[1].evicted, 0);
+  assert.deepEqual(scans()[1].blockers, { running: 1 }, "汇总直接说明这次为什么没卸");
 });
 
 let failed = 0;

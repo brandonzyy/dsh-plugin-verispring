@@ -24,6 +24,17 @@
 // 与普通会话走同一套判据。resident 探针拿不到时退回旧行为（子代理会话一律不卸）并保守记
 // subagent-probe-unavailable；follower 证据找不到时同样保守不卸（记 skip，5 分钟限流一次）。
 //
+// follow 归属的安装时机：session-controller 与插件条目由 loader 并发 apply
+// （cordis-plugin-loader/src/config/group.ts:56 的 Promise.all），apply 时 history 可能还没
+// provide；惰性到首次扫描（约 60s 后）安装又晚于界面第一条 follow，那之后计数与总数永远对不上，
+// 卸载器在用户切换会话之前什么都不卸。因此在 apply 时先试装一次，再用
+// ctx.inject(["sessionController"], …) 在服务可用的那一刻补装：cordis 的 inject 回调由 provide
+// 唤醒（cordis/lib/index.js:800-856、:1306-1343），发生在 host 向 shell 发 ready 之前
+// （dsh-desktop-host/lib/index.js:328 的 await application → :342-346 的 process.send ready），
+// 因而必然早于界面发起的第一条 follow。closeFollowers 的元素是 follow 生成器体里创建的裸闭包，
+// 没有 sessionId/address（dsh-api-session-controller/lib/index.js:1523-1528），安装之前就已存在的
+// 流无法按元素归属；此时只要总数多于已归属数，就全部会话保守不卸。
+//
 // 释放后 session-controller 的 resolve() 首行 liveAgent() 会落空（dsh-api-session-controller/
 // lib/index.js:218-240），下一次访问自然重新 promote → 再次被本插件捕获。dispose 会 stop loop、
 // await idle、卸 scope、关持久化 handle、最后 detachAgent/detachSession（agent-loop:1740-1810），
@@ -37,7 +48,10 @@
 // 堆压力（heapUsed ≥ V8 顶棚 × 50%）时门槛降到 2 分钟并按 lastActive 的 LRU 顺序卸。
 // 卸载失败 30 分钟内不再尝试该会话。monitor：mem-guard-evict（session、idleMs、
 // heapUsedBefore、pressure、observationEvicted）/ mem-guard-evict-fail（error 截 200）/
-// mem-guard-evict-boot / mem-guard-evict-skip（reason：follower-unknown、scan-failed）。
+// mem-guard-evict-boot / mem-guard-evict-follow（follow 包装装上时一条：source=apply|inject|scan、
+// preexistingFollowers、elapsedMs）/ mem-guard-evict-scan（每 5 分钟一条汇总：tracked、candidates、
+// evicted、blockers、followerTotal、followerTracked、followerUntracked、followerProbe、
+// subagentProbe、heapUsed、pressure）/ mem-guard-evict-skip（reason：follower-unknown、scan-failed）。
 import { homedir } from "node:os";
 import { monitorEvent } from "./monitor-log.js";
 import { heapLimitBytes } from "./memory-guard.js";
@@ -51,6 +65,7 @@ const PRESSURE_IDLE_MS = 2 * 60 * 1000;
 const PRESSURE_RATIO = 0.5;
 const FAIL_BACKOFF_MS = 30 * 60 * 1000;
 const SKIP_LOG_MS = 5 * 60 * 1000;
+const SUMMARY_MS = 5 * 60 * 1000;
 const DISPOSE_TIMEOUT_MS = 60 * 1000;
 const ERROR_LIMIT = 200;
 const UNTRACKED_LIMIT = 10;
@@ -167,7 +182,9 @@ export function evictionBlockers(entry, context) {
   }
   if (descendantLive(entry.sessionId)) blockers.push("live-descendant");
   if (claimInFlight(entry.sessionId)) blockers.push("operation-in-flight");
-  if (followerBlocks(entry.sessionId)) blockers.push("followed");
+  // followerBlocks 返回具体原因串（followed / follower-untracked），替身返回布尔时按 followed 记。
+  const follower = followerBlocks(entry.sessionId);
+  if (follower) blockers.push(typeof follower === "string" ? follower : "followed");
   return blockers;
 }
 
@@ -232,6 +249,10 @@ export default {
     let trackingEnabled = true;
     let lastSkipAt = 0;
     let lastSkipReason = "";
+    let lastSummaryAt = 0;
+    let followerInstalledAt = 0;
+    let disposed = false;
+    const bootAt = Date.now();
 
     const reportSkip = (reason, extra) => {
       const now = Date.now();
@@ -283,16 +304,21 @@ export default {
     // follower 归属：session-controller 的 closeFollowers 只有全局 Set，不能直接按会话归属；
     // 在 history.follow 上做一次可逆包装，拿到 sessionId → 活跃 follow 数。若包装不可用，
     // 只要 closeFollowers.size > 0 就保守视为「所有会话都有人在看」。
-    const ensureFollowerProbe = () => {
+    //
+    // 安装时机就是判据本身：包装必须早于界面第一条 follow。apply 时先试装（history 可能已 provide），
+    // 没装上就交给 ctx.inject(["sessionController"], …) 在服务 provide 的同一刻补装；只有宿主没有
+    // inject 时才退化到首次扫描。closeFollowers 的元素是裸闭包，安装前已存在的流无法归属。
+    const installFollowerProbe = (source) => {
+      if (disposed) return false;
       const history = service("sessionController")?.history;
       if (history === void 0 || typeof history.follow !== "function") {
         followerKnown = typeof history?.closeFollowers?.size === "number";
-        return;
+        return false;
       }
       const marker = history.follow[FOLLOW_PATCH];
       if (marker?.active === activeFollowers) {
         followerKnown = true;
-        return;
+        return true;
       }
       try {
         const original = marker?.original ?? history.follow;
@@ -300,22 +326,35 @@ export default {
         history.follow = wrapped;
         followPatch = { history, wrapped, original };
         followerKnown = true;
+        if (followerInstalledAt === 0) {
+          followerInstalledAt = Date.now();
+          const preexisting = typeof history.closeFollowers?.size === "number" ? history.closeFollowers.size : -1;
+          monitorEvent(dshHome, {
+            kind: "mem-guard-evict-follow",
+            source,
+            preexistingFollowers: preexisting,
+            elapsedMs: followerInstalledAt - bootAt,
+          });
+        }
+        return true;
       } catch {
         followerKnown = typeof history.closeFollowers?.size === "number";
+        return false;
       }
     };
 
     const followerBlocks = (sessionId) => {
-      ensureFollowerProbe();
+      installFollowerProbe("scan");
       if (!followerKnown) return true;
-      if ((activeFollowers.get(sessionId) ?? 0) > 0) return true;
+      if ((activeFollowers.get(sessionId) ?? 0) > 0) return "followed";
       const history = service("sessionController")?.history;
       const total = history?.closeFollowers?.size;
       if (typeof total !== "number") return false;
       let tracked = 0;
       for (const count of activeFollowers.values()) tracked += count;
-      // 包装安装前就存在的 follow 没有归属：只要总数多于已归属数，就对所有会话保守不卸。
-      return total > tracked;
+      // 安装前就存在的 follow 没有归属（元素是裸闭包，取不到 sessionId/address）：只要总数多于
+      // 已归属数，就对所有会话保守不卸；它们关掉之后总数回落，卸载自动恢复。
+      return total > tracked ? "follower-untracked" : false;
     };
 
     // 任何活子代（含 idle 常驻）都算「有活」：父 agent 的 dispose 会连带拆子激活，
@@ -376,6 +415,26 @@ export default {
       }
     };
 
+    // 每 5 分钟一条扫描汇总：把「为什么没卸」变成可直接读的计数，无需翻单条 evict 事件。
+    // 首次扫描就发（lastSummaryAt=0），之后按 5 分钟节流；节流以发事件时刻为准，与扫描间隔无关。
+    const reportScan = (summary) => {
+      const now = Date.now();
+      if (lastSummaryAt !== 0 && now - lastSummaryAt < SUMMARY_MS) return;
+      lastSummaryAt = now;
+      const total = service("sessionController")?.history?.closeFollowers?.size;
+      let followerTracked = 0;
+      for (const count of activeFollowers.values()) followerTracked += count;
+      monitorEvent(dshHome, {
+        kind: "mem-guard-evict-scan",
+        ...summary,
+        followerTotal: typeof total === "number" ? total : null,
+        followerTracked,
+        followerUntracked: typeof total === "number" ? Math.max(0, total - followerTracked) : null,
+        followerProbe: followerKnown ? "session-controller" : "unavailable",
+        subagentProbe: subagentResident() !== void 0,
+      });
+    };
+
     const scan = async () => {
       if (scanning) return;
       scanning = true;
@@ -385,7 +444,7 @@ export default {
         const pressure = heapUsed >= Math.floor(limit * PRESSURE_RATIO);
         const threshold = pressure ? Math.min(idleMs, PRESSURE_IDLE_MS) : idleMs;
         if (!followerKnown) {
-          ensureFollowerProbe();
+          installFollowerProbe("scan");
           if (!followerKnown) reportSkip("follower-unknown", { heapUsed });
         }
         const live = liveAgents();
@@ -400,12 +459,20 @@ export default {
           subagentResident,
           subagentOperationInFlight,
         };
+        const tracked = entries.size;
         const candidates = [];
+        const blockers = {};
         for (const entry of entries.values()) {
-          if (evictionBlockers(entry, context).length === 0) candidates.push(entry);
+          const reasons = evictionBlockers(entry, context);
+          if (reasons.length === 0) {
+            candidates.push(entry);
+            continue;
+          }
+          for (const reason of reasons) blockers[reason] = (blockers[reason] ?? 0) + 1;
         }
         // 堆压力下按 LRU 先卸；非压力时同样从最久未活动的开始，避免先动刚用过的会话。
         candidates.sort((left, right) => left.lastActive - right.lastActive);
+        let evicted = 0;
         for (const entry of candidates) {
           // 候选确定到真正 dispose 之间可能来输入/follow/claim/子代理：调用前用最新状态再核一次。
           const fresh = {
@@ -424,6 +491,7 @@ export default {
             const observationEvicted = purgePreparedObservation(entry.sessionId);
             const coldLogEvicted = purgeColdLogMemo(entry.sessionId);
             removeEntry(entry);
+            evicted += 1;
             monitorEvent(dshHome, {
               kind: "mem-guard-evict",
               session: entry.sessionId,
@@ -446,6 +514,14 @@ export default {
             });
           }
         }
+        reportScan({
+          tracked,
+          candidates: candidates.length,
+          evicted,
+          blockers,
+          heapUsed,
+          pressure,
+        });
       } catch (error) {
         reportSkip("scan-failed", { error: errorText(error) });
       } finally {
@@ -454,7 +530,19 @@ export default {
     };
 
     resumePatch = installResumePatch(agents, track);
-    ensureFollowerProbe();
+    installFollowerProbe("apply");
+    const canInject = typeof ctx.inject === "function";
+    // 会话控制器与插件条目由 loader 并发 apply（cordis-plugin-loader/src/config/group.ts:56），
+    // apply 时它可能还没 provide。inject 回调在服务 provide 的那一刻触发（cordis/lib/index.js:
+    // 800-856、:1306-1343），仍早于 host 向 shell 发 ready（dsh-desktop-host/lib/index.js:328 →
+    // :342-346），因此早于界面发起的第一条 follow。没有 inject 的宿主退化为首次扫描安装。
+    if (canInject) {
+      try {
+        ctx.inject(["sessionController"], () => installFollowerProbe("inject"));
+      } catch {
+        // 忽略：首次扫描的 installFollowerProbe("scan") 仍会尝试；失败时保守规则照常生效。
+      }
+    }
 
     const live = liveAgents();
     const untracked = live.filter((agent) => agent?.id !== void 0 && !entries.has(agent.id)).map((agent) => agent.id);
@@ -468,7 +556,8 @@ export default {
       tracked: entries.size,
       untrackedTotal: untracked.length,
       untracked: untracked.slice(0, UNTRACKED_LIMIT),
-      followerProbe: followerKnown ? "session-controller" : "unavailable",
+      // 有 inject 的宿主这里只是「还没到 provide 时刻」，实际安装由 mem-guard-evict-follow 记录。
+      followerProbe: followerKnown ? "session-controller" : canInject ? "deferred" : "unavailable",
       resumePatched: resumePatch !== void 0,
       subagentProbe: subagentResident() !== void 0,
     });
@@ -493,6 +582,7 @@ export default {
     if (typeof timer?.unref === "function") timer.unref();
 
     ctx.effect(() => () => {
+      disposed = true;
       trackingEnabled = false;
       clearInterval(timer);
       if (resumePatch !== void 0 && resumePatch.proto.resume === resumePatch.wrapped) {
