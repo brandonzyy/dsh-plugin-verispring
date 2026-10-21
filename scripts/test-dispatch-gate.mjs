@@ -80,7 +80,16 @@ function makeHarness(options = {}) {
     get: (id) => childAgents.get(id),
     isOwnedBy: (childId, leader) => childAgents.get(childId)?.owned === true && leader !== void 0,
   };
-  const sessionTitle = { get: () => void 0, rename: (target, title) => calls.rename.push([target, title]) };
+  // 会话标题（行内副标题）：宿主持久化，冷恢复后仍可读。options.titles 预置历史标题
+  // （模拟跨进程遗留），rename 只记录调用；预置事实不被改写，角色/描述自愈据此还原。
+  const presetTitles = options.titles ?? {};
+  const sessionTitle = {
+    get: (session) => {
+      const title = session?.header?.id ? presetTitles[session.header.id] : void 0;
+      return title === void 0 ? void 0 : { title };
+    },
+    rename: (target, title) => calls.rename.push([target, title]),
+  };
   const sessionController = { agents: { selectForNextRequest: (...args) => calls.select.push(args) } };
   const services = { agents, sessionTitle, sessionController, sessionProjections: { stateOf: () => void 0 } };
 
@@ -192,6 +201,7 @@ function makeHarness(options = {}) {
   return {
     leader,
     cwd,
+    home,
     scopedTools,
     scopedRestricted,
     calls,
@@ -307,7 +317,9 @@ test("测绘 end=error 后执行派遣被拒，明示测绘前缀的接替派遣
 
   assert.equal(harness.calls.activation.length, 1);
   const spec = harness.calls.activation[0];
-  assert.match(spec.label, / · scout · /);
+  // descriptor label 是事项简述：列表主标题不得以模型/路由名开头。
+  assert.equal(spec.label, "测绘智能体：增量校对");
+  assert.equal(spec.request.label, "测绘智能体：增量校对");
   const prompt = spec.request.prompt[0].text;
   assert.match(prompt, /【实际路由：scout/);
   assert.match(prompt, /【测绘智能体】/);
@@ -324,7 +336,9 @@ test("测绘 end=error 后执行派遣被拒，明示测绘前缀的接替派遣
   assert.equal(harness.calls.select[0][0].id, result.subagentId);
   // 标题是延迟重写的（宿主自动起名会覆盖一次），等第一个定时器落下再看。
   await new Promise((resolve) => setTimeout(resolve, 20));
-  assert.ok(harness.calls.rename.some(([, title]) => title.includes(" · scout · ")), "子代理标题应写实际路由");
+  const titles = harness.calls.rename.map(([, title]) => title);
+  assert.ok(titles.includes("verispring/deepseek-flash@high · scout · 测绘智能体：增量校对"), "会话标题应保留路由、角色与事项简述");
+  assert.ok(titles.some((title) => title.includes(" · scout · ")), "roleFromTitle/manon-bridge 依赖的标记必须保留");
 });
 
 test("send_message 报 NOT_RESUMABLE 后旧测绘记不可达，执行派遣被拒、测绘前缀可重派", async () => {
@@ -342,7 +356,7 @@ test("send_message 报 NOT_RESUMABLE 后旧测绘记不可达，执行派遣被�
   assert.equal(harness.guard({ description: "scout: 重派", prompt: "x" }), void 0);
   await harness.dispatch({ description: "scout: 重派", prompt: "x" });
   assert.equal(harness.calls.activation.length, 1);
-  assert.match(harness.calls.activation[0].label, / · scout · /);
+  assert.equal(harness.calls.activation[0].label, "scout: 重派");
 });
 
 test("无关的 send_message 失败不解除常驻", () => {
@@ -518,7 +532,7 @@ test("测绘前缀的派遣按测绘启动：注册 scoutId，注入职责与地
   const result = await harness.dispatch({ description: "scout: 建图", prompt: "建图" });
 
   const spec = harness.calls.activation[0];
-  assert.match(spec.label, / · scout · /);
+  assert.equal(spec.label, "scout: 建图", "主标题是事项简述，不含路由");
   const prompt = spec.request.prompt[0].text;
   assert.match(prompt, /【实际路由：scout/);
   assert.match(prompt, /【测绘智能体】/);
@@ -536,18 +550,102 @@ test("测绘前缀的派遣按测绘启动：注册 scoutId，注入职责与地
   assert.doesNotMatch(receipt, /已接替不可达测绘/, "首任测绘没有接替事实");
 });
 
+// ---- 主标题与副标题分离：列表主标题 = 事项简述，会话标题仍含路由与角色 ----
+
+test("新派遣 descriptor label 是事项简述，会话标题保留 route · role · 简述", async () => {
+  const harness = makeHarness();
+  const scoutDescription = "测绘智能体：增量校对 ask_scout 微任务空转";
+  const scout = await harness.dispatch({ description: scoutDescription, prompt: "只做增量校对" });
+  const executorDescription = "修 ask_scout 微任务空转致 OOM";
+  const executor = await harness.dispatch({ description: executorDescription, prompt: "改 gates/scout-relay.js:520" });
+
+  const [scoutSpec, executorSpec] = harness.calls.activation;
+  assert.equal(scoutSpec.label, scoutDescription, "主标题必须是事项简述");
+  assert.equal(scoutSpec.request.label, scoutDescription, "request.label 与 startActivation label 同源");
+  assert.equal(executorSpec.label, executorDescription);
+  assert.ok(!scoutSpec.label.startsWith("verispring/"), "主标题不得以模型/路由名开头");
+
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const titleOf = (id) => harness.calls.rename
+    .filter(([target]) => target?.header?.id === id)
+    .map(([, title]) => title);
+  assert.deepEqual(titleOf(scout.subagentId), [`verispring/deepseek-flash@high · scout · ${scoutDescription}`]);
+  assert.deepEqual(titleOf(executor.subagentId), [`verispring/deepseek-flash@high · executor · ${executorDescription}`]);
+  assert.match(titleOf(scout.subagentId)[0], / · scout · /, "roleFromTitle/manon-bridge 依赖的标记必须保留");
+});
+
+test("事项简述为空时主标题回落角色名，会话标题只留 route · role", async () => {
+  const harness = makeHarness();
+  await harness.dispatch({ description: "   ", prompt: "x" });
+
+  assert.equal(harness.calls.activation[0].label, "executor");
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.ok(
+    harness.calls.rename.some(([, title]) => title === "verispring/deepseek-flash@high · executor"),
+    "没有简述时标题不应带空段或路由名当主标题",
+  );
+});
+
+test("resume（派遣队列为空）按会话标题还原简述，不写无描述的 route · role", async () => {
+  const description = "修 ask_scout 微任务空转致 OOM";
+  const title = `verispring/deepseek-flash@high · scout · ${description}`;
+  const harness = makeHarness({ titles: { "child-resume": title } });
+  harness.seedAgent({ id: "child-resume", role: "scout" });
+
+  await harness.created(harness.agent("child-resume"));
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  const renamed = harness.calls.rename.map(([, value]) => value);
+  assert.ok(renamed.length > 0, "有简述时必须按当前路由重拼标题");
+  assert.ok(renamed.every((value) => value.includes(description)), `不得改写为无描述标题：${JSON.stringify(renamed)}`);
+  assert.ok(!renamed.includes("verispring/deepseek-flash@high · scout"), "不得产生 route · role 标题");
+  assert.equal(renamed[0], title, "重拼结果与原标题一致");
+});
+
+test("resume 解析不出简述时保留原标题，不做 rename", async () => {
+  const harness = makeHarness({ titles: { "child-legacy": "临时标题" } });
+  harness.seedAgent({ id: "child-legacy", role: "executor" });
+
+  await harness.created(harness.agent("child-legacy"));
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  assert.equal(harness.calls.rename.length, 0, "解析不出简述不得改写标题");
+});
+
+test("路由热更新重拼标题时保留事项简述", async () => {
+  const harness = makeHarness();
+  const description = "修 ask_scout 微任务空转致 OOM";
+  const result = await harness.dispatch({ description, prompt: "改 gates/scout-relay.js:520" });
+
+  writeFileSync(
+    `${harness.home}/verispring.json`,
+    `${JSON.stringify({ executor: { provider: "verispring", model: "deepseek-v4-pro", reasoningEffort: "max" } })}\n`,
+  );
+  await harness.install(harness.agent(result.subagentId));
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  const titles = harness.calls.rename
+    .filter(([target]) => target?.header?.id === result.subagentId)
+    .map(([, title]) => title);
+  assert.ok(
+    titles.includes(`verispring/deepseek-v4-pro@max · executor · ${description}`),
+    `热更新标题应保留简述：${JSON.stringify(titles)}`,
+  );
+  assert.ok(!titles.includes("verispring/deepseek-v4-pro@max · executor"), "不得丢掉简述");
+});
+
 test("执行派遣不写、不改会话的 scout 字段", async () => {
   const harness = makeHarness();
   harness.primeScout("scout-A");
   await harness.dispatch({ description: "改代码", prompt: "把 a 改成 b" });
   assert.equal(harness.scoutState().scoutId, "scout-A");
   assert.equal(harness.scoutState().scoutUnreachable, void 0);
-  assert.match(harness.calls.activation[0].label, / · executor · /);
+  assert.equal(harness.calls.activation[0].label, "改代码");
 
   // 没有测绘时直接调用执行入口（绕过 guard）也不会把子代理记成测绘。
   const blank = makeHarness();
   const result = await blank.dispatch({ description: "改代码", prompt: "把 a 改成 b" });
-  assert.match(blank.calls.activation[0].label, / · executor · /);
+  assert.equal(blank.calls.activation[0].label, "改代码");
   assert.match(blank.calls.activation[0].request.prompt[0].text, /【实际路由：executor/);
   assert.equal(blank.scoutState(), void 0);
   assert.equal(result.role, "executor");
@@ -721,7 +819,7 @@ test("测绘派遣含调研措辞仍放行（第 1、3 条只约束执行派遣�
 
   const first = await harness.dispatch(args);
   assert.ok(first.subagentId);
-  assert.match(harness.calls.activation[0].label, / · scout · /);
+  assert.equal(harness.calls.activation[0].label, "测绘智能体：全库巡检");
 
   // 测绘已在常驻：同一任务书写给执行者仍被调研措辞拦（规则只对执行派遣生效）。
   assert.match(harness.guard({ description: "改代码", prompt: "先调研一下现状" }), /调研型措辞/);

@@ -227,6 +227,20 @@ function roleFromTitle(sessionTitle, session) {
   return void 0;
 }
 
+// 会话标题（行内副标题）形如 `路由 · 角色 · 事项简述`。冷恢复（send_message 续接）时派遣
+// 队列已空，事项简述只能从当前标题取回；解析不出（旧的无描述标题、被宿主自动起名覆盖、
+// 自定义标题）返回 undefined——调用方据此保留原标题，绝不写回无描述的 `路由 · 角色`。
+function descriptionFromTitle(sessionTitle, session, role) {
+  if (!sessionTitle?.get) return void 0;
+  try {
+    const title = sessionTitle.get(session)?.title ?? "";
+    const parts = title.split(" · ");
+    if (parts.length < 3 || parts[1] !== role) return void 0;
+    return parts.slice(2).join(" · ").trim() || void 0;
+  } catch {}
+  return void 0;
+}
+
 // git HEAD 读取（地图新鲜度门用）：非仓库/git 缺失一律返回 undefined 并放行（fail-open）。
 function gitHead(cwd) {
   try {
@@ -688,8 +702,14 @@ const plugin = {
       const role = isScoutDescription(args.description) ? "scout" : "executor";
       routes = loadRoutes(configFile);
       const route = routes[role];
+      // label = 事项简述。列表主标题是宿主在创建时冻结的 descriptor.label（request.label /
+      // startActivation 的 label），必须只看事项简述——以模型/路由名开头会把真正要做的事
+      // 挤出可见区。描述为空时回落角色名，仍保证主标题可读。
       const label = String(args.description ?? "").trim();
-      const roleLabel = `${routeText(route)} · ${role} · ${label}`;
+      const descriptorLabel = label || role;
+      // 会话标题（行内副标题）保留 `路由 · 角色 · 事项简述`：路由仍可见，且 roleFromTitle 与
+      // manon-bridge 靠这一段里的 ` · scout · ` 判测绘角色，格式不得改动。
+      const roleLabel = label ? `${routeText(route)} · ${role} · ${label}` : `${routeText(route)} · ${role}`;
       // 测绘派遣一律交底职责与现状；只有上一任已不可达时才带接替事实（回执同源）。
       const previousState = role === "scout" ? readStateFile(sessionId, stateDir) : {};
       const previousScout = role === "scout" && previousState.scoutUnreachable
@@ -705,17 +725,17 @@ const plugin = {
       const routedPrompt = `【实际路由：${role} · ${routeText(route)}】\n${scoutPrefix}${String(args.prompt ?? "")}`;
       process.stderr.write(`caseos-dispatch-gate: 强制 ${role} 子代理 ${routeText(route)}\n`);
       const request = {
-        label: roleLabel,
+        label: descriptorLabel,
         prompt: [{ type: "text", text: routedPrompt }],
         parent: exec.agent,
         agentPreset: SUBAGENT_PRESET,
         agentOptions: { provider: route.provider, model: route.model, reasoningEffort: route.reasoningEffort },
         maxDepth: 1,
       };
-      queueRoutePlan(sessionId, { label: roleLabel, route, role });
+      queueRoutePlan(sessionId, { description: label, label: roleLabel, route, role });
       let child;
       try {
-        child = await startActivation(live, exec, { provider: "spawn", label: roleLabel, request, signal: exec.signal, delivery: "parent" });
+        child = await startActivation(live, exec, { provider: "spawn", label: descriptorLabel, request, signal: exec.signal, delivery: "parent" });
       } catch (error) {
         takeRoutePlan(sessionId);
         monitorEvent(dshHome, {
@@ -740,7 +760,7 @@ const plugin = {
         child: child.childId,
         label: label.slice(0, 120),
       });
-      applyChildRoute(serviceOf(live, "agents", ctx.root)?.get(child.childId), { label: roleLabel, route, role }, live);
+      applyChildRoute(serviceOf(live, "agents", ctx.root)?.get(child.childId), { description: label, label: roleLabel, route, role }, live);
       renameChildTitleAfterAutoTitle(live, child.childId, roleLabel);
       if (role === "scout") {
         rememberScoutOwner(child.childId, sessionId, stateDir);
@@ -940,7 +960,17 @@ const plugin = {
       routes = loadRoutes(configFile);
       const route = routes[role];
       const queued = takeRoutePlan(agent.session.header.parentSession);
-      return queued ?? { label: `${routeText(route)} · ${role}`, route, role };
+      if (queued) return queued;
+      // 冷恢复（send_message 续接）时派遣队列已空：事项简述只能从当前会话标题取回，再按
+      // 当前路由重拼；取不回就不给 label（agent/created 因此不 rename），保留原标题——
+      // 绝不把带描述的标题改写回无描述的 `路由 · 角色`。
+      const description = descriptionFromTitle(live.get("sessionTitle"), agent.session, role);
+      return {
+        description,
+        label: description ? `${routeText(route)} · ${role} · ${description}` : void 0,
+        route,
+        role,
+      };
     };
 
     for (const agent of liveOf().get("agents")?.list() ?? []) void installLeaderTool(agent);
@@ -970,11 +1000,14 @@ const plugin = {
           // 常驻测绘与执行子代理下一回合即生效，不必重派、不必重启。
           const route = loadRoutes(configFile)[cached.role] ?? cached.route;
           if (routeText(route) !== routeText(cached.route)) {
-            const suffix = cached.label.split(" · ").slice(2).join(" · ");
-            const label = `${routeText(route)} · ${cached.role}${suffix ? ` · ${suffix}` : ""}`;
+            // 重拼用 plan.description，不再 split 会话标题：描述本身可能含 " · "，从标题
+            // 反推会在第一次热更新就把描述截断。取不到描述则不 rename（保留原标题）。
+            const label = cached.description
+              ? `${routeText(route)} · ${cached.role} · ${cached.description}`
+              : void 0;
             monitorEvent(dshHome, { kind: "child-route-updated", agent: agent.id, role: cached.role, to: routeText(route) });
-            applyChildRoute(agent, { ...cached, route, label }, liveOf(agent));
-            renameChildTitleAfterAutoTitle(liveOf(agent), agent.id, label);
+            applyChildRoute(agent, { ...cached, route, ...(label ? { label } : {}) }, liveOf(agent));
+            if (label) renameChildTitleAfterAutoTitle(liveOf(agent), agent.id, label);
           } else applyChildRoute(agent, cached, liveOf(agent));
         }
       }
