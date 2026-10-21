@@ -204,12 +204,6 @@ channel:
     model: claude-opus-5-5
 ```
 
-The gateway's anthropic exit emits a duplicate `message_start` for short replies with
-thinking enabled; `llm-deepseek` fails hard on it with `MALFORMED_RESPONSE` (pi-ai only
-updates usage, so the pi-ai route never surfaced it). Until the gateway is fixed, the bundled
-`verispring-deepseek` entry carries `dedupeDuplicateMessageStart: true`: it drops only the
-duplicate `message_start` frames for that endpoint and streams everything else through.
-Remove that switch once the gateway fix ships and re-tests green.
 
 > **Exclusive discounts**: contact the package author — **20% off Claude, 50% off DeepSeek Flash**; WeChat: `jinyong0716`.
 

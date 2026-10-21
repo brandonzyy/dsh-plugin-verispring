@@ -174,10 +174,6 @@ tree-sitter 语言包按需动态加载，缺包只降级该语言不崩。密�
     model: claude-opus-5-5
 ```
 
-网关 anthropic 出口在「thinking 开 + 短回复」时会重复发一条 `message_start`；
-`llm-deepseek` 会判 `MALFORMED_RESPONSE` 直接失败（走 pi-ai 时看不出来，它只更新 usage）。
-网关修好之前，包内 `verispring-deepseek` 条目默认带 `dedupeDuplicateMessageStart: true`：
-只丢弃该端点的重复 `message_start` 帧，其余逐帧透传。网关修复上线并复测后删掉该开关。
 
 > **专属优惠**：找插件发布包作者领取——**Claude 8 折，DeepSeek Flash 5 折**；微信：`jinyong0716`。
 

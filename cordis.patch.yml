@@ -467,13 +467,10 @@
     - id: verispring-config
       name: './gates/verispring-config.js'
 
-# ---- D4：Verispring 的 deepseek-flash 改走 llm-deepseek（与官方同一适配器）----
-# provider id 用 verispring-ds（displayName「Verispring DeepSeek」），与 pi-ai 的 verispring
-# 并存：pi-ai 那条只服务在途会话与 claude-opus-5-5，llm-deepseek 这条服务新派遣。
-# id 冲突由本插件的 deepseek-gateway 解决（复用 registerDeepSeekProvider——该函数把 provider id
-# 当参数，硬编码只存在于 dsh-llm-deepseek-api-key:37）。
-# 本条目只放在插件组合包里：desktop 与 verispring 两个 profile 都 bundle 它，profile patch
-# 再 insert 一次会同 id 冲突。
+# ---- D4：Verispring 的 deepseek-flash 走 llm-deepseek（与官方同一适配器、同一份参数）----
+# provider id 用 verispring-ds（displayName「Verispring DeepSeek」）：id 由本插件的
+# deepseek-gateway 注入（复用 registerDeepSeekProvider——该函数把 provider id 当参数）。
+# 与官方 llm-deepseek 条目逐项相同，只保留地址（baseURL）与密钥（apiKeyEnv）两处差别。
 - insert:
     - id: verispring-deepseek
       name: 'dsh-plugin-verispring/deepseek-gateway'
@@ -482,20 +479,12 @@
         displayName: Verispring DeepSeek
         apiKeyEnv: VERISPRING_API_KEY
         baseURL: https://api.verispring.cn
-        thinking: enabled
-        streamIdleTimeoutMs: 600000
-        maxTokens: 256000
-        retryPolicy:
-          mode: normal
-          maxRetries: 4
-          retryableCodes: [TRANSPORT, SERVER, TIMEOUT, RATE_LIMIT, EMPTY_RESPONSE]
-        # 网关 /v1/files 未实现（401）：小图自动回退内联 base64（实测 200）；
-        # 外置阈值保持默认 20MB，不要让大图走到外置路径。
         models:
           - id: deepseek-flash
             name: deepseek-flash
             contextWindow: 1000000
-            maxTokens: 256000
-            inputModalities: [text, image]
+            inputModalities:
+              - text
+              - image
             systemPromptUpdate: in-history
             toolUpdate: addition-only
