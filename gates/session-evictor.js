@@ -15,11 +15,14 @@
 // （rc.2 的 resume 是类方法，在原型上：dsh-agent/lib/index.js:466）。反过来，插件拿不到 raw
 // registry 实例（`ctx.get("agents")` 同样被 getTraceable 包过），改实例不可行。
 //
-// 卸载判据（全部满足）：非 subagent 会话；agent.status === "idle"；durable inbox 无 pending；
-// 无任何活的子代 agent；没有 UI follow 流（按 follow 的 session 归属；无法归属的 follower 视为
-// 「有人在看」一律不卸）；session-controller 没有在途 resume/claim；距最后一次 session/event、
-// agent/status、工具调用 ≥ 空闲阈值；不是当前被 UI 跟随的根会话。找不到 follower 证据时保守
-// 不卸（记 skip，5 分钟限流一次）。
+// 卸载判据（全部满足）：不是「仍有活 activation 的子代理会话」；agent.status === "idle"；
+// durable inbox 无 pending；无任何活的子代 agent；没有 UI follow 流（按 follow 的 session 归属；
+// 无法归属的 follower 视为「有人在看」一律不卸）；session-controller 没有在途 resume/claim；
+// subagents manager 没有在途 child 操作；距最后一次 session/event、agent/status、工具调用 ≥
+// 空闲阈值。子代理来源会话按 activation 归属判定：id 仍在 manager 的 resident 里才不碰
+// （subagent-resident）；已经 settle（resident 在 dsh-subagent/lib/index.js:2034 删除）的会话
+// 与普通会话走同一套判据。resident 探针拿不到时退回旧行为（子代理会话一律不卸）并保守记
+// subagent-probe-unavailable；follower 证据找不到时同样保守不卸（记 skip，5 分钟限流一次）。
 //
 // 释放后 session-controller 的 resolve() 首行 liveAgent() 会落空（dsh-api-session-controller/
 // lib/index.js:218-240），下一次访问自然重新 promote → 再次被本插件捕获。dispose 会 stop loop、
@@ -133,10 +136,25 @@ function installResumePatch(agents, track) {
 
 // 纯判据：返回阻塞原因列表，[] 才允许卸载。测试直接喂替身对象核对。
 export function evictionBlockers(entry, context) {
-  const { now, threshold, agents, sessions, followerBlocks, descendantLive, claimInFlight } = context;
+  const {
+    now,
+    threshold,
+    agents,
+    sessions,
+    followerBlocks,
+    descendantLive,
+    claimInFlight,
+    subagentResident,
+    subagentOperationInFlight,
+  } = context;
   if (entry === void 0 || entry.agent === void 0) return ["no-entry"];
   const blockers = [];
-  if (entry.subagent === true) blockers.push("subagent");
+  if (entry.subagent === true) {
+    const resident = subagentResident();
+    if (resident === void 0) blockers.push("subagent-probe-unavailable");
+    else if (resident.has(entry.sessionId)) blockers.push("subagent-resident");
+    else if (subagentOperationInFlight(entry.sessionId)) blockers.push("subagent-operation-in-flight");
+  }
   if (now - entry.lastActive < threshold) blockers.push("recent-activity");
   if ((entry.blockedUntil ?? 0) > now) blockers.push("backoff");
   if (agents.get(entry.sessionId) !== entry.agent) blockers.push("agent-not-live");
@@ -183,6 +201,21 @@ export default {
       } catch {
         return void 0;
       }
+    };
+
+    // resident 在 manager 上（service 暴露的是 `subagents.manager`，dsh-subagent/lib/index.js:
+    // 2984、:2996-3003），不是 service 顶层字段。它是 live activation 的唯一权威集合
+    // （:1220-1223、:1850 插入、:2034 自然 settle 删除）。拿不到 Map 时返回 undefined，判据退回旧行为。
+    const subagentManager = () => service("subagents")?.manager;
+    const subagentResident = () => {
+      const resident = subagentManager()?.resident;
+      return resident instanceof Map || resident instanceof Set ? resident : void 0;
+    };
+    // 续接/投递在 resident 插入之前要跑 observe + resume：manager 的 ChildLock 用 tails 记录
+    // 在途 child（dsh-subagent/lib/index.js:1121-1140、:2090-2095），命中就说明有人正在操作它。
+    const subagentOperationInFlight = (sessionId) => {
+      const tails = subagentManager()?.locks?.tails;
+      return tails instanceof Map && tails.has(sessionId);
     };
 
     const agents = ctx.agents;
@@ -297,7 +330,7 @@ export default {
         children.push(agent);
         byParent.set(parent, children);
       }
-      const resident = service("subagents")?.resident;
+      const resident = subagentResident();
       return (sessionId) => {
         if ((byParent.get(sessionId) ?? []).some((child) => child?.id !== void 0)) return true;
         if (resident instanceof Map) {
@@ -364,6 +397,8 @@ export default {
           followerBlocks,
           descendantLive: makeDescendantCheck(live),
           claimInFlight,
+          subagentResident,
+          subagentOperationInFlight,
         };
         const candidates = [];
         for (const entry of entries.values()) {
@@ -435,6 +470,7 @@ export default {
       untracked: untracked.slice(0, UNTRACKED_LIMIT),
       followerProbe: followerKnown ? "session-controller" : "unavailable",
       resumePatched: resumePatch !== void 0,
+      subagentProbe: subagentResident() !== void 0,
     });
 
     // 活动面：任何会话事件/状态/工具调用都刷新 lastActive；agent 消失时清条目，避免本插件自己泄漏。

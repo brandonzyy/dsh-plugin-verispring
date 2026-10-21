@@ -44,7 +44,7 @@ Verispring 三角色会话架构 + 本地知识图谱 manon，大幅度优化主
 
 ### monitor 事件
 
-`~/.dsh/verispring-monitor.jsonl` 的 `kind`：`subagent-start` / `subagent-start-failed` / `subagent-end` / `subagent-error`（生命周期 + 角色 + 路由）、`child-route-updated`、`role-route-mismatch`、`scout-unreachable`、`scout-tools-restricted`（带测绘子代理 id；其 `edit`/`write` 已在 `agent/created` 时摘除）、`dispatch-deny`（带 `rule`：`scout-missing`、`brief-lint`、`map-baseline-missing`、`map-stale`、`executor-cap`）、`gate-deny`（派遣规范门/测绘常驻/缺地图，以及 codestyle 与 manon 的拒绝）、`leader-guard-deny`（带 `rule`：`sleep-in-loop`、`sleep-long`、`sleep-background`、`list-agents-repeat`）、`leader-write-hint`（带 `rule`：`write-whitelist`、`git-mutation`、`package-mutation`、`in-place-edit`、`recursive-remove`、`workspace-redirect`——非阻断的领导写入提示）、`ask-scout`、`structure-forward`、`checkpoint-saved` / `checkpoint-save-failed` / `checkpoint-injected` / `checkpoint-inject-failed`、`scout-relay-error`、`mem-guard-boot`（激活自报：`heapLimitBytes`、`nodeArgv`、`pid`、`softBytes`、`hardBytes`、`thresholdsSource`、`checkMs`、`readGuard`、`readGuardMaxBytes`）、`mem-guard-drain` / `mem-guard-recycle` / `mem-guard-skip`（内存看门狗：`heapUsed`、释放条数 `released`、`reason`）、`mem-guard-read-deny`（整读门：`tool`、`session`、`path`、`size`）、`mem-guard-sample`（每 5 分钟的 `heapUsed` / `rss` / `heapLimitBytes` 增长曲线）、`mem-guard-soft`（软阈值越线心跳，5 分钟限流）、`mem-guard-evict-boot`（卸载器自报：`scanMs`、`idleMs`、`tracked`、`untracked`）、`mem-guard-evict`（卸载成功：`session`、`idleMs`、`heapUsedBefore`、`pressure`、`observationEvicted`、`coldLogEvicted`）、`mem-guard-evict-fail`（`error` 截 200 字符、`retryAfterMs`）、`mem-guard-evict-skip`（`reason`：`follower-unknown`、`scan-failed`）。
+`~/.dsh/verispring-monitor.jsonl` 的 `kind`：`subagent-start` / `subagent-start-failed` / `subagent-end` / `subagent-error`（生命周期 + 角色 + 路由）、`child-route-updated`、`role-route-mismatch`、`scout-unreachable`、`scout-tools-restricted`（带测绘子代理 id；其 `edit`/`write` 已在 `agent/created` 时摘除）、`dispatch-deny`（带 `rule`：`scout-missing`、`brief-lint`、`map-baseline-missing`、`map-stale`、`executor-cap`）、`gate-deny`（派遣规范门/测绘常驻/缺地图，以及 codestyle 与 manon 的拒绝）、`leader-guard-deny`（带 `rule`：`sleep-in-loop`、`sleep-long`、`sleep-background`、`list-agents-repeat`）、`leader-write-hint`（带 `rule`：`write-whitelist`、`git-mutation`、`package-mutation`、`in-place-edit`、`recursive-remove`、`workspace-redirect`——非阻断的领导写入提示）、`ask-scout`、`structure-forward`、`checkpoint-saved` / `checkpoint-save-failed` / `checkpoint-injected` / `checkpoint-inject-failed`、`scout-relay-error`、`mem-guard-boot`（激活自报：`heapLimitBytes`、`nodeArgv`、`pid`、`softBytes`、`hardBytes`、`thresholdsSource`、`checkMs`、`readGuard`、`readGuardMaxBytes`）、`mem-guard-drain` / `mem-guard-recycle` / `mem-guard-skip`（内存看门狗：`heapUsed`、释放条数 `released`、`reason`）、`mem-guard-read-deny`（整读门：`tool`、`session`、`path`、`size`）、`mem-guard-sample`（每 5 分钟的 `heapUsed` / `rss` / `heapLimitBytes` 增长曲线）、`mem-guard-soft`（软阈值越线心跳，5 分钟限流）、`mem-guard-evict-boot`（卸载器自报：`scanMs`、`idleMs`、`tracked`、`untracked`、`subagentProbe`）、`mem-guard-evict`（卸载成功：`session`、`idleMs`、`heapUsedBefore`、`pressure`、`observationEvicted`、`coldLogEvicted`）、`mem-guard-evict-fail`（`error` 截 200 字符、`retryAfterMs`）、`mem-guard-evict-skip`（`reason`：`follower-unknown`、`scan-failed`）。
 
 ## 内存看门狗（memory-guard）
 
@@ -104,8 +104,10 @@ session-controller 的 `resolve()` 首行 `liveAgent()` 落空，下一次访问
 
 **卸载判据**（全部满足；任一不满足就不碰）：
 
-- 非 subagent 会话（子代理的 activation 归 `subagents` 管理器，由 memory-guard 的
-  `drainChildren` 释放）；
+- 子代理来源会话按 **activation 归属**：id 仍在 `subagents` manager 的 `resident`（活 activation）
+  中 → 不碰（`subagent-resident`）；已 settle（resident 在 `dsh-subagent/lib/index.js:2034`
+  删除）→ 与普通会话走同一套判据；manager 的 `ChildLock.tails` 有在途续接/投递也不碰。拿不到
+  resident 探针时退回旧行为（子代理会话一律不卸），boot 报 `subagentProbe:false`；
 - `agent.status === "idle"`，且 durable inbox 无 pending；
 - 没有活着的子代 agent（含 idle 常驻；父会话 dispose 会连带拆子作用域，先让宿主按自己的
   顺序 drain）；

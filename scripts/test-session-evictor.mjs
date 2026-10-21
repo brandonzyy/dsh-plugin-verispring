@@ -9,6 +9,9 @@
 //   不按会话归属（dsh-api-session-controller/lib/index.js:1440-1467、:1523-1528）。
 // - 冷观察缓存是 sessionQuery._observations.cache，条目带 refs（dsh-session-query/lib/index.js:
 //   327-341、:449-475）；refs > 0 不得清退。
+// - 子代理归属看 manager 的 resident：set 在 agents.resume 之后（dsh-subagent/lib/index.js:1850），
+//   自然 settle 时先 dispose handle（:2026）再 resident.delete（:2034）；manager 的续接/投递
+//   先经 ChildLock.tails（:1121-1140、:2090-2095）再 observe→resume（:2095→:2141→:1809）。
 // 定时器、Date.now、process.memoryUsage、v8.getHeapStatistics 全部替身化，用例不存在等待。
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
@@ -140,7 +143,14 @@ function makeHarness(options = {}) {
   const observationCache = options.observationCache ?? new Map();
   const coldLogMemo = options.coldLogMemo ?? new Map();
   const sessionQuery = { _observations: { cache: observationCache } };
-  const subagents = { resident: new Map() };
+  const resident = new Map();
+  const locks = { tails: new Map() };
+  // 宿主的 resident/locks 在 manager 上（service 暴露为 subagents.manager）：
+  // dsh-subagent/lib/index.js:2984、:2996-3003。
+  const manager = { resident, locks };
+  const subagents = { manager };
+  // withoutResidentProbe 模拟宿主没有暴露 resident（或以后改形状）：子代理会话必须退回旧行为。
+  if (options.withoutResidentProbe === true) manager.resident = void 0;
   const services = {
     agents: registry,
     sessions: { get: (id) => sessionStore.get(id) },
@@ -225,6 +235,16 @@ function makeHarness(options = {}) {
       return downstream;
     },
     toolNextCalls,
+    resident,
+    locks,
+    // 模拟 manager 的 resident.set（dsh-subagent/lib/index.js:1850）与 settle 删除（:2034）。
+    makeResident: (id, parentId = "parent") => {
+      resident.set(id, { childId: id, parent: { id: parentId }, closing: void 0 });
+    },
+    dropResident: (id) => resident.delete(id),
+    // 模拟 manager 的 ChildLock.tails（:1121-1140）：在途 observe/resume 会先占住 childId。
+    beginManagerOp: (id) => locks.tails.set(id, Promise.resolve()),
+    endManagerOp: (id) => locks.tails.delete(id),
     monitor: () => readJsonl(`${home}/verispring-monitor.jsonl`),
     events: () => readJsonl(`${home}/verispring-monitor.jsonl`).filter((entry) => entry.kind !== "mem-guard-evict-boot"),
     boot: () => readJsonl(`${home}/verispring-monitor.jsonl`).find((entry) => entry.kind === "mem-guard-evict-boot"),
@@ -253,6 +273,8 @@ test("判据纯函数：空条目、subagent、运行中、pending inbox、follo
     followerBlocks: () => false,
     descendantLive: () => false,
     claimInFlight: () => false,
+    subagentResident: () => new Map(),
+    subagentOperationInFlight: () => false,
   };
   assert.deepEqual(evictionBlockers(void 0, base), ["no-entry"]);
   assert.deepEqual(
@@ -265,7 +287,31 @@ test("判据纯函数：空条目、subagent、运行中、pending inbox、follo
       { sessionId: "s", agent, lastActive: 0, subagent: true },
       { ...base, agents: { get: () => void 0 }, sessions: { get: () => void 0 } },
     ),
-    ["subagent", "agent-not-live", "session-not-attached"],
+    ["agent-not-live", "session-not-attached"],
+  );
+  assert.deepEqual(
+    evictionBlockers(
+      { sessionId: "s", agent, lastActive: 0, subagent: true },
+      { ...base, subagentResident: () => new Map([["s", {}]]) },
+    ),
+    ["subagent-resident"],
+    "仍在 manager resident 中的子代理不得卸载",
+  );
+  assert.deepEqual(
+    evictionBlockers(
+      { sessionId: "s", agent, lastActive: 0, subagent: true },
+      { ...base, subagentResident: () => void 0 },
+    ),
+    ["subagent-probe-unavailable"],
+    "resident 探针缺失时退回旧行为",
+  );
+  assert.deepEqual(
+    evictionBlockers(
+      { sessionId: "s", agent, lastActive: 0, subagent: true },
+      { ...base, subagentOperationInFlight: () => true },
+    ),
+    ["subagent-operation-in-flight"],
+    "manager 有在途 child 操作时不得卸载",
   );
   const busyAgent = { ...agent, status: "running", inbox: { hasPending: true } };
   assert.deepEqual(
@@ -390,6 +436,7 @@ test("运行中 / durable inbox 有 pending / 有活子代：都不卸；解除�
   await harness.resume("pending", { inboxPending: true });
   await harness.resume("parent");
   await harness.resume("child", { origin: "subagent", parentSession: "parent", status: "running" });
+  harness.makeResident("child", "parent");
   harness.advance(11 * 60 * 1000);
   await harness.tick();
   assert.deepEqual(harness.disposeCalls, [], "有任一阻塞条件都不得卸载");
@@ -402,7 +449,7 @@ test("运行中 / durable inbox 有 pending / 有活子代：都不卸；解除�
   assert.deepEqual(
     harness.disposeCalls.map((call) => call.sessionId).sort(),
     ["pending", "running"],
-    "父会话仍有活子代不卸；subagent 会话本身不归卸载器管",
+    "父会话仍有活子代不卸；resident 中的子代理会话本身也不卸",
   );
 });
 
@@ -468,12 +515,61 @@ test("agent/disposed 清条目：宿主已释放的会话不会被卸载器再 d
   assert.equal(harness.disposeCalls.length, 0, "条目已随 agent/disposed 删除");
 });
 
-test("subagent 会话不归卸载器管：即使空闲也不 dispose", async () => {
+test("子代理会话按 activation 归属：resident 中不卸，已结束（非 resident）按普通判据卸", async () => {
   const harness = makeHarness();
+  await harness.resume("still-resident", { origin: "subagent" });
+  harness.makeResident("still-resident", "parent");
+  await harness.resume("settled", { origin: "subagent" });
+  harness.advance(10 * 60 * 1000);
+  await harness.tick();
+  assert.deepEqual(
+    harness.disposeCalls.map((call) => call.sessionId),
+    ["settled"],
+    "settle 后 resident 已删的子代理会话不再是豁免对象",
+  );
+  assert.equal(harness.agent("still-resident")?.id, "still-resident");
+});
+
+test("manager 在途 child 操作（ChildLock.tails）不卸；结束后可卸", async () => {
+  const harness = makeHarness();
+  await harness.resume("child", { origin: "subagent" });
+  harness.beginManagerOp("child");
+  harness.advance(10 * 60 * 1000);
+  await harness.tick();
+  assert.equal(harness.disposeCalls.length, 0, "续接/投递在 observe+resume 期间不能被卸载打断");
+  harness.endManagerOp("child");
+  await harness.tick();
+  assert.equal(harness.disposeCalls.length, 1);
+});
+
+test("manager 续接：卸载后重新 resume 被再次捕获，resident 期间保持存活", async () => {
+  const harness = makeHarness();
+  await harness.resume("child", { origin: "subagent" });
+  harness.advance(10 * 60 * 1000);
+  await harness.tick();
+  assert.equal(harness.disposeCalls.length, 1, "先模拟 UI promote 的结束子代理被卸载");
+
+  // 模拟 manager coldResume：在途占锁 → observe/resume → resident.set → 放锁。
+  harness.beginManagerOp("child");
+  await harness.resume("child", { origin: "subagent" });
+  harness.makeResident("child", "parent");
+  harness.endManagerOp("child");
+  harness.advance(10 * 60 * 1000);
+  await harness.tick();
+  assert.equal(harness.disposeCalls.length, 1, "重新 resume 的 handle 被捕获；resident 中不卸");
+
+  harness.dropResident("child");
+  await harness.tick();
+  assert.equal(harness.disposeCalls.length, 2, "settle 删除 resident 后可卸");
+});
+
+test("resident 探针缺失：子代理会话退回旧行为，boot 报 subagentProbe:false", async () => {
+  const harness = makeHarness({ withoutResidentProbe: true });
+  assert.equal(harness.boot().subagentProbe, false);
   await harness.resume("child", { origin: "subagent" });
   harness.advance(30 * 60 * 1000);
   await harness.tick();
-  assert.equal(harness.disposeCalls.length, 0);
+  assert.equal(harness.disposeCalls.length, 0, "拿不到 resident 时子代理会话一律不卸");
 });
 
 test("找不到 follower 探针：保守不卸，并落带原因的 skip（5 分钟限流）", async () => {
@@ -520,6 +616,7 @@ test("启动自报：激活前已 promote 的会话进 untracked（只上报不�
   assert.deepEqual(boot.untracked, ["pre-promoted"]);
   assert.equal(boot.followerProbe, "session-controller");
   assert.equal(boot.resumePatched, true);
+  assert.equal(boot.subagentProbe, true);
   assert.equal(typeof boot.scanMs, "number");
   assert.equal(typeof boot.idleMs, "number");
 
