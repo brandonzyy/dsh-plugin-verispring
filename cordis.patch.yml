@@ -485,11 +485,6 @@
         thinking: enabled
         streamIdleTimeoutMs: 600000
         maxTokens: 256000
-        # 网关 anthropic 出口在「thinking 开 + 短回复」时会重复发一条 message_start
-        # （service/convert.go:336 用 SendResponseCount==1 当首块判据，短流命中两次）。
-        # llm-deepseek 判 MALFORMED_RESPONSE 直接失败（pi-ai 只更新 usage，所以以前没暴露）。
-        # 本开关只丢弃该端点的重复 message_start 帧，其余逐帧透传。网关修复上线并复测后删除。
-        dedupeDuplicateMessageStart: true
         retryPolicy:
           mode: normal
           maxRetries: 4
