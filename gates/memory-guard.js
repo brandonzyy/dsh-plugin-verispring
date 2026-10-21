@@ -28,12 +28,21 @@
 // mem-guard-soft（无论有没有可回收目标）。检查自身若卡在 await 上（未来若恢复宿主释放路径），
 // 超过 max(2×checkMs, 60s) 记 skip=check-stuck 并把 checking 置回，避免之后所有定时器 tick
 // 都在 checking 守卫处静默 return——上一轮 56 分钟零事件、直到 4.0GiB OOM 的唯一静默路径就是这里。
-// 动作落 monitor：kind = mem-guard-boot（激活自报：heapLimitBytes / nodeArgv / pid /
-// thresholdsSource / checkMs / readGuard）/ mem-guard-sample / mem-guard-soft / mem-guard-release-hint /
-// mem-guard-recycle / mem-guard-skip / mem-guard-read-deny。
+// 动作落 monitor：kind = mem-guard-boot（激活自报：heapLimitBytes / nodeArgv / execPath /
+// electron / pid / thresholdsSource / checkMs / readGuard）/ mem-guard-sample / mem-guard-soft /
+// mem-guard-release-hint / mem-guard-recycle / mem-guard-skip / mem-guard-read-deny。
+//
+// 进程内看门狗有硬边界：host 事件循环被同步代码/微任务占住时，上面的 setInterval 一个字符都写
+// 不出来（2026-10-21 10:48 的 OOM：占住 45 秒，零记录）。所以 apply 另起一个独立 node 子进程
+// （gates/host-watchdog-child.js），父进程每 1000ms 经 IPC 发心跳，子进程自己用 ps 采父进程 RSS
+// 并在卡死/暴涨/父进程死亡时落 host-stall / host-mem-surge / host-exit 等证据。子进程只观测、
+// 只留证，绝不杀父进程或发信号；CASEOS_HOST_WATCHDOG=0 关闭，子进程意外退出最多重拉 3 次
+// （间隔按 CASEOS_WATCHDOG_RESTART_MS 递增），effect 释放时 kill 自己的子进程，避免插件重载累积。
+import childProcess from "node:child_process";
 import fs from "node:fs";
 import { homedir } from "node:os";
 import { basename, isAbsolute, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import v8 from "node:v8";
 import { monitorEvent } from "./monitor-log.js";
 import { releaseIdleCaches as releaseDispatchCaches } from "./dispatch-gate.js";
@@ -46,6 +55,12 @@ const HARD_BYTES_ENV = "CASEOS_MEM_HARD_BYTES";
 const READ_GUARD_ENV = "CASEOS_READ_GUARD";
 const READ_MAX_ENV = "CASEOS_READ_GUARD_MAX_BYTES";
 const READ_ALLOW_ENV = "CASEOS_READ_GUARD_ALLOW";
+const HOST_WATCHDOG_ENV = "CASEOS_HOST_WATCHDOG";
+const WATCHDOG_RESTART_MS_ENV = "CASEOS_WATCHDOG_RESTART_MS";
+const WATCHDOG_HEARTBEAT_MS = 1000;
+const WATCHDOG_MAX_RESTARTS = 3;
+const DEFAULT_RESTART_MS = 2000;
+export const HOST_WATCHDOG_CHILD = fileURLToPath(new URL("./host-watchdog-child.js", import.meta.url));
 const DEFAULT_CHECK_MS = 15000;
 const DEFAULT_READ_MAX_BYTES = 2 * 1024 * 1024;
 const READ_DENY_PATH_LIMIT = 200;
@@ -362,6 +377,155 @@ export function readDenyReason(path, size, maxBytes) {
     + `（宿主 >8KB 还会复制一份）；只想知道大小就用 stat/du。`;
 }
 
+export function hostWatchdogEnabled(env = process.env) {
+  return env[GUARD_ENV] !== "0" && env[HOST_WATCHDOG_ENV] !== "0";
+}
+
+// 独立子进程看门狗的父侧生命周期：fork → 每 1000ms 心跳 → 意外退出最多重拉 3 次 → effect 释放时
+// 停心跳、断 IPC、kill 自己的子进程。fork 走参数注入（默认 childProcess.fork），测试用替身即可
+// 核对 spawn 参数、重拉上限与 kill，不需要真的拉起进程。
+// host 可能是 Electron 二进制，子进程必须以 node 模式启动，所以 execPath 沿用 process.execPath
+// 并显式带 ELECTRON_RUN_AS_NODE=1（宿主自己就是这样 spawn host 的：抽取版 lib/main.js:3652 的
+// desktopNodeEnvironment）。
+export function startHostWatchdog({
+  dshHome,
+  env = process.env,
+  forkImpl = childProcess.fork,
+  heartbeatMs = WATCHDOG_HEARTBEAT_MS,
+  restartBaseMs,
+} = {}) {
+  const targetHome = dshHome ?? env.DSH_HOME ?? `${homedir()}/.dsh`;
+  const disabled = {
+    enabled: false,
+    stop() {},
+    child: () => void 0,
+    forks: () => 0,
+    restarts: () => 0,
+  };
+  if (!hostWatchdogEnabled(env)) return disabled;
+
+  const restartEnv = Number(env[WATCHDOG_RESTART_MS_ENV]);
+  const base = Number.isFinite(restartEnv) && restartEnv > 0 ? restartEnv : DEFAULT_RESTART_MS;
+  const delayBase = Number.isFinite(restartBaseMs) && restartBaseMs >= 0 ? restartBaseMs : base;
+  const state = {
+    child: void 0,
+    timer: void 0,
+    retry: void 0,
+    stopped: false,
+    seq: 0,
+    forks: 0,
+    restarts: 0,
+  };
+
+  const stopHeartbeat = () => {
+    if (state.timer === void 0) return;
+    clearInterval(state.timer);
+    state.timer = void 0;
+  };
+  const clearRetry = () => {
+    if (state.retry === void 0) return;
+    clearTimeout(state.retry);
+    state.retry = void 0;
+  };
+  // 发送失败静默：父进程卡死时 send 可能抛也可能排队，都不能反过来影响 host。
+  const beat = () => {
+    const child = state.child;
+    if (state.stopped || child === void 0 || child.connected === false) return;
+    const usage = process.memoryUsage();
+    state.seq += 1;
+    try {
+      child.send({
+        seq: state.seq,
+        t: Date.now(),
+        heapUsed: usage.heapUsed,
+        heapTotal: usage.heapTotal,
+        rss: usage.rss,
+      }, () => {});
+    } catch {}
+  };
+  const giveUp = () => {
+    stopHeartbeat();
+    monitorEvent(targetHome, {
+      kind: "host-watchdog-gave-up",
+      attempts: WATCHDOG_MAX_RESTARTS,
+      pid: process.pid,
+    });
+  };
+  const scheduleRestart = () => {
+    state.restarts += 1;
+    if (state.restarts > WATCHDOG_MAX_RESTARTS) {
+      giveUp();
+      return;
+    }
+    // 间隔递增：1×base、2×base、3×base。
+    state.retry = setTimeout(() => {
+      state.retry = void 0;
+      if (!state.stopped) spawn();
+    }, delayBase * state.restarts);
+    if (typeof state.retry?.unref === "function") state.retry.unref();
+  };
+  const spawn = () => {
+    if (state.stopped) return;
+    state.forks += 1;
+    let child;
+    try {
+      child = forkImpl(HOST_WATCHDOG_CHILD, [targetHome], {
+        execPath: process.execPath,
+        env: { ...process.env, ...env, ELECTRON_RUN_AS_NODE: "1", DSH_HOME: targetHome },
+        stdio: ["ignore", "ignore", "ignore", "ipc"],
+        serialization: "json",
+      });
+    } catch {
+      child = void 0;
+    }
+    if (child === void 0) {
+      scheduleRestart();
+      return;
+    }
+    state.child = child;
+    // 'error' 必须消化：子进程起不来时不能让宿主抛未捕获异常。
+    try {
+      child.on("error", () => {});
+    } catch {}
+    try {
+      child.on("exit", () => {
+        if (state.stopped || state.child !== child) return;
+        state.child = void 0;
+        scheduleRestart();
+      });
+    } catch {}
+    beat();
+  };
+
+  const stop = () => {
+    if (state.stopped) return;
+    state.stopped = true;
+    stopHeartbeat();
+    clearRetry();
+    const child = state.child;
+    state.child = void 0;
+    if (child === void 0) return;
+    try {
+      child.disconnect?.();
+    } catch {}
+    try {
+      child.kill?.();
+    } catch {}
+  };
+
+  spawn();
+  state.timer = setInterval(beat, heartbeatMs);
+  if (typeof state.timer?.unref === "function") state.timer.unref();
+
+  return {
+    enabled: true,
+    stop,
+    child: () => state.child,
+    forks: () => state.forks,
+    restarts: () => state.restarts,
+  };
+}
+
 export default {
   name: "caseos-memory-guard",
   // 只硬依赖 profileContext（落盘根）：agents/subagents 用 ctx.get 惰性取，缺了也照样做缓存
@@ -401,6 +565,8 @@ export default {
       readGuardMaxBytes: readGuardOff ? void 0 : readGuardMaxBytes,
       pid: process.pid,
       nodeArgv: process.execArgv,
+      execPath: process.execPath,
+      electron: process.versions.electron,
     });
 
     // 服务只在用时现取：面板改配置会重跑 apply，闭包里读到的旧作用域会失活。
@@ -742,5 +908,12 @@ export default {
     const timer = setInterval(runCheck, checkMs);
     if (typeof timer?.unref === "function") timer.unref();
     ctx.effect(() => () => clearInterval(timer), "caseos-memory-guard: interval");
+
+    // 进程内定时器盖不住「事件循环被占住」的场景，独立子进程看门狗负责那段时间的证据；
+    // 重载时 effect 释放会停心跳、断 IPC 并 kill 它，不累积子进程。
+    const hostWatchdog = startHostWatchdog({ dshHome });
+    if (hostWatchdog.enabled) {
+      ctx.effect(() => () => hostWatchdog.stop(), "caseos-memory-guard: host-watchdog");
+    }
   },
 };

@@ -38,12 +38,18 @@ Verispring three-role session architecture plus a bundled local knowledge graph 
 | `CASEOS_READ_GUARD_ALLOW` | empty | comma-separated path prefixes the read guard always allows (`~` expanded, directory-boundary matching) |
 | `CASEOS_MEM_SOFT_BYTES` | ceiling × 60% | soft heap threshold: non-blocking release hint to the leader + pruning of the plugin's own indexes (2.4GiB on a 4GiB ceiling) |
 | `CASEOS_MEM_HARD_BYTES` | ceiling × 80% | hard heap threshold: idle-state `mem-guard-skip` + restart prompt, never an exit (3.2GiB on a 4GiB ceiling) |
+| `CASEOS_HOST_WATCHDOG` | on | `0` disables the out-of-process watchdog child (no fork, no heartbeat) |
+| `CASEOS_WATCHDOG_SAMPLE_MS` | `5000` | child sampling interval (parent RSS via `ps -o rss= -p <ppid>`) |
+| `CASEOS_WATCHDOG_STALL_MS` | `10000` | heartbeat silence that counts as a stalled host event loop |
+| `CASEOS_WATCHDOG_SURGE_BYTES` | `536870912` (512MiB) | RSS growth inside 30s that records `host-mem-surge` |
+| `CASEOS_WATCHDOG_RSS_ALERT_BYTES` | `2791728742` (2.6GiB) | first RSS crossing that records `host-mem-surge` (`rss-alert`) |
+| `CASEOS_WATCHDOG_RESTART_MS` | `2000` | base delay for re-forking the child; retry n waits n× this |
 | `CASEOS_EVICT` | on | `0` disables the subagent-release gate at assembly time (no `agents.resume` wrapper, no telemetry scan, no `release_subagent` tool, no events) |
 | `CASEOS_EVICT_SCAN_MS` | `60000` | telemetry scan interval; the scan only reports the releasable-child count, it never releases anything |
 
 ### Monitor events
 
-`kind` values in `~/.dsh/verispring-monitor.jsonl`: `subagent-start` / `subagent-start-failed` / `subagent-end` / `subagent-error` (lifecycle + role + route), `child-route-updated`, `role-route-mismatch`, `scout-unreachable`, `scout-tools-restricted` (scout child id; its `edit`/`write` were restricted on `agent/created`), `dispatch-deny` (with `rule`: `scout-missing`, `brief-lint`, `map-baseline-missing`, `map-stale`, `executor-cap`), `gate-deny` (dispatch spec / resident-scout / missing-map denials, plus codestyle and manon), `leader-guard-deny` (with `rule`: `sleep-in-loop`, `sleep-long`, `sleep-background`, `list-agents-repeat`), `leader-write-hint` (with `rule`: `write-whitelist`, `git-mutation`, `package-mutation`, `in-place-edit`, `recursive-remove`, `workspace-redirect` — non-blocking leader write hints), `ask-scout`, `structure-forward`, `checkpoint-saved` / `checkpoint-save-failed` / `checkpoint-injected` / `checkpoint-inject-failed`, `scout-relay-error`, `mem-guard-boot` (activation self-report: `heapLimitBytes`, `nodeArgv`, `pid`, `softBytes`, `hardBytes`, `thresholdsSource`, `checkMs`, `readGuard`, `readGuardMaxBytes`), `mem-guard-recycle` / `mem-guard-skip` (heap watchdog: `heapUsed`, `released`, `reason`), `mem-guard-read-deny` (whole-file read guard: `tool`, `session`, `path`, `size`), `mem-guard-sample` (a 5-minute `heapUsed` / `rss` / `heapLimitBytes` growth curve), `mem-guard-soft` (soft-threshold heartbeat, rate-limited to 5 minutes), `mem-guard-release-hint` (non-blocking leader hint after a tool result while over the soft threshold: `session`, `heapUsed`, `softBytes`, `candidates`), `mem-guard-release` (leader-requested subagent release: `caller`, `child`, `mode`: `drain` / `dispose` / `noop` / `refused`, `reason`, `heapUsedBefore`, `heapUsedAfter`), `mem-guard-evict-boot` (release gate self-report at apply time: `scanMs`, `tracked`, `untracked`, `releaseTool`, `subagentProbe`), `mem-guard-evict-tool` (final tool-registration state: `tool`, `registered`, `via`: `root` / `inject`, `elapsedMs`), `mem-guard-evict-follow` (follow-wrapper install: `source`, `preexistingFollowers`, `elapsedMs`), `mem-guard-evict-scan` (5-minute telemetry: `tracked`, `candidates`, `resident`, `followerTotal`, `followerTracked`, `followerUntracked`, `followerProbe`, `subagentProbe`, `heapUsed`), `mem-guard-evict-skip` (`reason`: `scan-failed`).
+`kind` values in `~/.dsh/verispring-monitor.jsonl`: `subagent-start` / `subagent-start-failed` / `subagent-end` / `subagent-error` (lifecycle + role + route), `child-route-updated`, `role-route-mismatch`, `scout-unreachable`, `scout-tools-restricted` (scout child id; its `edit`/`write` were restricted on `agent/created`), `dispatch-deny` (with `rule`: `scout-missing`, `brief-lint`, `map-baseline-missing`, `map-stale`, `executor-cap`), `gate-deny` (dispatch spec / resident-scout / missing-map denials, plus codestyle and manon), `leader-guard-deny` (with `rule`: `sleep-in-loop`, `sleep-long`, `sleep-background`, `list-agents-repeat`), `leader-write-hint` (with `rule`: `write-whitelist`, `git-mutation`, `package-mutation`, `in-place-edit`, `recursive-remove`, `workspace-redirect` — non-blocking leader write hints), `ask-scout`, `structure-forward`, `checkpoint-saved` / `checkpoint-save-failed` / `checkpoint-injected` / `checkpoint-inject-failed`, `scout-relay-error`, `mem-guard-boot` (activation self-report: `heapLimitBytes`, `nodeArgv`, `pid`, `softBytes`, `hardBytes`, `thresholdsSource`, `checkMs`, `readGuard`, `readGuardMaxBytes`), `mem-guard-recycle` / `mem-guard-skip` (heap watchdog: `heapUsed`, `released`, `reason`), `mem-guard-read-deny` (whole-file read guard: `tool`, `session`, `path`, `size`), `mem-guard-sample` (a 5-minute `heapUsed` / `rss` / `heapLimitBytes` growth curve), `mem-guard-soft` (soft-threshold heartbeat, rate-limited to 5 minutes), `mem-guard-release-hint` (non-blocking leader hint after a tool result while over the soft threshold: `session`, `heapUsed`, `softBytes`, `candidates`), `mem-guard-release` (leader-requested subagent release: `caller`, `child`, `mode`: `drain` / `dispose` / `noop` / `refused`, `reason`, `heapUsedBefore`, `heapUsedAfter`), `mem-guard-evict-boot` (release gate self-report at apply time: `scanMs`, `tracked`, `untracked`, `releaseTool`, `subagentProbe`), `mem-guard-evict-tool` (final tool-registration state: `tool`, `registered`, `via`: `root` / `inject`, `elapsedMs`), `mem-guard-evict-follow` (follow-wrapper install: `source`, `preexistingFollowers`, `elapsedMs`), `mem-guard-evict-scan` (5-minute telemetry: `tracked`, `candidates`, `resident`, `followerTotal`, `followerTracked`, `followerUntracked`, `followerProbe`, `subagentProbe`, `heapUsed`), `mem-guard-evict-skip` (`reason`: `scan-failed`), `host-watchdog-boot` (child start self-report: `pid`, `ppid`, `execPath`, `electron`, `sampleMs`, `stallMs`, `surgeBytes`, `rssAlertBytes`), `host-stall` / `host-stall-tick` / `host-stall-end` (blocked host event loop: stalled ms, last heartbeat `seq` / `heapUsed`, RSS curve, recovery duration + peak RSS), `host-mem-surge` (`reason`: `rss-surge` / `rss-alert`, window start/end RSS, last heartbeat `heapUsed`), `host-exit` (parent died: last heartbeat age, last `heapUsed` / RSS, the last 10 RSS samples, newer `crash-*.log` names), `host-watchdog-sample` (5-minute child summary), `host-watchdog-gave-up` (3 failed re-forks).
 
 
 ## Memory guard
@@ -95,6 +101,46 @@ tool result via `tools/post-execute` — one huge result can jump the heap betwe
 
 Kill switch: `CASEOS_MEM_GUARD=0` (no interval, no listeners, no boot line — the read guard is part of
 this gate, so it goes too; `CASEOS_READ_GUARD=0` turns off only the read guard).
+
+## Host watchdog child process (out-of-process evidence)
+
+In-process timers cannot testify while the host event loop is blocked: on the 2026-10-21 10:48 OOM
+the host was stuck for 45 seconds and the 15s `mem-guard` interval wrote nothing. `gates/memory-guard.js`
+therefore forks `gates/host-watchdog-child.js` at apply time — a separate node process that keeps
+sampling while the host is blocked:
+
+- IPC heartbeats every 1000ms (`seq`, `t`, `heapUsed`, `heapTotal`, `rss`), timer `unref`ed; send
+  failures are silent.
+- Every `CASEOS_WATCHDOG_SAMPLE_MS` (5000) the child reads the parent's RSS with
+  `ps -o rss= -p <ppid>` (async, 2s timeout; macOS reports KB, stored as bytes).
+- **Stall** — no heartbeat for `CASEOS_WATCHDOG_STALL_MS` (10000) while the parent is alive:
+  `host-stall` once (stalled ms, last `seq` / `heapUsed`, current RSS), `host-stall-tick` every sample
+  (RSS curve), and `host-stall-end` when heartbeats resume (duration + peak RSS).
+- **Surge** — RSS grows by `CASEOS_WATCHDOG_SURGE_BYTES` (512MiB) inside any 30s window, or RSS first
+  crosses `CASEOS_WATCHDOG_RSS_ALERT_BYTES` (2.6GiB): `host-mem-surge` with window start/end RSS and
+  the latest heartbeat `heapUsed`; 60s throttle per kind.
+- **Parent death** — IPC disconnect or a failed `process.kill(ppid, 0)`: `host-exit` (last heartbeat
+  age, last `heapUsed` / RSS, the last 10 RSS samples) plus the names of `crash-*.log` files in
+  `~/Library/Logs/DeepSeek Harness/` newer than the child's start (names only, never read), then the
+  child exits — no orphan ever survives the host.
+- `host-watchdog-boot` on start (pid, ppid, execPath, thresholds) and `host-watchdog-sample` every
+  5 minutes (RSS / peak / stall and surge counters).
+
+The child **never** kills, signals or restarts the host — it only records. The parent tracks the
+child: if it exits unexpectedly it is re-forked at most 3 times with increasing delay
+(`CASEOS_WATCHDOG_RESTART_MS`, default 2000; 1×, 2×, 3×), after which `host-watchdog-gave-up` is
+written and restarts stop. `ctx.effect` teardown stops the heartbeat, disconnects IPC and `kill()`s the
+child, so plugin reloads never accumulate processes. `CASEOS_HOST_WATCHDOG=0` disables it;
+`CASEOS_MEM_GUARD=0` disables the whole memory guard including the child.
+
+The host itself is the Desktop Electron binary running in node mode: the shell spawns it with
+`ELECTRON_RUN_AS_NODE: "1"` (`/tmp/dsh-asar-extract/lib/main.js:245`, `:3652`, `:3794`), and the live
+host confirms it (`nodeArgv: ["--expose-internals"]`). The fork therefore reuses `process.execPath`
+and sets `ELECTRON_RUN_AS_NODE=1`; `mem-guard-boot` now records `execPath` and
+`process.versions.electron` next to `nodeArgv`, so this can be re-verified after every restart.
+
+Cost: one idle node child (measured: about 67MB RSS under the Electron binary in node mode, about
+45MB under plain node) plus one `ps` call every 5s; with the watchdog off neither exists.
 
 ## Subagent release, decided by the leader (session-evictor)
 

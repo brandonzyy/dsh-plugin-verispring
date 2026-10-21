@@ -38,12 +38,18 @@ Verispring 三角色会话架构 + 本地知识图谱 manon，大幅度优化主
 | `CASEOS_READ_GUARD_ALLOW` | 空 | 逗号分隔的放行前缀（`~` 展开、按目录边界匹配），命中的路径整读门直接放行 |
 | `CASEOS_MEM_SOFT_BYTES` | 顶棚 × 60% | 软阈值：给主会话发非阻断释放提示 + 剪本插件的只增索引（4GiB 顶棚即 2.4GiB） |
 | `CASEOS_MEM_HARD_BYTES` | 顶棚 × 80% | 硬阈值：空闲态记 `mem-guard-skip` + 重启提示（绝不退出；4GiB 顶棚即 3.2GiB） |
+| `CASEOS_HOST_WATCHDOG` | 开 | `0` 关闭独立子进程看门狗（不 fork、不发心跳） |
+| `CASEOS_WATCHDOG_SAMPLE_MS` | `5000` | 子进程采样间隔（用 `ps -o rss= -p <ppid>` 采父进程 RSS） |
+| `CASEOS_WATCHDOG_STALL_MS` | `10000` | 心跳静默多久算 host 事件循环卡死 |
+| `CASEOS_WATCHDOG_SURGE_BYTES` | `536870912`（512MiB） | 30s 内 RSS 增长多少记 `host-mem-surge` |
+| `CASEOS_WATCHDOG_RSS_ALERT_BYTES` | `2791728742`（2.6GiB） | RSS 首次越过多少记 `host-mem-surge`（`rss-alert`） |
+| `CASEOS_WATCHDOG_RESTART_MS` | `2000` | 重拉子进程的基础间隔；第 n 次等待 n 倍 |
 | `CASEOS_EVICT` | 开 | `0` 在装配时关闭子代理释放器（不包装 `agents.resume`、不装扫描、不注册 `release_subagent`、不落事件） |
 | `CASEOS_EVICT_SCAN_MS` | `60000` | 遥测扫描间隔；只上报可释放子代理数，绝不释放任何会话 |
 
 ### monitor 事件
 
-`~/.dsh/verispring-monitor.jsonl` 的 `kind`：`subagent-start` / `subagent-start-failed` / `subagent-end` / `subagent-error`（生命周期 + 角色 + 路由）、`child-route-updated`、`role-route-mismatch`、`scout-unreachable`、`scout-tools-restricted`（带测绘子代理 id；其 `edit`/`write` 已在 `agent/created` 时摘除）、`dispatch-deny`（带 `rule`：`scout-missing`、`brief-lint`、`map-baseline-missing`、`map-stale`、`executor-cap`）、`gate-deny`（派遣规范门/测绘常驻/缺地图，以及 codestyle 与 manon 的拒绝）、`leader-guard-deny`（带 `rule`：`sleep-in-loop`、`sleep-long`、`sleep-background`、`list-agents-repeat`）、`leader-write-hint`（带 `rule`：`write-whitelist`、`git-mutation`、`package-mutation`、`in-place-edit`、`recursive-remove`、`workspace-redirect`——非阻断的领导写入提示）、`ask-scout`、`structure-forward`、`checkpoint-saved` / `checkpoint-save-failed` / `checkpoint-injected` / `checkpoint-inject-failed`、`scout-relay-error`、`mem-guard-boot`（激活自报：`heapLimitBytes`、`nodeArgv`、`pid`、`softBytes`、`hardBytes`、`thresholdsSource`、`checkMs`、`readGuard`、`readGuardMaxBytes`）、`mem-guard-recycle` / `mem-guard-skip`（内存看门狗：`heapUsed`、释放条数 `released`、`reason`）、`mem-guard-read-deny`（整读门：`tool`、`session`、`path`、`size`）、`mem-guard-sample`（每 5 分钟的 `heapUsed` / `rss` / `heapLimitBytes` 增长曲线）、`mem-guard-soft`（软阈值越线心跳，5 分钟限流）、`mem-guard-release-hint`（软阈值期间主会话下一次工具结果后的非阻断提示：`session`、`heapUsed`、`softBytes`、`candidates`）、`mem-guard-release`（主会话点名释放子代理：`caller`、`child`、`mode`：`drain` / `dispose` / `noop` / `refused`、`reason`、`heapUsedBefore`、`heapUsedAfter`）、`mem-guard-evict-boot`（释放器 apply 时刻自报：`scanMs`、`tracked`、`untracked`、`releaseTool`、`subagentProbe`）、`mem-guard-evict-tool`（工具注册终态：`tool`、`registered`、`via`：`root` / `inject`、`elapsedMs`）、`mem-guard-evict-follow`（follow 包装安装：`source`、`preexistingFollowers`、`elapsedMs`）、`mem-guard-evict-scan`（每 5 分钟遥测：`tracked`、`candidates`、`resident`、`followerTotal`、`followerTracked`、`followerUntracked`、`followerProbe`、`subagentProbe`、`heapUsed`）、`mem-guard-evict-skip`（`reason`：`scan-failed`）。
+`~/.dsh/verispring-monitor.jsonl` 的 `kind`：`subagent-start` / `subagent-start-failed` / `subagent-end` / `subagent-error`（生命周期 + 角色 + 路由）、`child-route-updated`、`role-route-mismatch`、`scout-unreachable`、`scout-tools-restricted`（带测绘子代理 id；其 `edit`/`write` 已在 `agent/created` 时摘除）、`dispatch-deny`（带 `rule`：`scout-missing`、`brief-lint`、`map-baseline-missing`、`map-stale`、`executor-cap`）、`gate-deny`（派遣规范门/测绘常驻/缺地图，以及 codestyle 与 manon 的拒绝）、`leader-guard-deny`（带 `rule`：`sleep-in-loop`、`sleep-long`、`sleep-background`、`list-agents-repeat`）、`leader-write-hint`（带 `rule`：`write-whitelist`、`git-mutation`、`package-mutation`、`in-place-edit`、`recursive-remove`、`workspace-redirect`——非阻断的领导写入提示）、`ask-scout`、`structure-forward`、`checkpoint-saved` / `checkpoint-save-failed` / `checkpoint-injected` / `checkpoint-inject-failed`、`scout-relay-error`、`mem-guard-boot`（激活自报：`heapLimitBytes`、`nodeArgv`、`pid`、`softBytes`、`hardBytes`、`thresholdsSource`、`checkMs`、`readGuard`、`readGuardMaxBytes`）、`mem-guard-recycle` / `mem-guard-skip`（内存看门狗：`heapUsed`、释放条数 `released`、`reason`）、`mem-guard-read-deny`（整读门：`tool`、`session`、`path`、`size`）、`mem-guard-sample`（每 5 分钟的 `heapUsed` / `rss` / `heapLimitBytes` 增长曲线）、`mem-guard-soft`（软阈值越线心跳，5 分钟限流）、`mem-guard-release-hint`（软阈值期间主会话下一次工具结果后的非阻断提示：`session`、`heapUsed`、`softBytes`、`candidates`）、`mem-guard-release`（主会话点名释放子代理：`caller`、`child`、`mode`：`drain` / `dispose` / `noop` / `refused`、`reason`、`heapUsedBefore`、`heapUsedAfter`）、`mem-guard-evict-boot`（释放器 apply 时刻自报：`scanMs`、`tracked`、`untracked`、`releaseTool`、`subagentProbe`）、`mem-guard-evict-tool`（工具注册终态：`tool`、`registered`、`via`：`root` / `inject`、`elapsedMs`）、`mem-guard-evict-follow`（follow 包装安装：`source`、`preexistingFollowers`、`elapsedMs`）、`mem-guard-evict-scan`（每 5 分钟遥测：`tracked`、`candidates`、`resident`、`followerTotal`、`followerTracked`、`followerUntracked`、`followerProbe`、`subagentProbe`、`heapUsed`）、`mem-guard-evict-skip`（`reason`：`scan-failed`）、`host-watchdog-boot`（子进程启动自报：`pid`、`ppid`、`execPath`、`electron`、`sampleMs`、`stallMs`、`surgeBytes`、`rssAlertBytes`）、`host-stall` / `host-stall-tick` / `host-stall-end`（host 事件循环卡死：卡住毫秒、最后心跳 `seq` / `heapUsed`、RSS 曲线、恢复总时长与期间峰值）、`host-mem-surge`（`reason`：`rss-surge` / `rss-alert`、窗口起止 RSS、最近心跳 `heapUsed`）、`host-exit`（父进程死亡：最后心跳距今、最后 `heapUsed` / RSS、最近 10 个 RSS 样本、更新的 `crash-*.log` 文件名）、`host-watchdog-sample`（子进程 5 分钟汇总）、`host-watchdog-gave-up`（重拉 3 次仍失败）。
 
 ## 内存看门狗（memory-guard）
 
@@ -85,6 +91,41 @@ host 进程自己从不淘汰点开的会话；没有释放路径，跑久了必
 
 一键全关：`CASEOS_MEM_GUARD=0`（连 boot 自报与整读门也不落、不挂）；只想关整读门用
 `CASEOS_READ_GUARD=0`。
+
+## 独立子进程看门狗（host-watchdog）
+
+进程内定时器在 host 事件循环被占住时无法留证：2026-10-21 10:48 的 OOM 里 host 卡了 45 秒，15s 的
+`mem-guard` 定时器一条都没写。`gates/memory-guard.js` 在 apply 时 fork `gates/host-watchdog-child.js`
+——一个独立 node 进程，host 卡死时它照常采样：
+
+- 每 1000ms 经 IPC 收心跳（`seq`、`t`、`heapUsed`、`heapTotal`、`rss`），定时器 `unref`，发送失败静默。
+- 每 `CASEOS_WATCHDOG_SAMPLE_MS`（默认 5000）用 `ps -o rss= -p <ppid>` 异步采父进程 RSS（2s 超时；
+  macOS 的 KB 换算成字节）。
+- **卡死**——父进程仍活着但 `CASEOS_WATCHDOG_STALL_MS`（默认 10000）没有心跳：先一条 `host-stall`
+  （卡了多久、最后心跳 `seq` / `heapUsed`、当前 RSS），卡死期间每个采样周期一条 `host-stall-tick`
+  （RSS 曲线），心跳恢复写 `host-stall-end`（总时长、期间峰值 RSS）。
+- **暴涨**——任意 30s 窗口 RSS 增长 ≥ `CASEOS_WATCHDOG_SURGE_BYTES`（默认 512MiB），或 RSS 首次
+  越过 `CASEOS_WATCHDOG_RSS_ALERT_BYTES`（默认 2.6GiB）：`host-mem-surge` 带窗口起止 RSS 与最近
+  心跳的 `heapUsed`；同类 60s 节流。
+- **父进程死亡**——IPC `disconnect` 或 `process.kill(ppid, 0)` 失败：写 `host-exit`（最后心跳距今、
+  最后 `heapUsed` / RSS、最近 10 个 RSS 样本），再列出 `~/Library/Logs/DeepSeek Harness/` 下比子进程
+  启动时间新的 `crash-*.log` **文件名**（只列名字、不读内容），然后退出——绝不留孤儿。
+- 启动一条 `host-watchdog-boot`（pid、ppid、execPath、阈值），每 5 分钟一条 `host-watchdog-sample`
+  汇总（RSS / 峰值 / 卡死与暴涨计数）。
+
+子进程**绝不**杀进程、发信号或重启 host，只留证。父侧管着重拉：子进程意外退出时最多重拉 3 次，
+间隔按 `CASEOS_WATCHDOG_RESTART_MS`（默认 2000）递增（1×、2×、3×），超过就写
+`host-watchdog-gave-up` 并停止。`ctx.effect` 释放时停心跳、断 IPC 并 `kill()` 自己的子进程，插件
+重载不累积进程。开关：`CASEOS_HOST_WATCHDOG=0`；`CASEOS_MEM_GUARD=0` 连子进程一起关。
+
+host 本身是 Electron 二进制跑 node 模式：桌面壳用 `spawn(this.node, ...)` +
+`ELECTRON_RUN_AS_NODE: "1"` 拉起它（`/tmp/dsh-asar-extract/lib/main.js:245`、`:3652`、`:3794`），
+线上 host 进程的 `nodeArgv` 是 `["--expose-internals"]`。所以子进程沿用 `process.execPath` 并显式带
+`ELECTRON_RUN_AS_NODE=1`；`mem-guard-boot` 现在同时记 `execPath` 与 `process.versions.electron`，
+每次重启后可核对。
+
+开销：一个常驻 node 子进程（实测 Electron node 模式约 67MB RSS，普通 node 约 45MB）加每 5s 一次
+`ps`；关掉时两者都不存在。
 
 ## 子代理释放由主会话决定（session-evictor）
 

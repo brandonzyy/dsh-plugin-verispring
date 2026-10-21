@@ -9,19 +9,26 @@
 // 活动）、硬阈值降级（宿主不自动重启，只落 monitor + stderr）、15s 默认采样与 env 覆盖、
 // subagent/end 与 tools/post-execute 即时检查、整读门（read 与 bash 整读动词的 deny、
 // 受控形态放行、白名单、开关、stat/路径解析失败放行、子代理会话同样受检）、
-// CASEOS_MEM_GUARD=0 全关、作用域释放时清定时器。
+// CASEOS_MEM_GUARD=0 全关、作用域释放时清定时器、独立子进程看门狗的 fork 参数
+// （ELECTRON_RUN_AS_NODE / execPath / ipc / json）、effect 释放时 kill、意外退出重拉上限 3 次
+// 与 host-watchdog-gave-up、开关关闭不起进程。
 import assert from "node:assert/strict";
+import childProcess from "node:child_process";
+import { EventEmitter } from "node:events";
 import fs, { mkdtempSync, readFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import v8 from "node:v8";
 import plugin, {
+  HOST_WATCHDOG_CHILD,
   bashReadPaths,
   checkStuck,
   heapLimitBytes,
+  hostWatchdogEnabled,
   memoryDecision,
   proportionalThresholds,
   readToolReadPath,
+  startHostWatchdog,
 } from "../gates/memory-guard.js";
 import scoutRelay, { releaseIdleCaches as releaseRelayCaches } from "../gates/scout-relay.js";
 
@@ -37,6 +44,8 @@ const ENV_KEYS = [
   "CASEOS_READ_GUARD_ALLOW",
   "CASEOS_SCOUT_RELAY",
   "CASEOS_ASK_SCOUT_TIMEOUT_MS",
+  "CASEOS_HOST_WATCHDOG",
+  "CASEOS_WATCHDOG_RESTART_MS",
 ];
 const realMemoryUsage = process.memoryUsage;
 const realGetHeapStatistics = v8.getHeapStatistics;
@@ -69,6 +78,8 @@ function makeHarness(options = {}) {
   const home = mkdtempSync(join(tmpdir(), "memory-guard-home-"));
   for (const key of ENV_KEYS) delete process.env[key];
   if (options.guard === false) process.env.CASEOS_MEM_GUARD = "0";
+  // 默认不拉起真实子进程：只有显式 hostWatchdog 的用例才测 fork 路径，其余用例保持纯内存。
+  if (options.hostWatchdog !== true) process.env.CASEOS_HOST_WATCHDOG = "0";
   for (const [key, value] of Object.entries(options.env ?? {})) process.env[key] = String(value);
 
   const listeners = new Map();
@@ -164,6 +175,7 @@ function makeHarness(options = {}) {
   if (options.withRelay === true) scoutRelay.apply(ctx);
 
   return {
+    home,
     intervals,
     stderr,
     disposers,
@@ -241,6 +253,8 @@ test("启动自报：mem-guard-boot 带 heapLimitBytes/nodeArgv/pid 与比例阈
   assert.ok(line, "激活时应落 mem-guard-boot");
   assert.equal(line.heapLimitBytes, 4 * GIB);
   assert.deepEqual(line.nodeArgv, process.execArgv);
+  assert.equal(line.execPath, process.execPath);
+  assert.equal(line.electron, process.versions.electron);
   assert.equal(line.pid, process.pid);
   assert.equal(line.thresholdsSource, "proportional");
   assert.equal(line.softBytes, Math.floor(4 * GIB * 0.6));
@@ -802,6 +816,160 @@ test("检查完成后 checking 归位：下一次 tick 照常判定（不会永�
   await harness.tick();
   const second = harness.monitor().filter((entry) => entry.kind === "mem-guard-skip" && entry.reason === "soft-threshold-no-targets");
   assert.equal(second.length, 2, "冷却结束后重新尝试，checking 没有被卡死");
+});
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function fakeChild() {
+  const child = new EventEmitter();
+  child.connected = true;
+  child.sent = [];
+  child.killed = 0;
+  child.disconnected = false;
+  child.send = (message, callback) => {
+    child.sent.push(message);
+    if (typeof callback === "function") callback();
+  };
+  child.disconnect = () => {
+    child.connected = false;
+    child.disconnected = true;
+  };
+  child.kill = () => {
+    child.killed += 1;
+  };
+  return child;
+}
+
+test("host 看门狗：fork 参数带 ELECTRON_RUN_AS_NODE、心跳立即发、stop 断开并 kill", () => {
+  const home = mkdtempSync(join(tmpdir(), "memory-guard-watchdog-"));
+  const calls = [];
+  const children = [];
+  const forkImpl = (modulePath, args, options) => {
+    const child = fakeChild();
+    calls.push({ modulePath, args, options });
+    children.push(child);
+    return child;
+  };
+  const env = { ...process.env, CASEOS_HOST_WATCHDOG: "1" };
+  const watchdog = startHostWatchdog({ dshHome: home, env, forkImpl, heartbeatMs: 1000 });
+  try {
+    assert.equal(watchdog.enabled, true);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].modulePath, HOST_WATCHDOG_CHILD);
+    assert.deepEqual(calls[0].args, [home]);
+    assert.equal(calls[0].options.execPath, process.execPath);
+    assert.equal(calls[0].options.env.ELECTRON_RUN_AS_NODE, "1");
+    assert.equal(calls[0].options.env.DSH_HOME, home);
+    assert.deepEqual(calls[0].options.stdio, ["ignore", "ignore", "ignore", "ipc"]);
+    assert.equal(calls[0].options.serialization, "json");
+
+    assert.equal(children[0].sent.length, 1, "fork 后立即发一条心跳");
+    for (const field of ["seq", "t", "heapUsed", "heapTotal", "rss"]) {
+      assert.equal(typeof children[0].sent[0][field], "number", `心跳带 ${field}`);
+    }
+  } finally {
+    watchdog.stop();
+  }
+  assert.equal(children[0].killed, 1, "effect 释放时 kill 自己的子进程");
+  assert.equal(children[0].disconnected, true, "先断开 IPC 再 kill");
+  assert.equal(watchdog.child(), void 0);
+  // 主动 stop 后不再重拉。
+  children[0].emit("exit", 0, null);
+  assert.equal(calls.length, 1, "stop 之后退出不再重拉");
+});
+
+test("host 看门狗：意外退出最多重拉 3 次，之后 host-watchdog-gave-up 且停心跳", async () => {
+  const home = mkdtempSync(join(tmpdir(), "memory-guard-watchdog-"));
+  const children = [];
+  const forkImpl = () => {
+    const child = fakeChild();
+    children.push(child);
+    return child;
+  };
+  const env = { ...process.env, CASEOS_HOST_WATCHDOG: "1" };
+  const watchdog = startHostWatchdog({ dshHome: home, env, forkImpl, restartBaseMs: 5, heartbeatMs: 1000 });
+  try {
+    assert.equal(watchdog.forks(), 1);
+    // 前三次退出各排一次重拉（间隔 5/10/15ms），第四次超过上限直接放弃。
+    for (let index = 0; index < 3; index += 1) {
+      children.at(-1).emit("exit", 1, null);
+      await sleep(50);
+      assert.equal(children.length, index + 2, `第 ${index + 1} 次退出后重拉`);
+    }
+    children.at(-1).emit("exit", 1, null);
+    await sleep(30);
+    assert.equal(children.length, 4, "最多 1 次启动 + 3 次重拉");
+    assert.equal(watchdog.forks(), 4);
+    assert.equal(watchdog.restarts(), 4);
+    const gaveUp = readJsonl(`${home}/verispring-monitor.jsonl`)
+      .find((entry) => entry.kind === "host-watchdog-gave-up");
+    assert.ok(gaveUp, "放弃重拉要落 monitor");
+    assert.equal(gaveUp.attempts, 3);
+  } finally {
+    watchdog.stop();
+  }
+});
+
+test("host 看门狗：apply 里真实接线（CASEOS_HOST_WATCHDOG=1），effect 释放走 kill", () => {
+  const realFork = childProcess.fork;
+  const calls = [];
+  const children = [];
+  childProcess.fork = (modulePath, args, options) => {
+    const child = fakeChild();
+    calls.push({ modulePath, args, options });
+    children.push(child);
+    return child;
+  };
+  try {
+    const harness = makeHarness({ hostWatchdog: true, heapUsed: 1 * GIB });
+    assert.equal(calls.length, 1, "apply 应 fork 子进程看门狗");
+    assert.equal(calls[0].modulePath, HOST_WATCHDOG_CHILD);
+    assert.equal(calls[0].options.env.ELECTRON_RUN_AS_NODE, "1");
+    assert.equal(calls[0].options.env.DSH_HOME, harness.home);
+    assert.equal(harness.disposers.length, 2, "内存定时器 + 子进程看门狗各一个 effect");
+    const heartbeatInterval = harness.intervals.at(-1);
+    assert.equal(heartbeatInterval.ms, 1000);
+    harness.disposers.at(-1)();
+    assert.equal(children[0].killed, 1, "effect 释放必须 kill，插件重载不累积子进程");
+    assert.equal(heartbeatInterval.cleared, true, "心跳定时器同时清掉");
+  } finally {
+    childProcess.fork = realFork;
+  }
+});
+
+test("host 看门狗：CASEOS_HOST_WATCHDOG=0 或 CASEOS_MEM_GUARD=0 都不起子进程", () => {
+  const calls = [];
+  const forkImpl = () => {
+    calls.push(1);
+    return fakeChild();
+  };
+  assert.equal(hostWatchdogEnabled({ CASEOS_HOST_WATCHDOG: "0" }), false);
+  assert.equal(hostWatchdogEnabled({ CASEOS_MEM_GUARD: "0" }), false);
+  assert.equal(hostWatchdogEnabled({}), true);
+
+  const off = startHostWatchdog({
+    dshHome: mkdtempSync(join(tmpdir(), "memory-guard-watchdog-")),
+    env: { ...process.env, CASEOS_HOST_WATCHDOG: "0" },
+    forkImpl,
+  });
+  assert.equal(off.enabled, false);
+  off.stop();
+  assert.equal(calls.length, 0);
+
+  // CASEOS_MEM_GUARD=0 时 apply 在 fork 之前就返回：定时器、监听、子进程都不存在。
+  const realFork = childProcess.fork;
+  const applied = [];
+  childProcess.fork = () => {
+    applied.push(1);
+    return fakeChild();
+  };
+  try {
+    const harness = makeHarness({ guard: false, hostWatchdog: true });
+    assert.equal(harness.disposers.length, 0);
+    assert.equal(applied.length, 0, "CASEOS_MEM_GUARD=0 不 fork 看门狗");
+  } finally {
+    childProcess.fork = realFork;
+  }
 });
 
 let failed = 0;
