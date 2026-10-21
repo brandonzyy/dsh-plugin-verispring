@@ -481,7 +481,7 @@ const BIG = 64 * MIB;
 test("read-guard 解析：只认整读动词；sed -n 行范围与 head/tail 限量属受控，歧义放行", () => {
   assert.deepEqual(bashReadPaths("cat /big/a.log"), ["/big/a.log"]);
   assert.deepEqual(bashReadPaths("cat -n /big/a.log /big/b.log"), ["/big/a.log", "/big/b.log"]);
-  assert.deepEqual(bashReadPaths("wc -c /big/a.log"), ["/big/a.log"]);
+  assert.deepEqual(bashReadPaths("base64 /big/a.log"), ["/big/a.log"]);
   assert.deepEqual(bashReadPaths("cat /big/a.log && xxd /big/b.bin"), ["/big/a.log", "/big/b.bin"]);
   // 受控读取：sed 行范围、head/tail 限量、tail 默认 10 行
   assert.deepEqual(bashReadPaths("sed -n '10,20p' /big/a.log"), []);
@@ -525,7 +525,7 @@ test("read-guard：read 整读超限被拒，理由给出 offset/limit 与 sed �
   assert.equal(line.session, "leader-1");
 });
 
-test("read-guard：bash 的整读动词超限被拒（cat/wc），阈值边界放行", async () => {
+test("read-guard：bash 的整读动词超限被拒（cat/base64），wc 只出计数不查，阈值边界放行", async () => {
   const harness = makeHarness({
     files: { "/big/a.log": BIG, "/big/edge.log": 2 * MIB, "/big/over.log": 2 * MIB + 1 },
   });
@@ -534,8 +534,11 @@ test("read-guard：bash 的整读动词超限被拒（cat/wc），阈值边界�
   assert.equal(cat.kind, "deny");
   assert.match(cat.reason, /\/big\/a\.log 有 64\.0 MB/);
 
-  const wc = await harness.pre({ name: "bash", arguments: { command: "wc -c /big/a.log" }, agent });
-  assert.equal(wc.kind, "deny");
+  const b64 = await harness.pre({ name: "bash", arguments: { command: "base64 /big/a.log" }, agent });
+  assert.equal(b64.kind, "deny");
+
+  // wc 只输出计数不倾倒内容，不在检查面（非读命令，根本不 stat）
+  assert.deepEqual(bashReadPaths("wc -c /big/a.log"), []);
 
   // 阈值是「大于」：等于上限放行，多 1 字节拒绝
   const edge = await harness.pre({ name: "bash", arguments: { command: "cat /big/edge.log" }, agent });

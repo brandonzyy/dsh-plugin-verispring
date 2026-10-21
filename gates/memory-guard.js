@@ -72,8 +72,8 @@ const WHOLE_FILE_VERBS = new Set([
   "hexdump",
   "od",
   "base64",
-  "wc",
 ]);
+// wc 不在此列：它只输出计数不倾倒内容，整读门拦它纯属误伤（想知道大小请用 stat/du）。
 const WRAPPER_WORDS = new Set(["sudo", "env", "command", "time", "nohup", "nice", "exec"]);
 const SED_LINE_RANGE = /^\d+(,\d+)?p$/;
 const SED_TO_EOF = /^\d+,\$p$/;
