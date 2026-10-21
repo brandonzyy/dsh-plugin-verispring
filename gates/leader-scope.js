@@ -7,7 +7,7 @@
 //   派遣面工具再以「瘦身定义」重注册进领导自己的层：截断描述与参数说明，执行闭包不变。
 // - 测绘/执行智能体（origin == subagent）不受领导面影响：子代理的作用域链挂在其 preset 下，
 //   不经过领导，全量工具面来自 verispring-subagent；测绘的 deny edit/write 由 dispatch-gate
-//   随派遣请求下发（toolFilter）。
+//   在 agent/created 时 restrict（子代理 scoped tools.restrict，工具列表里直接没有）。
 // - CASEOS_SCOUT=0 关闭分工条款中的测绘部分。
 const LEADER_ALLOW = new Set([
   "bash", "edit", "write", "read", "read_image",

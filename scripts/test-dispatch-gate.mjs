@@ -222,6 +222,12 @@ function makeHarness(options = {}) {
     install: async (agent = leader) => {
       for (const callback of listeners.get("agent/pre-step") ?? []) await callback({ agent }, () => {});
     },
+    /** 宿主 agent/created 广播：逐个 await，与宿主串行语义一致 */
+    created: async (agent = leader) => {
+      for (const callback of listeners.get("agent/created") ?? []) await callback({ agent });
+    },
+    /** 宿主 agents 注册表里的子代理（派发成功后 startActivation 已登记） */
+    agent: (id) => childAgents.get(id),
     tool: () => routedTool(),
     dispatch: async (args, agent = leader) => routedTool().execute(args, { agent }),
     /** 回执渲染（宿主与 client.js 读的那段文本） */
@@ -517,7 +523,7 @@ test("测绘前缀的派遣按测绘启动：注册 scoutId，注入职责与地
   assert.match(prompt, /【实际路由：scout/);
   assert.match(prompt, /【测绘智能体】/);
   assert.match(prompt, /只做定位、事实与建图/);
-  assert.match(prompt, /只读：不要 edit\/write/);
+  assert.match(prompt, /你没有 edit\/write 工具；地图由领导 write 落盘/);
   assert.match(prompt, /仓库已有地图/);
   assert.ok(prompt.includes("gates/dispatch-gate.js: 派遣门禁"), "地图全文应注入任务书");
   assert.doesNotMatch(prompt, /自动接替|自动定为/);
@@ -552,6 +558,67 @@ test("CASEOS_SCOUT=0 关闭测绘架构时没有测绘也放行执行派遣", as
     const harness = makeHarness();
     assert.equal(harness.guard({ description: "改代码", prompt: "把 a 改成 b" }), void 0);
   });
+});
+
+// ---- 测绘工具硬禁：角色只在 agent/created 的派遣队列计划里可判（早于角色落盘与 scoutId 登记） ----
+
+const deniesEditWrite = (spec) => spec.deny?.includes("edit") && spec.deny?.includes("write");
+
+test("pending 计划 role=scout 的子代理创建时被 restrict deny edit/write，并记 scout-tools-restricted", async () => {
+  const harness = makeHarness();
+  const result = await harness.dispatch({ description: "scout: 建图", prompt: "建图" });
+
+  await harness.created(harness.agent(result.subagentId));
+
+  assert.ok(
+    harness.scopedRestricted.some(deniesEditWrite),
+    `测绘创建时必须摘掉 edit/write：${JSON.stringify(harness.scopedRestricted)}`,
+  );
+  const line = harness.monitor().find((entry) => entry.kind === "scout-tools-restricted");
+  assert.ok(line, "收掉工具时必须记 scout-tools-restricted");
+  assert.equal(line.child, result.subagentId);
+});
+
+test("pending 计划 role=executor 的子代理创建时不 restrict edit/write", async () => {
+  const harness = makeHarness();
+  harness.primeScout("scout-A");
+  const result = await harness.dispatch({ description: "改代码", prompt: "把 a 改成 b" });
+
+  await harness.created(harness.agent(result.subagentId));
+
+  assert.equal(harness.scopedRestricted.filter(deniesEditWrite).length, 0, "执行者必须保留 edit/write");
+  assert.equal(harness.monitor().filter((entry) => entry.kind === "scout-tools-restricted").length, 0);
+});
+
+test("领导会话创建时不 restrict edit/write", async () => {
+  const harness = makeHarness();
+
+  await harness.created(harness.leader);
+
+  assert.equal(harness.scopedRestricted.filter(deniesEditWrite).length, 0, "领导必须保留 edit/write");
+  assert.ok(harness.scopedRestricted.some((spec) => spec.deny.includes("subagent-base")), "领导面限定照旧生效");
+});
+
+test("CASEOS_SCOUT=0 时测绘子代理创建不 restrict edit/write", async () => {
+  await withEnv({ CASEOS_SCOUT: "0" }, async () => {
+    const harness = makeHarness();
+    const result = await harness.dispatch({ description: "scout: 建图", prompt: "建图" });
+
+    await harness.created(harness.agent(result.subagentId));
+
+    assert.equal(harness.scopedRestricted.filter(deniesEditWrite).length, 0, "测绘机制关闭时不得摘工具");
+    assert.equal(harness.monitor().filter((entry) => entry.kind === "scout-tools-restricted").length, 0);
+  });
+});
+
+test("pending 计划缺失的子代理创建时不误伤 edit/write", async () => {
+  const harness = makeHarness();
+  const stray = harness.seedAgent({ id: "stray-1" });
+
+  await harness.created(stray);
+
+  assert.equal(harness.scopedRestricted.filter(deniesEditWrite).length, 0, "没有派遣计划就无角色事实，不得摘工具");
+  assert.equal(harness.monitor().filter((entry) => entry.kind === "scout-tools-restricted").length, 0);
 });
 
 test("测绘身份按状态目录隔离：别的 profile 的同名 id 不会互相污染", async () => {

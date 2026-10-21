@@ -9,7 +9,8 @@
 //   派遣成功启动才写。常驻的判据是可达：子代理每次应询结束都会 settle 成 completed 并移出
 //   resident，send_message 走冷恢复，所以 finished/inactive 都不算失联；只有该 id 的
 //   subagent/end stopReason 不是 completed，或领导 send_message 回报 unavailable /
-//   NOT_RESUMABLE，才判定不可达。测绘子代理 deny edit/write。
+//   NOT_RESUMABLE，才判定不可达。测绘子代理在 agent/created 时按派遣队列计划里的角色
+//   restrict 掉 edit/write（工具列表里直接没有），执行者与领导不受影响。
 //   子代理自身的角色同样落盘（同目录 <子会话id>.json {role}）：重载后 childPlan 优先读
 //   落盘角色，其次按标题自愈（label 已写为标题），最后只按「本子代理是不是父会话登记的
 //   测绘」兜底——否则常驻测绘会在内存路由表清空后被静默重归类为执行（v1.3.58 实测事故）。
@@ -480,7 +481,7 @@ function scoutBriefingPrefix({ previous, reason, cwd }) {
   const mapPath = `${cwd}/${MAP_FILE}`;
   const lines = [
     "【测绘智能体】领导以 description 的测绘前缀把本笔派遣标为测绘：只做定位、事实与建图，产出入口表 ≤20 行；"
-      + "只读：不要 edit/write，地图由领导 write 落盘。",
+      + "你没有 edit/write 工具；地图由领导 write 落盘。",
   ];
   if (previous) lines.push(`上任测绘 ${previous} 已不可达（${reason}），本笔是接替派遣。`);
   let text = lines.join("\n");
@@ -905,6 +906,22 @@ const plugin = {
       }
     };
 
+    // 测绘工具硬禁：agent/created 严格早于角色落盘与 scoutId 登记，角色只能从派遣队列计划
+    // 里认（同一处理器里的 applyChildRoute 就是这么写的）。这里按 scout 摘掉 edit/write，
+    // 模型面直接没有这两个工具；执行者与领导不经过本分支，CASEOS_SCOUT=0 关闭测绘机制时
+    // 同样不摘。失败只写 stderr，不影响其余执法。
+    const restrictScoutTools = async (agent, plan) => {
+      if (!agent || plan?.role !== "scout" || process.env.CASEOS_SCOUT === "0") return;
+      try {
+        await agent.ctx.inject(["tools"], (rtc) => {
+          rtc.tools.restrict({ deny: ["edit", "write"] });
+          monitorEvent(dshHome, { kind: "scout-tools-restricted", child: agent.id });
+        });
+      } catch (error) {
+        process.stderr.write(`caseos-dispatch-gate: 测绘 ${agent.id} 工具硬禁失败: ${String(error)}\n`);
+      }
+    };
+
     const childPlan = (agent) => {
       if (!agent || agent.session?.header?.origin !== "subagent") return undefined;
       const live = liveOf(agent);
@@ -933,6 +950,7 @@ const plugin = {
         applyChildRoute(agent, plan, liveOf(agent));
         await composeSubagentPreset(agent);
         await hideBaseSubagentTool(agent);
+        await restrictScoutTools(agent, plan);
         const title = plan?.label;
         const sessionTitle = liveOf(agent).get("sessionTitle");
         if (title && sessionTitle) {
