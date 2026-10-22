@@ -175,7 +175,9 @@
         group: true
         isolate:
           compaction: true
-        # 不挂 compaction-tool-result-pruner（isolate 里的那条服务声明一并删除，避免悬空）。
+          # 只声明不挂实现：遮蔽祖先层可能启用的截断器，ctx.get 恒为 undefined（loader 容忍无实现声明）
+          toolResultPruner: true
+        # 不挂 compaction-tool-result-pruner。
         # 截断器改写的是整段历史里所有超预算的 tool/result——包括已经发给模型的结果，回改之后
         # 请求不再是上一次的前缀延伸：system 之后的提示缓存整段失效，下一次请求把整段历史当
         # 写缓存重发；旧块被改还让其后的 thinking 块签名失效，网关直接 400。收益侧只是让上下文
@@ -371,6 +373,7 @@
             group: true
             isolate:
               compaction: true
+              toolResultPruner: true
             # 同上：不挂 tool-result-pruner（回改已发历史 → 提示缓存整段失效、thinking 签名失效），
             # 自动压缩保留，压缩请求仍读缓存。
             config:
