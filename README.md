@@ -13,7 +13,7 @@ Verispring three-role session architecture plus a bundled local knowledge graph 
 | 4 | Brief lint + executor cap | The executor brief is a result description, not a research request: briefs containing research wording (`BRIEF_LINT_TERMS` in `gates/dispatch-gate.js`) are denied with directions to `send_message` the scout instead — **negated mentions are exempt** (a negation within 6 characters before the hit, e.g. `不要通读实现` / `禁止先调研`). Running executors per leader session are capped (default 8); exceeding it is denied with "end the turn and wait for receipts". Both have kill switches (`CASEOS_BRIEF_LINT=0`, `CASEOS_MAX_EXECUTORS`) |
 | 5 | Pinned model | Routes are enforced at runtime **per role**: a scout dispatch uses the panel's scout route, an executor dispatch the executor route (the role comes from the `description` prefix); explicit `provider`/`model` on the call is ignored. `subagent_fork` is always denied |
 | 6 | Commit gate | `git commit` requires a prior read of `~/.dsh/specs/代码写作规范.md`; the shape is forced to `-F file -- explicit paths`, with `timeout`/`env`/`nice`/`nohup`/`stdbuf` style wrappers seen through |
-| 7 | Leader scope | The leader's tool face shrinks to the review five (`bash`/`edit`/`write`/`read`/`read_image`) plus the dispatch face (`subagent`/`send_message`/`interrupt_agent`/`list_agents`/`release_subagent`), intersected with the tools that actually exist in the leader's view (desktop serves them from the preset layer, headless from the root layer); dispatch tools are shadowed by slim definitions; `subagent-base` is unconditionally denied at the root layer (if the routing executor ever breaks, the model has no fallback to sneak through). Scout and executor subagents get the full face of the `verispring-subagent` preset; a scout's `edit`/`write` are hard-denied at runtime — `gates/dispatch-gate.js` matches the `scout` role from the queued dispatch plan on `agent/created` and calls `rtc.tools.restrict({ deny: ["edit", "write"] })` on the child's own scope, so the tools are absent from the scout's tool list (executors and the leader keep them). Kill switch `CASEOS_SCOUT=0` drops the scout part of the division clause and the restriction |
+| 7 | Leader scope | The leader's tool face shrinks to the review five (`bash`/`edit`/`write`/`read`/`read_image`) plus the dispatch face (`subagent`/`send_message`/`interrupt_agent`/`list_agents`/`release_subagent`), intersected with the tools that actually exist in the leader's view (desktop serves them from the preset layer, headless from the root layer); dispatch tools are shadowed by slim definitions, and those model-visible definitions are frozen per session (see "Per-session frozen tool surface"); `subagent-base` is unconditionally denied at the root layer (if the routing executor ever breaks, the model has no fallback to sneak through). Scout and executor subagents get the full face of the `verispring-subagent` preset; a scout's `edit`/`write` are hard-denied at runtime — `gates/dispatch-gate.js` matches the `scout` role from the queued dispatch plan on `agent/created` and calls `rtc.tools.restrict({ deny: ["edit", "write"] })` on the child's own scope, so the tools are absent from the scout's tool list (executors and the leader keep them). Kill switch `CASEOS_SCOUT=0` drops the scout part of the division clause and the restriction |
 | 8 | Leader guard | Two kinds of runtime handling. **Denials (unchanged):** while a child is running, `sleep`/loop-waiting in `bash` is denied, and a second `list_agents` in the same turn is denied. **Hints (since 1.3.66):** `edit`/`write` outside the whitelist (`.project-map.md`, paths containing `/reports/`, `~/.dsh/AGENTS.md`, plus `CASEOS_LEADER_WRITE_ALLOW` prefixes) and `bash` change commands — `git commit/push/merge/rebase/restore/stash` (only `git stash list` / `git stash show` stay silent), `npm`/`pnpm` publish/install, `sed -i`/`perl -i`, `rm -rf`, workspace redirects — are **no longer denied**: the call runs as usual and one notice is appended after the tool result via the host `tools/post-execute` `additionalContexts` ("clear-boundary code and writing tasks go to an executor subagent; the leader does small fixes, the map, reports and verification writes"), at most once per turn, recorded to the monitor as `leader-write-hint` (rule + summary). Subagent sessions are unaffected. Kill switch `CASEOS_LEADER_GUARD=0` |
 | 9 | Scout relay | The three loops that used to exist only in the prompt: `ask_scout` lets an executor hand a location/fact question to the resident scout and waits for the fresh answer (sender is the leader agent, since `sendMessage` authorizes by lineage; the answer is correlated by marker from the scout's session events, so a scout that settles right after answering still delivers it, and every wait round yields through a real ≥250 ms timer that is cleared when the wait ends); the closing "结构增量" (structure delta) section of a non-scout child is forwarded to the scout automatically; a failed child (`error`/`aborted`/`refusal`) writes a checkpoint that the plugin attaches when the leader continues it. Non-scout subagents get an injected ≤4-line locator discipline (`ask_scout` when a scout is reachable, "write it into your report" otherwise) plus the mandatory structure-delta section. Kill switch `CASEOS_SCOUT_RELAY=0`; `CASEOS_ASK_SCOUT_TIMEOUT_MS` bounds the wait |
 | 10 | manon bridge | Resolves the local graph CLI (`MANON_KG_BIN` > bundled `manon/manon-kg` > legacy `~/manon/manon-kg`) and, when present, injects per role: the scout gets the full surface (commands, sourced invocation rule, ownership discipline), the leader gets one line ("graph facts come from the scout"), the executor gets one line — **manon is scout-owned; leader and executors never invoke it directly**; semantics in `~/.dsh/specs/Manon调用规则.md`. **The load-bearing part is the invocation rule**: dsh's subprocess service strips KEY/TOKEN-shaped env vars from children (anti-leak), so a bare `manon-kg sync` always fails with a missing key — the injected form sources `~/.dsh/manon.env` inside the bash command first (the scrub only strips the first hop; grandchildren inherit freely). Secret values never pass through or get printed |
@@ -356,6 +356,45 @@ dispatch entry uses DSH's official activation API and returns a child id immedia
 child continuation tools for subsequent messages. In headless/CLI runs the process exits with
 the turn, so child work is not retained after the process ends.
 
+## Per-session frozen tool surface (cache-prefix stability)
+
+Tool definitions (name/description/parameters and their order) sit at the very front of the Anthropic
+prompt-cache prefix, with system sections right behind them: one byte of change makes every running
+session rewrite that prefix on its next turn. Session logs (`data.header.tools` of `type=request/header`
+entries in `~/.dsh/sessions/**/session.v4.jsonl.zstd`) show the same session's tool set changing
+repeatedly: 5cc6c9 ↔ 00f363 was the `subagent` parameter (cwd/description/prompt) descriptions toggling
+between the "hand-written global schema" and "slimmed host base" registration paths, one with
+descriptions and one with them missing entirely; one `SLIM_DESC.subagent` copy edit landed directly in
+running sessions; adding one tool moved the count 10 → 11. Each one matched a full prefix rewrite on the
+production gateway (150k–390k tokens measured).
+
+The fix has two layers:
+
+1. **One path, fixed order**: `subagent` has a single canonical parameter schema (cwd/description/prompt
+   all carry descriptions, kept within the slim budget) used by both the global entry and the
+   session-level entry, so whether the host exposes `subagent-base` cannot change the model surface; the
+   session-level registration order of plugin tools is fixed (`SURFACE_TOOL_ORDER` in
+   `gates/tool-surface.js`).
+2. **Per-session snapshot**: when a session first builds its tool surface, the final ordered model-visible
+   definitions and the plugin's system-section texts are written to
+   `~/.dsh/caseos/session-state/<session id>.surface.json`; afterwards every rebuild of that session
+   (resume, restart, hot reload) registers from the snapshot and renders from it, while execution
+   closures stay the current implementation. Consequently:
+   - new or rewritten tool copy and system sections only affect **new sessions**; a running session's
+     prefix stays byte-identical;
+   - tools the snapshot does not contain are not exposed to the old session (globally registered ones are
+     removed through that session's `restrict`);
+   - tools the snapshot contains but the current code no longer provides are skipped with one stderr line;
+   - a corrupt/missing snapshot is rebuilt from the current definitions and written back (the first resume
+     after an upgrade rebuilds once, then stays frozen again).
+
+Boundary (accepted): the `caseos:scout-relay` section follows the session's *reachable scout id* — that is
+session-state fact, and freezing it would point executors at a scout that has since been replaced, so it
+keeps its live behavior. Only **model-visible fields** (description/parameters/section text) and tool order
+are frozen; return values, `output.schema` and `execute` always come from the current implementation. To
+move a running session to new copy: open a new session, or delete its `<session id>.surface.json` and let
+it resume (it rebuilds once from the current implementation).
+
 ## Context compaction (per role)
 
 | Role | Mounted on | Trigger → summary cap |
@@ -552,9 +591,11 @@ exemption flow exists for force-installs.
 
 ## Tests and upgrade smoke check
 
-`pnpm test` runs the three gate behavior suites and the smoke check in order:
+`pnpm test` runs the gate behavior suites and the smoke check in order:
 `node scripts/test-dispatch-gate.mjs`, `node scripts/test-leader-guard.mjs`,
-`node scripts/test-scout-relay.mjs`, then `pnpm smoke`. Mock suites cannot prove the host
+`node scripts/test-scout-relay.mjs`, `node scripts/test-tool-surface.mjs` (per-session freeze — two builds
+of the same session byte-identical, copy edits only reach new sessions, subagent parameter descriptions
+identical across every registration path, return values matching `output.schema`), then `pnpm smoke`. Mock suites cannot prove the host
 actually loads the gates, so `pnpm smoke` after a dsh upgrade does manifest and syntax checks
 and, when `DSH_BIN` and `DSH_SMOKE_PROFILE` are set, adds the official `--dump-config`
 composition check against an isolated profile; that check must find the dispatch gate,

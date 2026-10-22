@@ -81,8 +81,9 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
-import { SLIM_DESC, slimSchema } from "./leader-scope.js";
+import { SLIM_DESC } from "./leader-scope.js";
 import { monitorEvent } from "./monitor-log.js";
+import { installSessionSurface, registerSurfaceTool } from "./tool-surface.js";
 
 function loadRoutes(configFile) {
   try {
@@ -385,6 +386,35 @@ function startedReceipt(value) {
   return text;
 }
 
+// subagent 的模型可见参数只有这一份 canonical 形态：全局入口与会话冻结注册都用它。
+// 旧实现里全局入口手写了一份无参数说明的 schema，会话层路径却从宿主 subagent-base 取参数
+// （带说明再截断），同一会话在两条注册路径间切换就出现 5cc6c9（有说明）↔ 00f363（整段缺失）。
+const SUBAGENT_PARAMETERS = {
+  type: "object",
+  properties: {
+    cwd: { type: "string", description: "子代理初始工作目录；相对路径按当前目录解析，省略则继承。" },
+    description: { type: "string", description: "3-5 字的事项简述，用于列表主标题与行内标题。" },
+    prompt: { type: "string", description: "自足任务书：改哪里、改成什么、怎么验证。" },
+  },
+  required: ["description", "prompt"],
+};
+
+// 输出必须是声明过的字段：宿主按 output.schema 校验（additionalProperties: false），找不到
+// 属性的键会让整次调用报 invalid output（子代理已启动却看不到回执）。回执要用的路由、角色
+// 与接替事实一并声明，schema 与 execute 的返回值同一份契约。
+const SUBAGENT_OUTPUT_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    kind: { type: "string", const: "activation" },
+    subagentId: { type: "string" },
+    route: { type: "string" },
+    role: { type: "string" },
+    replacedScoutId: { type: "string" },
+  },
+  required: ["kind", "subagentId"],
+};
+
 function pathMatches(value, dshHome) {
   if (typeof value !== "string") return false;
   const expanded = value.startsWith("~/") ? dshHome + value.slice(1) : value;
@@ -650,7 +680,6 @@ const plugin = {
     process.stderr.write(
       `caseos-dispatch-gate: plugin activated (测绘: ${routeText(routes.scout)}; 执行: ${routeText(routes.executor)})\n`,
     );
-    let globalLeaderToolInstalled = false;
 
     // 服务一律从活上下文现取（agent.ctx 随会话存活），不碰 apply 闭包 ctx：面板改配置会
     // 重跑 apply、旧作用域失活，闭包 ctx 一读就是 inactive context 事故。
@@ -798,99 +827,54 @@ const plugin = {
       throw last ?? new Error('cannot get property "subagents" without inject');
     };
 
-    const staticSubagentBase = {
-      name: BASE_SUBAGENT_TOOL,
+    // subagent 入口只有一份定义：模型可见字段（description/parameters）固定，执行体是本文件的
+    // 路由强制。全局注册保证没有会话层安装时派遣仍有着落；会话层再按该会话的冻结快照覆盖
+    // （见 tool-surface：旧会话冻结旧文案，新文案只对新会话生效）。
+    const buildLeaderSubagent = (execute) => ({
+      name: LEADER_SUBAGENT_TOOL,
       description: SLIM_DESC.subagent,
-      parameters: {
-        type: "object",
-        properties: {
-          cwd: { type: "string" },
-          description: { type: "string" },
-          prompt: { type: "string" },
-        },
-        required: ["description", "prompt"],
-      },
+      parameters: JSON.parse(JSON.stringify(SUBAGENT_PARAMETERS)),
       output: {
-        schema: { type: "object", additionalProperties: true },
+        schema: JSON.parse(JSON.stringify(SUBAGENT_OUTPUT_SCHEMA)),
+        // 回执文案按本插件的路由事实渲染（全局入口与会话层入口同一份契约）。
         render: (_args, value) => [{ type: "text", text: startedReceipt(value) }],
       },
-    };
-    const staticRoutedTool = {
-      ...staticSubagentBase,
-      name: LEADER_SUBAGENT_TOOL,
       __caseosRouted: true,
       // 不传 rtc：执行体按 exec.agent.ctx 现取活上下文，静态入口同样不持有闭包 ctx。
-      async execute(args, exec) { return executeRouted(args, exec); },
-    };
+      execute,
+    });
     try {
-      ctx.root.tools.register(staticRoutedTool);
-      globalLeaderToolInstalled = true;
+      ctx.root.tools.register(buildLeaderSubagent((args, exec) => executeRouted(args, exec)));
     } catch (error) {
       process.stderr.write(`caseos-dispatch-gate: 全局 subagent 入口注册失败: ${String(error)}\n`);
     }
+    // 模型可见定义与执行体分开提供：冻结注册只替换 description/parameters，execute 永远是当前实现。
+    registerSurfaceTool("subagent", (agent) => (
+      agent?.session?.header?.origin === "subagent"
+        ? void 0
+        : buildLeaderSubagent((args, exec) => executeRouted(args, exec))
+    ));
 
     // 子代理的 provider/model/角色是运行时契约，不能依赖模型是否记得在 tool call 里填写。
-    // 官方 tool-subagent 先以 subagent-base 挂载，领导层只暴露本插件的 subagent 入口；
-    // 这样不在官方同名工具作用域上重复注册，角色由领导的 description 前缀决定。
+    // 官方基座 subagent-base 只作为执行实现存在，领导模型面只看到本插件的路由入口（会话层隐藏）。
+    // agent/created 与 agent/pre-step 都走这里：热重载后由 pre-step 重装，执行闭包回到当前实现。
     const installLeaderTool = async (agent) => {
-      if (!agent || agent.session?.header?.origin === "subagent") return;
+      if (!agent || typeof agent.ctx?.inject !== "function") return;
       if (leaderToolInstalled.has(agent) || leaderToolInstalling.has(agent)) return;
       leaderToolInstalling.add(agent);
       try {
-        await agent.ctx.inject(["tools", "subagents"], (rtc) => {
-        if (globalLeaderToolInstalled) {
-          try { rtc.tools.restrict({ deny: [BASE_SUBAGENT_TOOL] }); }
-          catch {}
-          leaderToolInstalled.add(agent);
-          return;
-        }
-        // 按领导自己的视图取官方基座；它只作为执行实现，不直接暴露给模型。
-        const current = rtc.tools.get(BASE_SUBAGENT_TOOL, agent);
-        if (!current) {
-          // 基座已被会话层 restrict 藏掉（见下）：取不到是正常态，只要本插件的路由入口
-          // （__caseosRouted）也在，派遣就有着落，别再重复装配。
-          const existing = rtc.tools.get(LEADER_SUBAGENT_TOOL, agent);
-          if (existing?.__caseosRouted) leaderToolInstalled.add(agent);
-          return;
-        }
-        // 领导层的 subagent 只此一处注册：瘦身文案来自 leader-scope，执行体是本文件的路由强制。
-        // 其他插件（如 leader-scope）不得再注册同名工具，否则同层重复注册会抛错。
-        if (current.__caseosRouted) {
-          leaderToolInstalled.add(agent);
-          return;
-        }
-        const wrapped = { ...current, name: LEADER_SUBAGENT_TOOL, __caseosRouted: true,
-          description: SLIM_DESC.subagent ?? current.description,
-          parameters: slimSchema(current.parameters ?? {}),
-          // 回执文案按本插件的路由事实渲染（会话层入口与全局入口同一份契约）。
-          ...(current.output ? { output: { ...current.output, render: (_args, value) => [{ type: "text", text: startedReceipt(value) }] } } : {}),
-          execute: (args, exec) => executeRouted(args, exec, rtc) };
-        let registered = globalLeaderToolInstalled;
-        if (!registered) {
-          try {
-            ctx.root.tools.register(wrapped);
-            globalLeaderToolInstalled = true;
-            registered = true;
-            process.stderr.write("caseos-dispatch-gate: 全局 subagent 入口已绑定强制路由\n");
-          } catch (error) {
-            try {
-              rtc.tools.register(wrapped);
-              registered = true;
-              process.stderr.write("caseos-dispatch-gate: 领导 subagent 入口已绑定强制路由\n");
-            } catch (scopedError) {
-              process.stderr.write(`caseos-dispatch-gate: subagent 入口注册失败: ${String(scopedError)}; 全局尝试: ${String(error)}\n`);
-            }
+        // 执行体不持有闭包 ctx（executeRouted 按 exec.agent.ctx 现取活上下文），这里只需要 tools。
+        await agent.ctx.inject(["tools"], (rtc) => {
+          if (agent.session?.header?.origin !== "subagent") {
+            try { rtc.tools.restrict({ deny: [BASE_SUBAGENT_TOOL] }); }
+            catch (error) { process.stderr.write(`caseos-dispatch-gate: 官方基座隐藏失败: ${String(error)}\n`); }
           }
-        }
-        if (registered) {
-          // 基座只供本插件保留，领导模型只看到路由入口。
-          try { rtc.tools.restrict({ deny: [BASE_SUBAGENT_TOOL] }); }
-          catch (error) { process.stderr.write(`caseos-dispatch-gate: 官方基座隐藏失败: ${String(error)}\n`); }
+          // 按该会话的冻结快照注册模型可见定义；没有快照就按当前实现建一份并落盘。
+          installSessionSurface({ stateDir, agent, rtc });
           leaderToolInstalled.add(agent);
-        }
         });
       } catch (error) {
-        process.stderr.write(`caseos-dispatch-gate: 领导 subagent 入口注入失败: ${String(error)}\n`);
+        process.stderr.write(`caseos-dispatch-gate: 会话工具面安装失败: ${String(error)}\n`);
       } finally {
         leaderToolInstalling.delete(agent);
       }
@@ -981,6 +965,9 @@ const plugin = {
         await composeSubagentPreset(agent);
         await hideBaseSubagentTool(agent);
         await restrictScoutTools(agent, plan);
+        // 子代理面的插件工具（ask_scout）同样按会话冻结：常驻测绘的会话寿命长，文案改了
+        // 不能把它下一轮的前缀整段重写。
+        await installLeaderTool(agent);
         const title = plan?.label;
         const sessionTitle = liveOf(agent).get("sessionTitle");
         if (title && sessionTitle) {

@@ -16,6 +16,7 @@
 import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { monitorEvent } from "./monitor-log.js";
+import { registerSurfaceTool } from "./tool-surface.js";
 
 const TOOL_NAME = "ask_scout";
 const ASK_TIMEOUT_ENV = "CASEOS_ASK_SCOUT_TIMEOUT_MS";
@@ -546,6 +547,15 @@ export default {
     } catch (error) {
       process.stderr.write(`caseos-scout-relay: ${TOOL_NAME} 注册失败: ${String(error)}\n`);
     }
+
+    // 逐会话冻结：ask_scout 的模型可见文案属于本插件的工具定义，会话恢复/重启后按该会话的
+    // 冻结快照注册（gates/tool-surface.js），执行体仍是这里的当前实现。只对子代理提供——
+    // 领导面由 leader-scope 的 allow 名单摘掉，冻结注册不得把它塞回去。
+    registerSurfaceTool(TOOL_NAME, (agent) => {
+      const header = headerOf(agent);
+      if (header.origin !== "subagent" && header.parentSession === void 0) return void 0;
+      return askTool;
+    });
 
     // ---- 非测绘子代理的定位纪律 ------------------------------------------
     // 提示词只解释运行时已有的两条闭环（ask_scout、结构增量自动转交），判定在代码里。

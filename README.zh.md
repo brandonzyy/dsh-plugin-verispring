@@ -13,7 +13,7 @@ Verispring 三角色会话架构 + 本地知识图谱 manon，大幅度优化主
 | 4 | 任务书闸 + 并发上限 | 执行任务书是成果描述，不是调研请求：含调研型措辞（`gates/dispatch-gate.js` 的 `BRIEF_LINT_TERMS`）即拒绝并指路 `send_message` 测绘——**带否定的说法豁免**（命中词前 6 个字符内有否定词，如「不要通读实现」「禁止先调研」）。同一领导会话里运行中的执行子代理有上限（缺省 8），超限拒绝并提示结束回合等回执。两者各有开关（`CASEOS_BRIEF_LINT=0`、`CASEOS_MAX_EXECUTORS`） |
 | 5 | 模型钉死 | 路由在运行时**按角色**强制注入：测绘派遣走面板测绘路由，执行派遣走执行路由（角色来自 `description` 前缀）；调用里显式写的 `provider`/`model` 一律忽略。`subagent_fork` 一律拒绝 |
 | 6 | 提交门 | `git commit` 前必须先读 `~/.dsh/specs/代码写作规范.md`；提交形状强制 `-F 文件 -- 显式路径`，`timeout`/`env`/`nice`/`nohup`/`stdbuf` 等包装命令穿透识别 |
-| 7 | 领导面限定 | 领导会话工具面收缩到复核五件（`bash`/`edit`/`write`/`read`/`read_image`）+ 派遣面（`subagent`/`send_message`/`interrupt_agent`/`list_agents`/`release_subagent`），名单与领导视图里实际存在的工具取交集（桌面工具在 preset 层，headless 在根层），派遣工具以瘦身定义遮蔽；`subagent-base` 在 root 层无条件隐藏（路由执行体异常时模型无路可绕）。测绘/执行子代理用 `verispring-subagent` preset 的全量工具面；测绘的 `edit`/`write` 在运行时硬禁——`gates/dispatch-gate.js` 在 `agent/created` 时按派遣队列计划里的 `scout` 角色，在子代理自己的作用域上调 `rtc.tools.restrict({ deny: ["edit", "write"] })`，工具列表里直接没有这两个工具（执行者与领导保留）。逃生开关 `CASEOS_SCOUT=0` 关闭分工条款中的测绘部分与该硬禁 |
+| 7 | 领导面限定 | 领导会话工具面收缩到复核五件（`bash`/`edit`/`write`/`read`/`read_image`）+ 派遣面（`subagent`/`send_message`/`interrupt_agent`/`list_agents`/`release_subagent`），名单与领导视图里实际存在的工具取交集（桌面工具在 preset 层，headless 在根层），派遣工具以瘦身定义遮蔽，这些模型可见定义按会话冻结（见「工具面与系统段的逐会话冻结」）；`subagent-base` 在 root 层无条件隐藏（路由执行体异常时模型无路可绕）。测绘/执行子代理用 `verispring-subagent` preset 的全量工具面；测绘的 `edit`/`write` 在运行时硬禁——`gates/dispatch-gate.js` 在 `agent/created` 时按派遣队列计划里的 `scout` 角色，在子代理自己的作用域上调 `rtc.tools.restrict({ deny: ["edit", "write"] })`，工具列表里直接没有这两个工具（执行者与领导保留）。逃生开关 `CASEOS_SCOUT=0` 关闭分工条款中的测绘部分与该硬禁 |
 | 8 | 领导守卫（leader-guard） | 两类处置。**拒绝（不变）**：有子代理运行时 `bash` 里的 `sleep`/循环等待被拒；同一回合第二次 `list_agents` 被拒。**提示（1.3.66 起）**：白名单（`.project-map.md`、路径含 `/reports/`、`~/.dsh/AGENTS.md`，外加 `CASEOS_LEADER_WRITE_ALLOW` 前缀）之外的 `edit`/`write` 与 `bash` 变更命令——`git commit/push/merge/rebase/restore/stash`（只有 `git stash list` / `git stash show` 按只读静默）、`npm`/`pnpm` 的 publish/install、`sed -i`/`perl -i`、`rm -rf`、工作区重定向——**不再拒绝**：调用照常执行，在工具结果后经宿主 `tools/post-execute` 的 `additionalContexts` 追加一次提示（「有明确边界的代码和写作任务，请交给执行子代理；领导自己只做小修正、地图、报告和验收所需的写入」），同一回合只提示一次，monitor 记 `leader-write-hint`（规则名 + 摘要）。子代理会话不受限。逃生开关 `CASEOS_LEADER_GUARD=0` |
 | 9 | 测绘接力（scout-relay） | 三条原本只在提示词里的闭环：`ask_scout` 让执行者把定位/事实问题代发给常驻测绘并等它新答复（sender 取领导 Agent，`sendMessage` 按血缘授权；答复按 marker 从测绘会话事件关联，测绘答完即结算离场也能送达；每轮等待都由真实 ≥250ms 计时器让出，等待结束即清除）；非测绘子代理收尾文本里的「结构增量」段自动转给测绘；异常结束（`error`/`aborted`/`refusal`）落检查点，领导续接时由插件携现场代发。非测绘子代理另有注入的 ≤4 行定位纪律（有可达测绘指 `ask_scout`，没有则写进汇报）+ 必带的「结构增量」段。逃生开关 `CASEOS_SCOUT_RELAY=0`；`CASEOS_ASK_SCOUT_TIMEOUT_MS` 控制等待时限 |
 | 10 | manon 桥接 | 解析本地图谱 CLI（`MANON_KG_BIN` > 组件自带 `manon/manon-kg` > 旧地 `~/manon/manon-kg`），存在则按角色注入：测绘拿全量（命令面、source 调用铁则、维护纪律），领导只拿"图谱事实找测绘"，执行只拿一行说明。manon 是测绘专责，领导和执行都不直接调用；语义详见 `~/.dsh/specs/Manon调用规则.md`。**承重墙是调用铁则**：dsh 子进程服务会把 KEY/TOKEN 形状的环境变量从子进程剥掉（防泄漏），直接跑 `manon-kg sync` 必报缺密钥——注入的调用式让 bash 命令先 `source ~/.dsh/manon.env` 再执行（清洗只剥第一层，孙进程自由继承）。密钥值不经过也不打印 |
@@ -314,6 +314,34 @@ grep '"kind":"mem-guard-boot"' "${DSH_HOME:-$HOME/.dsh}/verispring-monitor.jsonl
 会话自己的层，路由包装无法遮蔽）。派遣入口使用 DSH 官方 activation API，立即返回子代理 ID；
 后续消息通过子代理续接工具发送。headless/CLI 场景进程随回合退出，子代理工作不会在进程结束后保留。
 
+## 工具面与系统段的逐会话冻结（缓存前缀稳定）
+
+工具定义（name/description/parameters 及顺序）在 Anthropic 提示缓存前缀的最前面，系统段紧随其后：
+任何一个字节变化，在跑会话的下一轮就要把前缀整段重写。会话日志
+（`~/.dsh/sessions/**/session.v4.jsonl.zstd` 里 `type=request/header` 的 `data.header.tools`）实证过
+同一会话内工具集反复变化：5cc6c9 ↔ 00f363 是 `subagent` 三个参数（cwd/description/prompt）的说明在
+「全局手写 schema」与「宿主基座 slim」两条注册路径之间来回切，一份有说明、一份整段缺失；一次
+`SLIM_DESC.subagent` 文案提交直接进了在跑会话；新增一个工具让工具数 10 → 11。每次都对上一次生产
+网关的整段重写（实测 15 万~39 万 token）。
+
+修复分两层：
+
+1. **单一路径 + 固定顺序**：`subagent` 的参数只有一份 canonical schema（cwd/description/prompt 都带
+   说明，长度控制在瘦身口径内），全局入口与会话层入口都用它——宿主有没有 `subagent-base` 都不改变模型面；
+   插件工具的会话层注册顺序固定（`gates/tool-surface.js` 的 `SURFACE_TOOL_ORDER`）。
+2. **逐会话快照**：会话首次构建工具面时，把该会话最终顺序的模型可见定义与插件注入的系统段文本写进
+   `~/.dsh/caseos/session-state/<会话id>.surface.json`；此后同一会话（恢复、重启、热重载）一律按快照
+   注册与出文案，执行闭包取当前实现。于是：
+   - 新增/改写的工具文案与系统段只对**新会话**生效，在跑会话的前缀逐字节不变；
+   - 快照里没有的新工具不暴露给旧会话（插件全局注册的那些用该会话的 `restrict` 摘掉）；
+   - 快照有而当前实现没有的工具跳过，并在 stderr 记一行；
+   - 快照损坏/缺失按当前定义重建并写回（升级后第一次恢复按当时实现重建一次，此后照旧冻结）。
+
+边界（认账）：`caseos:scout-relay` 段随「本会话可达测绘 id」变化——这是会话状态事实，冻结会把执行者
+指向已换掉的旧测绘，因此保持现行为；冻结只覆盖**模型可见字段**（description/parameters/系统段文本）
+与工具顺序，返回值、`output.schema`、`execute` 永远取当前实现。要让某个在跑会话换到新文案：新开会话；
+或删掉它的 `<会话id>.surface.json` 后再恢复（会按当前实现重建一次）。
+
 ## 上下文压缩（分角色）
 
 | 角色 | 挂载位置 | 触发 → 摘要上限 |
@@ -477,8 +505,10 @@ dsh 0.2.0-rc.2 至 0.2.1-rc.1。版本不满足时安装被拒；确要强装走
 
 ## 测试与升级检查
 
-`pnpm test` 依次跑三个门禁行为测试与冒烟：`node scripts/test-dispatch-gate.mjs`、
-`node scripts/test-leader-guard.mjs`、`node scripts/test-scout-relay.mjs`，再跑 `pnpm smoke`。
+`pnpm test` 依次跑各门禁行为测试与冒烟：`node scripts/test-dispatch-gate.mjs`、
+`node scripts/test-leader-guard.mjs`、`node scripts/test-scout-relay.mjs`、
+`node scripts/test-tool-surface.mjs`（工具面逐会话冻结：同会话两次构建逐字节相同、文案变更只对新会话
+生效、subagent 参数说明在所有注册路径同一形态、返回值与 `output.schema` 一致），再跑 `pnpm smoke`。
 mock 测试证明不了真实宿主装载门禁，所以升级 dsh 后跑 `pnpm smoke` 检查版本声明、源码语法与
 插件入口；设置 `DSH_BIN` 与 `DSH_SMOKE_PROFILE` 后会再执行官方 `--dump-config` 组合检查，
 确认派遣门禁、配置入口和子代理 preset 均已装配。

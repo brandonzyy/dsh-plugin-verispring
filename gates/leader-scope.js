@@ -4,18 +4,28 @@
 // - 领导会话（origin != subagent）创建时 restrict({allow}) 收缩继承来的工具面（全局层与
 //   preset 层都受限）；名单先与领导视图里实际存在的工具求交集——点名不存在的工具即抛错，
 //   而桌面把模型可见工具全放在 preset 层、headless 全在全局层，两处的存在集不同。
-//   派遣面工具再以「瘦身定义」重注册进领导自己的层：截断描述与参数说明，执行闭包不变。
+// - 派遣面工具的模型可见定义走逐会话冻结（gates/tool-surface.js）：首次构建时把 description/
+//   参数说明快照进会话状态，之后恢复/重启/热重载都按快照注册，执行闭包仍是当前实现。改文案
+//   只影响新会话——工具定义在提示缓存前缀最前面，改一个字节会让在跑会话整段重写。
 // - 测绘/执行智能体（origin == subagent）不受领导面影响：子代理的作用域链挂在其 preset 下，
 //   不经过领导，全量工具面来自 verispring-subagent；测绘的 deny edit/write 由 dispatch-gate
 //   在 agent/created 时 restrict（子代理 scoped tools.restrict，工具列表里直接没有）。
 // - CASEOS_SCOUT=0 关闭分工条款中的测绘部分。
+import { homedir } from "node:os";
+import {
+  frozenSectionText,
+  installSessionSurface,
+  registerSurfaceSection,
+  registerSurfaceTool,
+} from "./tool-surface.js";
+
 const LEADER_ALLOW = new Set([
   "bash", "edit", "write", "read", "read_image",
   "subagent", "subagent-base", "send_message", "interrupt_agent", "list_agents", "release_subagent",
 ]);
 
-// 派遣面工具的瘦身文案。subagent 的遮蔽注册由 dispatch-gate 完成（路由执行体在它那，
-// 同层二次注册会抛错），这里导出文案供其复用；本文件只瘦身其余派遣工具。
+// 派遣面工具的瘦身文案。subagent 的模型可见定义由 dispatch-gate 提供（路由执行体在它那），
+// 这里导出文案供其复用；本文件只负责其余派遣工具的参数瘦身与三个段文案。
 export const SLIM_DESC = {
   subagent:
     "派遣执行类工作；任务书须自足。是不是测绘由 description 前缀决定（「测绘智能体」或「scout:」开头）；没有可达测绘时派执行者会被拒。渠道、模型、思考强度按角色取面板配置，调用里写的无效。默认后台运行，返回子代理 id，结束后有通知；运行中可 send_message 纠偏。",
@@ -25,7 +35,7 @@ export const SLIM_DESC = {
 };
 
 // 参数说明截到 60 字符；结构（type/properties/required/enum/items）原样保留
-export function slimSchema(schema) {
+function slimSchema(schema) {
   if (Array.isArray(schema)) return schema.map(slimSchema);
   if (typeof schema !== "object" || schema === null) return schema;
   const out = {};
@@ -45,25 +55,36 @@ function isSubagent(agent) {
   }
 }
 
+// 会话级状态目录（与 dispatch-gate / scout-relay / session-evictor 同一处）：
+// ~/.dsh/caseos/session-state。profileContext 不在本插件的 inject 面里，用 get() 取。
+function stateDirOf(ctx) {
+  let home;
+  try {
+    home = ctx.get?.("profileContext")?.home;
+  } catch {}
+  if (!home) home = process.env.DSH_HOME ?? `${homedir()}/.dsh`;
+  return `${home}/caseos/session-state`;
+}
+
 const plugin = {
   inject: ["tools", "systemPrompt"],
   apply(ctx) {
-    // 派遣面工具的瘦身定义（排除 subagent：它由 dispatch-gate 连同路由执行体一起注册）；
-    // 复核五件保持原版。
-    const slimDefs = (agent) => {
-      const defs = [];
-      for (const name of Object.keys(SLIM_DESC)) {
-        if (name === "subagent") continue;
-        const orig = ctx.tools.get(name, agent);
-        if (orig === void 0) continue;
-        defs.push({
+    const stateDir = stateDirOf(ctx);
+    // 瘦身定义：截 description 与参数说明，执行闭包是宿主当前实现（展开 current）。
+    // 返回 undefined 表示该会话没有这个工具，模型面就不该出现。
+    for (const name of ["send_message", "interrupt_agent", "list_agents"]) {
+      registerSurfaceTool(name, (agent, get) => {
+        if (isSubagent(agent)) return void 0;
+        const orig = get(name);
+        if (orig === void 0) return void 0;
+        return {
           ...orig,
+          name,
           description: SLIM_DESC[name] ?? orig.description,
           parameters: slimSchema(orig.parameters ?? {}),
-        });
-      }
-      return defs;
-    };
+        };
+      });
+    }
 
     // 领导可见的分工声明（子代理渲染为空）。这是派遣行为的承重墙，措辞弱化即回退亲做。
     // 条款只解释运行时怎么做，判定在代码里（leader-guard / dispatch-gate / scout-relay），
@@ -72,28 +93,44 @@ const plugin = {
       process.env.CASEOS_SCOUT === "0"
         ? ""
         : "常驻测绘智能体：派执行任务前，先确保有一个只读智能体常驻（它被硬禁改码）；是不是测绘由 description 前缀决定——“测绘智能体”或“scout:”开头派测绘，其余一律是执行派遣，没有可达测绘时派执行者会被拒。测绘应询结束显示 finished/inactive 是正常的，send_message 即可续接；测绘不可达时直接重派（description 照旧带测绘前缀），插件会按测绘派遣注入职责与地图。产出=入口表 ≤20 行，由你用 write 落盘为仓库根 .project-map.md；仓库已有该文件时测绘智能体只做增量校对。执行任务书的定位与事实先 send_message 问它（执行者也可用 ask_scout 直接问）。";
+    const dispatchText = (scope) =>
+      isSubagent(scope)
+        ? ""
+        : "分工：有明确边界的代码与写作任务交给执行子代理（subagent）——读码、改码、跑测试与门禁、检索这类整块工作各派一个执行者，任务书自足。领导自己做小修正、维护地图、写报告，以及验收所需的读写。Manon 图谱是常驻测绘的专责工具（sync/query/deep-query 都由它做），要图谱事实就问测绘。" +
+          scoutClause +
+          "回执与验收（强制）：测绘/执行子代理完成任务时会第一时间自动送来回执（含收尾报告）并唤醒你，测绘的回报也以消息直达，无需任何等待动作，派遣完成后直接结束本回合等回执。以下由运行时执行，违反即被拒绝：有子代理运行时的 sleep 与循环等待；同一回合第二次 list_agents；任务书含调研型措辞。领导自己写码或跑变更命令不会被拒绝，但工具结果后会追加一句分工提示。执行者回执里的「结构增量」由插件自动转给测绘，你收到测绘回报后用 write 整文件重写 .project-map.md 登记新基准。给出最终答复前，所有已派工作必须已回执并经你验收；若某项回执远超预期时长仍未到，用一次 list_agents 查状态，必要时 interrupt_agent 叫停后重派。";
+    // 子代理内存的最终决定权在主会话：插件不自动卸载任何会话，release_subagent 是唯一释放入口。
+    // 只解释运行时已有的工具，判定在 session-evictor / memory-guard 的代码里。
+    const releaseText = (scope) =>
+      isSubagent(scope)
+        ? ""
+        : "子代理内存由你决定：子代理回执验收完毕、且确定不再 send_message 续接时，调用 release_subagent 释放它的内存；"
+          + "常驻测绘通常保留，内存紧张时也可释放（之后 send_message 会自动从磁盘恢复）。"
+          + "主会话自身永不被自动卸载；插件也不会自动卸载任何子代理。";
+
+    registerSurfaceSection("caseos:leader-dispatch", dispatchText);
+    registerSurfaceSection("caseos:leader-release", releaseText);
+
     ctx.systemPrompt.section({
       name: "caseos:leader-dispatch",
       order: ctx.systemPrompt.getSectionOrder("TOOL_SUBAGENT"),
-      text: (context) =>
-        isSubagent(context.scope)
-          ? ""
-          : "分工：有明确边界的代码与写作任务交给执行子代理（subagent）——读码、改码、跑测试与门禁、检索这类整块工作各派一个执行者，任务书自足。领导自己做小修正、维护地图、写报告，以及验收所需的读写。Manon 图谱是常驻测绘的专责工具（sync/query/deep-query 都由它做），要图谱事实就问测绘。" +
-            scoutClause +
-            "回执与验收（强制）：测绘/执行子代理完成任务时会第一时间自动送来回执（含收尾报告）并唤醒你，测绘的回报也以消息直达，无需任何等待动作，派遣完成后直接结束本回合等回执。以下由运行时执行，违反即被拒绝：有子代理运行时的 sleep 与循环等待；同一回合第二次 list_agents；任务书含调研型措辞。领导自己写码或跑变更命令不会被拒绝，但工具结果后会追加一句分工提示。执行者回执里的「结构增量」由插件自动转给测绘，你收到测绘回报后用 write 整文件重写 .project-map.md 登记新基准。给出最终答复前，所有已派工作必须已回执并经你验收；若某项回执远超预期时长仍未到，用一次 list_agents 查状态，必要时 interrupt_agent 叫停后重派。",
+      text: (context) => frozenSectionText({
+        stateDir,
+        session: context?.scope?.session,
+        name: "caseos:leader-dispatch",
+        current: dispatchText(context?.scope),
+      }),
     });
 
-    // 子代理内存的最终决定权在主会话：插件不自动卸载任何会话，release_subagent 是唯一释放入口。
-    // 只解释运行时已有的工具，判定在 session-evictor / memory-guard 的代码里。
     ctx.systemPrompt.section({
       name: "caseos:leader-release",
       order: ctx.systemPrompt.getSectionOrder("TOOL_SUBAGENT"),
-      text: (context) =>
-        isSubagent(context.scope)
-          ? ""
-          : "子代理内存由你决定：子代理回执验收完毕、且确定不再 send_message 续接时，调用 release_subagent 释放它的内存；"
-            + "常驻测绘通常保留，内存紧张时也可释放（之后 send_message 会自动从磁盘恢复）。"
-            + "主会话自身永不被自动卸载；插件也不会自动卸载任何子代理。",
+      text: (context) => frozenSectionText({
+        stateDir,
+        session: context?.scope?.session,
+        name: "caseos:leader-release",
+        current: releaseText(context?.scope),
+      }),
     });
 
     ctx.on("agent/created", async ({ agent }) => {
@@ -115,15 +152,8 @@ const plugin = {
           process.stderr.write(`leader-scope: restrict 失败: ${String(error?.stack ?? error)}\n`);
           return;
         }
-        // 瘦身定义遮蔽继承的原版：模型面更小，执行仍是原闭包
-        for (const def of slimDefs(agent)) {
-          try {
-            rtc.tools.register(def);
-            process.stderr.write(`leader-scope: ${def.name} 瘦身注册成功\n`);
-          } catch (error) {
-            process.stderr.write(`leader-scope: ${def?.name} 瘦身失败: ${String(error)}\n`);
-          }
-        }
+        // 收缩后再装冻结定义：模型可见字段全部来自该会话的快照，执行闭包是当前实现。
+        installSessionSurface({ stateDir, agent, rtc });
       });
     });
   },

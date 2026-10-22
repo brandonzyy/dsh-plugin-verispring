@@ -17,6 +17,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { monitorEvent } from "./monitor-log.js";
+import { frozenSectionText, registerSurfaceSection } from "./tool-surface.js";
 
 const SECRET_FILES = new Set(["manon.env", "verispring.env"]);
 // 项目侧环境文件（值会连 key 一起进会话日志）：.env、*.env、.env.local 等；
@@ -135,25 +136,35 @@ const plugin = {
       } catch {}
       return "executor";
     };
+    const stateDir = `${home}/caseos/session-state`;
+    const manonText = (scope) => {
+      const role = roleOf(scope);
+      if (role === "leader") {
+        return `本地图谱（manon，存储在 <项目>/.manon/）由常驻测绘智能体专责：sync 建图、入口表、语义查询都是它的活。你要图谱事实（结构、调用链、入口坐标）就 send_message 问测绘或写进任务书让它回报，不要自己运行 manon-kg。`;
+      }
+      if (role === "executor") {
+        return `本地图谱（<项目>/.manon/）由常驻测绘专责维护，你不直接调用 manon-kg；任务书没给而你又需要图谱事实时，在回报里写明缺失，由领导转测绘补齐。`;
+      }
+      return `本地图谱：${kg}（存储在 <项目>/.manon/，随仓库走；组件版首次运行自动建运行环境，需联网一次）。` +
+        `命令面：sync（增量建图，--full 全量）、query "词" -j（检索，默认已瘦身：紧凑字段+条数上限，全量加 --full）、` +
+        `deep-query "问题"（多轮规划问答）、graph、impact、health、status。图谱由你专责：领导与执行不直接调用。` +
+        `调用铁则：dsh 会剥掉子进程里 KEY/TOKEN 形状的环境变量，直接运行必报缺密钥——必须让 bash 命令自带密钥，` +
+        `统一用这个前缀：\`bash -c '${sourcePrefix}<子命令>'\`（例：${sourcePrefix}${kg} sync）。` +
+        `维护纪律：进仓先 sync 并把入口表落盘为仓库根 .project-map.md；main 前进后被派遣拦截时做增量校对并回报，` +
+        `由领导重写地图登记新基准。不 clear。语义与陷阱详见 ${home}/specs/Manon调用规则.md，动手前先读。`;
+    };
+    // 本段随角色出三份文案（角色落盘、终身不变），首次构建工具面时随快照冻结：升级换了措辞
+    // 也只对新会话生效（工具定义与系统段在提示缓存前缀里，改一个字节就是在跑会话整段重写）。
+    registerSurfaceSection("verispring:manon-kg", manonText);
     ctx.systemPrompt.section({
       name: "verispring:manon-kg",
       order: ctx.systemPrompt.getSectionOrder("TOOL_SUBAGENT"),
-      text: (context) => {
-        const role = roleOf(context.scope);
-        if (role === "leader") {
-          return `本地图谱（manon，存储在 <项目>/.manon/）由常驻测绘智能体专责：sync 建图、入口表、语义查询都是它的活。你要图谱事实（结构、调用链、入口坐标）就 send_message 问测绘或写进任务书让它回报，不要自己运行 manon-kg。`;
-        }
-        if (role === "executor") {
-          return `本地图谱（<项目>/.manon/）由常驻测绘专责维护，你不直接调用 manon-kg；任务书没给而你又需要图谱事实时，在回报里写明缺失，由领导转测绘补齐。`;
-        }
-        return `本地图谱：${kg}（存储在 <项目>/.manon/，随仓库走；组件版首次运行自动建运行环境，需联网一次）。` +
-          `命令面：sync（增量建图，--full 全量）、query "词" -j（检索，默认已瘦身：紧凑字段+条数上限，全量加 --full）、` +
-          `deep-query "问题"（多轮规划问答）、graph、impact、health、status。图谱由你专责：领导与执行不直接调用。` +
-          `调用铁则：dsh 会剥掉子进程里 KEY/TOKEN 形状的环境变量，直接运行必报缺密钥——必须让 bash 命令自带密钥，` +
-          `统一用这个前缀：\`bash -c '${sourcePrefix}<子命令>'\`（例：${sourcePrefix}${kg} sync）。` +
-          `维护纪律：进仓先 sync 并把入口表落盘为仓库根 .project-map.md；main 前进后被派遣拦截时做增量校对并回报，` +
-          `由领导重写地图登记新基准。不 clear。语义与陷阱详见 ${home}/specs/Manon调用规则.md，动手前先读。`;
-      },
+      text: (context) => frozenSectionText({
+        stateDir,
+        session: context?.scope?.session,
+        name: "verispring:manon-kg",
+        current: manonText(context?.scope),
+      }),
     });
   },
 };

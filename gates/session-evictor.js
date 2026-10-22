@@ -45,6 +45,7 @@
 // mem-guard-evict-skip（reason：scan-failed）。
 import { homedir } from "node:os";
 import { monitorEvent } from "./monitor-log.js";
+import { registerSurfaceTool } from "./tool-surface.js";
 
 const EVICT_ENV = "CASEOS_EVICT";
 const SCAN_MS_ENV = "CASEOS_EVICT_SCAN_MS";
@@ -707,6 +708,15 @@ export default {
         return executeRelease(args, exec);
       },
     };
+
+    // 逐会话冻结：release_subagent 的模型可见文案属于本插件的工具定义，会话恢复/重启后按
+    // 该会话的冻结快照注册（gates/tool-surface.js），执行体仍是这里的当前实现。只对主会话
+    // 提供——子代理面本来就被 restrict 摘掉，冻结注册不得把它塞回去。
+    registerSurfaceTool(TOOL_NAME, (agent) => {
+      const header = agent?.session?.header;
+      if (header?.origin === "subagent" || header?.parentSession !== void 0) return void 0;
+      return releaseTool;
+    });
 
     // 注册终态单独落一条：boot 事件写于 apply 时刻，tools 服务晚 provide 时那里的 releaseTool
     // 只是快照；本事件在 root/inject 任一路径出结果后写一次，registered 才是最终事实。
