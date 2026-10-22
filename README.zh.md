@@ -71,14 +71,14 @@ host 进程自己从不淘汰点开的会话；没有释放路径，跑久了必
 - **释放提示**——堆越过软阈值期间，**主会话**的下一次工具结果后追加一条非阻断
   `additionalContexts`：列出主会话可释放的已结束子代理（`id`、截断的描述、测绘/执行）并建议调用
   `release_subagent`。落 `mem-guard-release-hint`；同一主会话 5 分钟最多一次，子代理会话永远收不到。
-- **整读门**——突发大头是「一份巨型工具结果进 `Session.log`」（宿主 pruner 对 >8KB 的结果还会
-  复制一份），所以 `tools/pre-execute` 先查会整篇进结果的调用：没带 `offset`/`limit` 的 `read`，
-  以及 bash 里的整读动词（`cat`、`less`、`more`、`most`、`nl`、`tac`、`strings`、`xxd`、
-  `hexdump`、`od`、`base64`、`wc`、带 `-n 'a,bp'` 行范围之外的 `sed`、`tail -n +N`）。目标超过
-  `CASEOS_READ_GUARD_MAX_BYTES`（默认 2MiB）即拒绝，拒绝文案写明文件大小与分段读法，并记
-  `mem-guard-read-deny`。`stat` 失败、相对路径拿不到会话 cwd、以及任何解析歧义（重定向、命令
-  替换、引号不闭合）一律放行——只在确定超限时才拒绝。根 ctx 的监听器收到全部 agent 的调用，
-  子代理会话同样受检。
+- **整读门**——突发大头是「一份巨型工具结果进 `Session.log`」（宿主 pruner 原会对 >8KB 的结果再
+  复制一份；本包已不再挂该截断器，见「上下文压缩」），所以 `tools/pre-execute` 先查会整篇进
+  结果的调用：没带 `offset`/`limit` 的 `read`，以及 bash 里的整读动词（`cat`、`less`、`more`、
+  `most`、`nl`、`tac`、`strings`、`xxd`、`hexdump`、`od`、`base64`、`wc`、带 `-n 'a,bp'` 行范围
+  之外的 `sed`、`tail -n +N`）。目标超过 `CASEOS_READ_GUARD_MAX_BYTES`（默认 2MiB）即拒绝，
+  拒绝文案写明文件大小与分段读法，并记 `mem-guard-read-deny`。`stat` 失败、相对路径拿不到会话
+  cwd、以及任何解析歧义（重定向、命令替换、引号不闭合）一律放行——只在确定超限时才拒绝。
+  根 ctx 的监听器收到全部 agent 的调用，子代理会话同样受检。
 - **观测面**——阈值以下也每 5 分钟落一条 `mem-guard-sample`（`heapUsed` / `rss` /
   `heapLimitBytes`），增长曲线不再只在越线后可见；软阈值越线每 5 分钟落一条
   `mem-guard-soft`。一次检查若卡在宿主释放的 await 上超过 `max(2×checkMs, 60s)`，记
@@ -321,9 +321,20 @@ grep '"kind":"mem-guard-boot"' "${DSH_HOME:-$HOME/.dsh}/verispring-monitor.jsonl
 | 主会话（领导） | `standard` preset 的 compaction 组 | 上下文窗口 40%（1M 窗口即约 400k）→ 摘要上限 40k token |
 | 测绘/执行子代理 | `verispring-subagent` preset 的 compaction 组 | 上下文窗口 60%（约 600k）→ 摘要上限 60k token |
 
-两条策略都先剪枝超大工具结果（单条超过 8192 字符保留首 4096、尾 1024），再按 DSH 结构化模板
-合并可安全压缩的历史，不额外保留原文尾部；上下文溢出时自动重试。摘要长度由模型按固定模板决定，
-上限只是封顶，实际摘要通常远短于上限。
+两条策略都不挂宿主的工具结果截断器（`dsh-compaction-tool-result-pruner`）。截断器会改写历史里
+任何超预算的 `tool/result`——包括已经发给模型的结果；而 compaction-basic 在量测**之前**就调它
+（`index.ts:324`，`:325` 重测，若仅靠截断降到阈值下就直接返回、不做压缩），上下文溢出恢复时再调
+一次（`:296`）。一次截断就让 system 之后的提示缓存整段失效：请求不再是上一次的前缀延伸，下一次
+请求把整段历史当**写缓存**重发，而不是读缓存。生产实测：约 40 万 token 时截掉 2518 token
+（2026-10-22 06:45），下一次请求整段重写 37.1 万 token；21:30/00:19/19:05/20:44 同形态
+（38.9 万/34.7 万/38.4 万/38.4 万）。回改这些旧块还会让其后每个 thinking 块的签名失效，网关按
+绑定键直接 400。
+
+自动压缩本身保留：按 DSH 结构化模板合并可安全压缩的历史，不额外保留原文尾部，上下文溢出时
+自动重试；摘要长度由模型按固定模板决定，上限只是封顶，实际摘要通常远短于上限。树里没有截断器时
+compaction-basic 读不到 `toolResultPruner` 服务，直接进入摘要——不报错；压缩请求本身仍读缓存：
+它复用最近一次的 system 与 tools，指令只追加在末尾。认账的代价：超大工具结果会留在上下文里，
+直到某次压缩把它摘要掉，40%/60% 阈值因此更早到达。
 
 子代理挂 `verispring-subagent`：harness 的 spawn 请求没有 preset 字段，子代理默认继承父会话
 preset；dispatch-gate 在子代理创建窗口（`agent/created`，早于首个 prompt）把它切过去并写入

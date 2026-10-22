@@ -78,7 +78,8 @@ tool result via `tools/post-execute` — one huge result can jump the heap betwe
   It is recorded as `mem-guard-release-hint` and shown at most once per leader session per 5 minutes;
   subagent sessions never get the hint.
 - **Whole-file read guard** — the burst is mostly one huge tool result landing in `Session.log`
-  (the host pruner copies results over 8KB a second time), so `tools/pre-execute` checks the calls
+  (the host pruner used to copy results over 8KB a second time; this bundle no longer mounts it,
+  see [Context compaction](#context-compaction-per-role)), so `tools/pre-execute` checks the calls
   that dump a whole file: `read` without `offset`/`limit`, and `bash` whole-file readers (`cat`,
   `less`, `more`, `most`, `nl`, `tac`, `strings`, `xxd`, `hexdump`, `od`, `base64`, `wc`, `sed`
   unless it carries a `-n 'a,bp'` range, `tail -n +N`). A target larger than
@@ -362,10 +363,26 @@ the turn, so child work is not retained after the process ends.
 | Main session (leader) | compaction group of the `standard` preset | 40% of the context window (~400k on a 1M window) → summary capped at 40k tokens |
 | Scout/executor subagents | compaction group of the `verispring-subagent` preset | 60% of the context window (~600k) → summary capped at 60k tokens |
 
-Both policies prune oversized tool results first (a result over 8192 characters keeps its first
-4096 and last 1024), then condense the safely balanced history with DSH's structured template; no
-verbatim tail is kept, and context overflow retries automatically. The summary length is chosen
-by the model from a fixed template; the cap only bounds it, and real summaries usually run far shorter.
+Neither policy mounts the host tool-result pruner (`dsh-compaction-tool-result-pruner`). The
+pruner shrinks every oversized `tool/result` in the history — including results already sent to
+the model — and compaction-basic calls it *before* it measures the context (`index.ts:324`,
+re-measures at `:325`, and returns without compacting when the trim alone got under the
+threshold), then once more when recovering from a context overflow (`:296`). One such trim costs
+the prompt cache for everything after the system prompt: the request is no longer a
+prefix-extension of the previous one, so the next request re-sends the whole history as cache
+*writes* instead of cache *reads*. Production measurement: at ~400k tokens a 2518-token trim
+(2026-10-22 06:45) turned the following request into a 371k-token rewrite; 21:30/00:19/19:05/20:44
+repeat the same shape (389k/347k/384k/384k). Rewriting those old blocks also invalidates the
+signature of every thinking block after them, which the gateway rejects with a bound-key 400.
+
+Auto-compaction itself is kept: it condenses the safely balanced history with DSH's structured
+template, no verbatim tail is kept, and context overflow retries automatically. The summary length
+is chosen by the model from a fixed template; the cap only bounds it, and real summaries usually
+run far shorter. With no pruner in the tree, compaction-basic finds no `toolResultPruner` service
+and goes straight to summarising — no error — and the compression request itself still reads the
+cache: it reuses the most recent system prompt and tool catalog and only appends its instructions
+at the end. Accepted cost: oversized results stay in context until a compaction summarises them,
+so the 40%/60% thresholds are reached sooner.
 
 Subagents on `verispring-subagent`: the harness spawn request has no preset field and a child
 inherits its parent's preset by default; dispatch-gate switches the child inside its creation
