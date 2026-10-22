@@ -15,7 +15,7 @@
 // fiber 卸载才删 SessionStore（dsh-session/lib/index.js:1871-1893）。主会话自身永不被自动卸载。
 //
 // 烧堆是突发式的：实测堆能在两次 60s 采样之间从 <2.4GiB 跳到 4.06GiB，大头是巨型工具结果
-// 全文进 Session.log（宿主 pruner 对 >8KB 的结果还会复制一份）。所以除周期采样外，还有一道
+// 全文进 Session.log。所以除周期采样外，还有一道
 // 整读门（read-guard）在 tools/pre-execute 里拦住会整篇进结果的大文件读取：
 // CASEOS_READ_GUARD=0 全关；CASEOS_READ_GUARD_MAX_BYTES 默认 2MiB；CASEOS_READ_GUARD_ALLOW
 // 是逗号分隔的放行前缀。命中且 stat 超限才拒绝，stat 失败与任何解析歧义一律放行。
