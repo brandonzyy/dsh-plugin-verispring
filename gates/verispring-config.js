@@ -123,6 +123,9 @@ function buildConfig(z) {
     deepQueryEffort: z.string().description("Manon Deep Query 思考强度（默认 Off）").default("off").volatile(),
     embeddingUrl: z.string().description("embedding 端点").default("https://api.siliconflow.cn/v1").volatile(),
     embeddingModel: z.string().description("embedding 模型（更换后需重新 sync 重建向量）").default("BAAI/bge-m3").volatile(),
+    idleCompactEnabled: z.boolean().description("主会话空闲自动压缩（默认开启；CASEOS_IDLE_COMPACT=0 可整体关闭）").default(true).volatile(),
+    idleCompactMinutes: z.number().min(1).step(1).description("空闲判定：主会话连续无真实模型请求的分钟数（默认 55）").default(55).volatile(),
+    idleCompactMinTokens: z.number().min(1).step(1).description("上下文下限：totalTokens 严格超过该值才压缩（默认 50000）").default(50000).volatile(),
   });
 }
 

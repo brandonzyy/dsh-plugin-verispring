@@ -474,6 +474,11 @@
     # 逐个决定释放（主会话自身与子代理都不会被自动卸载）；CASEOS_EVICT=0 关闭。
     - id: caseos-session-evictor
       name: './gates/session-evictor.js'
+    # 主会话空闲自动压缩：连续 55 分钟无真实模型请求且 totalTokens > 50000 时调宿主
+    # compaction.compactNow 压一次；子会话/非空闲/阈值以下不碰。CASEOS_IDLE_COMPACT=0 关闭，
+    # 阈值在配置面板（verispring-config 的 idleCompact* 字段）调整。
+    - id: caseos-idle-compact
+      name: './gates/idle-compact.js'
     # 配置面板：Config schema 提供宿主表单服务；client 组合包页渲染并把模型位落盘到执法面
     - id: verispring-config
       name: './gates/verispring-config.js'

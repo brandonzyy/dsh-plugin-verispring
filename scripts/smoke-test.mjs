@@ -106,6 +106,25 @@ if (!patchText.includes("id: caseos-scout-relay") || !patchText.includes("'./gat
   fail("cordis.patch.yml 未注册 caseos-scout-relay 门禁");
 }
 
+// 主会话空闲自动压缩：门禁必须被组合配置装载，配置字段必须进面板 schema（UI 由 schema
+// description 自动生成），宿主契约的两个入口（agent/request 监听、compactNow）不得丢。
+const idleCompactText = readFileSync(join(root, "gates/idle-compact.js"), "utf8");
+if (!sourceFiles.includes(join("gates", "idle-compact.js"))) fail("gates/idle-compact.js 未进入语法检查面");
+if (!patchText.includes("id: caseos-idle-compact") || !patchText.includes("'./gates/idle-compact.js'")) {
+  fail("cordis.patch.yml 未注册 caseos-idle-compact 门禁");
+}
+if (!idleCompactText.includes("CASEOS_IDLE_COMPACT") || !idleCompactText.includes("agent/request") || !idleCompactText.includes("compactNow")) {
+  fail("idle-compact 未实现空闲压缩入口/请求纪元监听/总开关");
+}
+if (!configText.includes("idleCompactEnabled") || !configText.includes("idleCompactMinutes") || !configText.includes("idleCompactMinTokens")) {
+  fail("verispring-config 缺少空闲压缩配置项（面板不会生成）");
+}
+if (!/idleCompactEnabled:[^\n]*\.default\(true\)/.test(configText)
+  || !/idleCompactMinutes:[^\n]*\.default\(55\)/.test(configText)
+  || !/idleCompactMinTokens:[^\n]*\.default\(50000\)/.test(configText)) {
+  fail("verispring-config 空闲压缩默认值必须是 开启/55 分钟/50000 tokens");
+}
+
 const dsh = process.env.DSH_BIN;
 const profile = process.env.DSH_SMOKE_PROFILE;
 if (dsh && profile) {
@@ -120,7 +139,7 @@ if (dsh && profile) {
     ]) {
       if (output.includes(failure)) fail(`组合配置包含失败诊断：${failure}`);
     }
-    for (const marker of ["caseos-dispatch-gate", "verispring-config", "preset-verispring-subagent", "id: verispring-subagent"]) {
+    for (const marker of ["caseos-dispatch-gate", "caseos-idle-compact", "verispring-config", "preset-verispring-subagent", "id: verispring-subagent"]) {
       if (!output.includes(marker)) fail(`组合配置缺少 ${marker}`);
     }
   } catch (error) {
