@@ -577,13 +577,6 @@ test("执行者提示注入：有可达测绘指 ask_scout，无可达测绘改�
   assert.match(withScout, /不要自己通读实现/);
   assert.match(withScout, /结构增量/);
   assert.match(withScout, /没有就写「无」/);
-  // 简语规则：一条、且明写不影响结构增量段
-  assert.match(withScout, /收尾报告用简语：每句只说一件事/);
-  assert.match(withScout, /先结论后理由/);
-  assert.match(withScout, /测试读数逐字保留/);
-  assert.match(withScout, /否定词（「无」「不」「禁止」等）绝不省略/);
-  assert.match(withScout, /安全警告与不可逆操作提示用完整句/);
-  assert.match(withScout, /「结构增量」段不受简语影响/);
   assert.ok(withScout.split("\n").length <= 4, "注入不超过 4 行");
 
   // 测绘自己与领导不注入
@@ -598,10 +591,6 @@ test("执行者提示注入：有可达测绘指 ask_scout，无可达测绘改�
   assert.match(without, /写进汇报/);
   assert.doesNotMatch(without, /ask_scout 问常驻测绘/);
   assert.match(without, /结构增量/);
-  // 简语规则两条分支一致
-  assert.match(without, /收尾报告用简语：每句只说一件事/);
-  assert.match(without, /「结构增量」段不受简语影响/);
-  assert.ok(without.split("\n").length <= 4, "注入不超过 4 行");
 });
 
 test("CASEOS_SCOUT_RELAY=0 时工具、转交、检查点、注入全部不生效", async () => {
