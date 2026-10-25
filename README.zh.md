@@ -19,6 +19,7 @@ Verispring 三角色会话架构 + 本地知识图谱 manon，大幅度优化主
 | 10 | manon 桥接 | 解析本地图谱 CLI（`MANON_KG_BIN` > 组件自带 `manon/manon-kg` > 旧地 `~/manon/manon-kg`），存在则按角色注入：测绘拿全量（命令面、source 调用铁则、维护纪律），领导只拿"图谱事实找测绘"，执行只拿一行说明。manon 是测绘专责，领导和执行都不直接调用；语义详见 `~/.dsh/specs/Manon调用规则.md`。**承重墙是调用铁则**：dsh 子进程服务会把 KEY/TOKEN 形状的环境变量从子进程剥掉（防泄漏），直接跑 `manon-kg sync` 必报缺密钥——注入的调用式让 bash 命令先 `source ~/.dsh/manon.env` 再执行（清洗只剥第一层，孙进程自由继承）。密钥值不经过也不打印 |
 | 11 | 密钥卫生 | 凭据/环境文件（`manon.env`、`verispring.env`、项目 `.env*`）禁止 read、禁止用 `cat`/`sed` 等命令输出（按命令段判定，受控 source 与 manon 输出管道不误伤）；无参数 `env`/`printenv`、`ps eww`、`/proc/*/environ`、无 `--format` 的 `docker inspect` 这类整环境倾倒一律拦截 |
 | 12 | 运行监控 | 角色漂移、门禁拦截、测绘可达性变化、子代理 start/end（角色 + 路由 + 停止原因，启动成功后才记）追加落盘 `~/.dsh/verispring-monitor.jsonl`，事后审计无需解压会话日志 |
+| 13 | 空闲自动压缩 | 单一 60s tick **只检查主会话**——子代理的上下文由父会话的派遣生命周期管理，这里绝不介入。主会话连续 `idleCompactMinutes`（默认 55）分钟没有真实模型请求，且 `tokenMeter` 读到的 `totalTokens` **严格超过** `idleCompactMinTokens`（默认 50000）时，调宿主 `compaction.compactNow` 压一次。空闲期是唯一不打断回合的压缩时机，能摊平缓存 TTL 过期后下一次请求的大额缓存写入。防重复靠请求纪元：压缩自身的 summarize 直连 `ctx.llm.stream`、不触发 `agent/request`，因此既不刷新空闲计时也不推进纪元；`compactedEpoch` 记**触发时**捕获的 epoch（不是完成时），压缩期间排队的新请求之后仍具备资格。`inflight` 集合挡住重入（维护期间宿主仍报 `agent.status` 为 `idle`，不能靠状态），失败/取消每代理冷却 10 分钟，每个代理一个 `AbortController`（dispose 时 abort）；重启后 `epoch === compactedEpoch === 0`，没有真实请求绝不压缩（避免重启即压）。服务取自 `agentPresets.serviceFor(agent, "compaction")`（预设隔离领域；`web-app` 在 root 层禁用了 `compaction-basic`），并带老宿主兜底。适用范围：仅 preset 绑定的主会话（web/desktop）触发；headless 一次性驱动器不为主会话组合 preset，因而不触发（与 `/compact` 的可用范围一致）。面板字段 `idleCompactEnabled`（默认 true）/ `idleCompactMinutes`（55）/ `idleCompactMinTokens`（50000）；开关 `CASEOS_IDLE_COMPACT=0` |
 
 ### 环境变量
 
@@ -46,10 +47,11 @@ Verispring 三角色会话架构 + 本地知识图谱 manon，大幅度优化主
 | `CASEOS_WATCHDOG_RESTART_MS` | `2000` | 重拉子进程的基础间隔；第 n 次等待 n 倍 |
 | `CASEOS_EVICT` | 开 | `0` 在装配时关闭子代理释放器（不包装 `agents.resume`、不装扫描、不注册 `release_subagent`、不落事件） |
 | `CASEOS_EVICT_SCAN_MS` | `60000` | 遥测扫描间隔；只上报可释放子代理数，绝不释放任何会话 |
+| `CASEOS_IDLE_COMPACT` | 开 | `0` 在装配时关闭空闲自动压缩门禁：不装 60s 定时器、不挂 `agent/request` / `agent/created` 监听、不落事件 |
 
 ### monitor 事件
 
-`~/.dsh/verispring-monitor.jsonl` 的 `kind`：`subagent-start` / `subagent-start-failed` / `subagent-end` / `subagent-error`（生命周期 + 角色 + 路由）、`child-route-updated`、`role-route-mismatch`、`scout-unreachable`、`scout-tools-restricted`（带测绘子代理 id；其 `edit`/`write` 已在 `agent/created` 时摘除）、`dispatch-deny`（带 `rule`：`scout-missing`、`brief-lint`、`map-baseline-missing`、`map-stale`、`executor-cap`）、`gate-deny`（派遣规范门/测绘常驻/缺地图，以及 codestyle 与 manon 的拒绝）、`leader-guard-deny`（带 `rule`：`sleep-in-loop`、`sleep-long`、`sleep-background`、`list-agents-repeat`）、`leader-write-hint`（带 `rule`：`write-whitelist`、`git-mutation`、`package-mutation`、`in-place-edit`、`recursive-remove`、`workspace-redirect`——非阻断的领导写入提示）、`ask-scout`、`structure-forward`、`checkpoint-saved` / `checkpoint-save-failed` / `checkpoint-injected` / `checkpoint-inject-failed`、`scout-relay-error`、`mem-guard-boot`（激活自报：`heapLimitBytes`、`nodeArgv`、`pid`、`softBytes`、`hardBytes`、`thresholdsSource`、`checkMs`、`readGuard`、`readGuardMaxBytes`）、`mem-guard-recycle` / `mem-guard-skip`（内存看门狗：`heapUsed`、释放条数 `released`、`reason`）、`mem-guard-read-deny`（整读门：`tool`、`session`、`path`、`size`）、`mem-guard-sample`（每 5 分钟的 `heapUsed` / `rss` / `heapLimitBytes` 增长曲线）、`mem-guard-soft`（软阈值越线心跳，5 分钟限流）、`mem-guard-release-hint`（软阈值期间主会话下一次工具结果后的非阻断提示：`session`、`heapUsed`、`softBytes`、`candidates`）、`mem-guard-release`（主会话点名释放子代理：`caller`、`child`、`mode`：`drain` / `dispose` / `noop` / `refused`、`reason`、`heapUsedBefore`、`heapUsedAfter`）、`mem-guard-evict-boot`（释放器 apply 时刻自报：`scanMs`、`tracked`、`untracked`、`releaseTool`、`subagentProbe`）、`mem-guard-evict-tool`（工具注册终态：`tool`、`registered`、`via`：`root` / `inject`、`elapsedMs`）、`mem-guard-evict-follow`（follow 包装安装：`source`、`preexistingFollowers`、`elapsedMs`）、`mem-guard-evict-scan`（每 5 分钟遥测：`tracked`、`candidates`、`resident`、`followerTotal`、`followerTracked`、`followerUntracked`、`followerProbe`、`subagentProbe`、`heapUsed`）、`mem-guard-evict-skip`（`reason`：`scan-failed`）、`host-watchdog-boot`（子进程启动自报：`pid`、`ppid`、`execPath`、`electron`、`sampleMs`、`stallMs`、`surgeBytes`、`rssAlertBytes`）、`host-stall` / `host-stall-tick` / `host-stall-end`（host 事件循环卡死：卡住毫秒、最后心跳 `seq` / `heapUsed`、RSS 曲线、恢复总时长与期间峰值）、`host-mem-surge`（`reason`：`rss-surge` / `rss-alert`、窗口起止 RSS、最近心跳 `heapUsed`）、`host-exit`（父进程死亡：最后心跳距今、最后 `heapUsed` / RSS、最近 10 个 RSS 样本、更新的 `crash-*.log` 文件名）、`host-watchdog-sample`（子进程 5 分钟汇总）、`host-watchdog-gave-up`（重拉 3 次仍失败）。
+`~/.dsh/verispring-monitor.jsonl` 的 `kind`：`subagent-start` / `subagent-start-failed` / `subagent-end` / `subagent-error`（生命周期 + 角色 + 路由）、`child-route-updated`、`role-route-mismatch`、`scout-unreachable`、`scout-tools-restricted`（带测绘子代理 id；其 `edit`/`write` 已在 `agent/created` 时摘除）、`dispatch-deny`（带 `rule`：`scout-missing`、`brief-lint`、`map-baseline-missing`、`map-stale`、`executor-cap`）、`gate-deny`（派遣规范门/测绘常驻/缺地图，以及 codestyle 与 manon 的拒绝）、`leader-guard-deny`（带 `rule`：`sleep-in-loop`、`sleep-long`、`sleep-background`、`list-agents-repeat`）、`leader-write-hint`（带 `rule`：`write-whitelist`、`git-mutation`、`package-mutation`、`in-place-edit`、`recursive-remove`、`workspace-redirect`——非阻断的领导写入提示）、`ask-scout`、`structure-forward`、`checkpoint-saved` / `checkpoint-save-failed` / `checkpoint-injected` / `checkpoint-inject-failed`、`scout-relay-error`、`mem-guard-boot`（激活自报：`heapLimitBytes`、`nodeArgv`、`pid`、`softBytes`、`hardBytes`、`thresholdsSource`、`checkMs`、`readGuard`、`readGuardMaxBytes`）、`mem-guard-recycle` / `mem-guard-skip`（内存看门狗：`heapUsed`、释放条数 `released`、`reason`）、`mem-guard-read-deny`（整读门：`tool`、`session`、`path`、`size`）、`mem-guard-sample`（每 5 分钟的 `heapUsed` / `rss` / `heapLimitBytes` 增长曲线）、`mem-guard-soft`（软阈值越线心跳，5 分钟限流）、`mem-guard-release-hint`（软阈值期间主会话下一次工具结果后的非阻断提示：`session`、`heapUsed`、`softBytes`、`candidates`）、`mem-guard-release`（主会话点名释放子代理：`caller`、`child`、`mode`：`drain` / `dispose` / `noop` / `refused`、`reason`、`heapUsedBefore`、`heapUsedAfter`）、`mem-guard-evict-boot`（释放器 apply 时刻自报：`scanMs`、`tracked`、`untracked`、`releaseTool`、`subagentProbe`）、`mem-guard-evict-tool`（工具注册终态：`tool`、`registered`、`via`：`root` / `inject`、`elapsedMs`）、`mem-guard-evict-follow`（follow 包装安装：`source`、`preexistingFollowers`、`elapsedMs`）、`mem-guard-evict-scan`（每 5 分钟遥测：`tracked`、`candidates`、`resident`、`followerTotal`、`followerTracked`、`followerUntracked`、`followerProbe`、`subagentProbe`、`heapUsed`）、`mem-guard-evict-skip`（`reason`：`scan-failed`）、`host-watchdog-boot`（子进程启动自报：`pid`、`ppid`、`execPath`、`electron`、`sampleMs`、`stallMs`、`surgeBytes`、`rssAlertBytes`）、`host-stall` / `host-stall-tick` / `host-stall-end`（host 事件循环卡死：卡住毫秒、最后心跳 `seq` / `heapUsed`、RSS 曲线、恢复总时长与期间峰值）、`host-mem-surge`（`reason`：`rss-surge` / `rss-alert`、窗口起止 RSS、最近心跳 `heapUsed`）、`host-exit`（父进程死亡：最后心跳距今、最后 `heapUsed` / RSS、最近 10 个 RSS 样本、更新的 `crash-*.log` 文件名）、`host-watchdog-sample`（子进程 5 分钟汇总）、`host-watchdog-gave-up`（重拉 3 次仍失败）、`idle-compact-start` / `idle-compact-done` / `idle-compact-fail` / `idle-compact-cancelled`（空闲自动压缩：`agent`、`epoch`、`idleMs` / `idleMinutes`、`totalTokens` / `minTokens`；`done` 带 `compacted`）。
 
 ## 内存看门狗（memory-guard）
 
@@ -370,6 +372,36 @@ preset；dispatch-gate 在子代理创建窗口（`agent/created`，早于首个
 （`dsh --profile … "<任务>"`）不为主会话组合任何 preset，主会话不吃 `standard` 的 400k 策略，
 只受 profile 根层启用的 `compaction-basic`（若有）约束；子代理不受影响。
 
+### 主会话空闲自动压缩
+
+主会话空闲期是唯一能在不打断回合的前提下回收上下文的窗口，也是缓存 TTL 咬人的地方：空闲
+一段时间后的第一次请求会把整段历史当**写缓存**重发。`gates/idle-compact.js` 把这个窗口变成
+一次压缩：
+
+- **tick**——单一 60s 定时器；每次只检查主会话（会话头带 `origin` / `parentSession` 的子会话
+  直接跳过，子代理上下文归父会话的派遣生命周期管），且只在 `agent.status` 为 `idle` 时看。
+- **阈值**——连续 `idleCompactMinutes`（默认 55）分钟没有真实模型请求，且
+  `tokenMeter.measure(session).totalTokens` **严格大于** `idleCompactMinTokens`（默认 50000）
+  才具备资格。空闲计时只由 `agent/request` 驱动，后台事件不刷新它（装载时按会话日志末事件时间
+  保守初始化一次，读不到就按 `now`，宁可晚压不早压）。
+- **压缩**——经 `agentPresets.serviceFor(agent, "compaction")` 取压缩服务（compaction 挂在 preset
+  的隔离领域里，`web-app` 在 root 层禁用了 `compaction-basic`），调
+  `compaction.compactNow(agent, signal)`；返回 `null`（无可压区间）同样算本轮完成。
+- **不重复压**——压缩的 summarize 直连 `ctx.llm.stream`，不触发 `agent/request`，因此既不刷新
+  空闲计时也不推进请求纪元。资格按纪元判定：`epoch` 只在真实请求时 +1，`compactedEpoch` 记
+  **触发时**捕获的纪元（不是完成时的），所以压缩期间排入的新请求之后仍具备资格。维护期间宿主
+  仍报 `agent.status` 为 `idle`，重入只能靠本门禁的 `inflight` 集合挡住；失败/取消每代理冷却
+  10 分钟；每个代理一个 `AbortController`，dispose 时 abort；重启后 `epoch` 与 `compactedEpoch`
+  都是 0，没有真实请求绝不压缩（避免重启即压）。
+- **适用范围**——只有 preset 绑定的主会话（web/desktop）会触发。headless 一次性驱动器
+  （`dsh --profile … "<任务>"`）不为主会话组合 preset，因此不触发，与 `/compact` 的可用范围一致。
+- **配置**——面板三个字段：`idleCompactEnabled`（默认开）、`idleCompactMinutes`（默认 55）、
+  `idleCompactMinTokens`（默认 50000）；`CASEOS_IDLE_COMPACT=0` 是装配级总开关（不装定时器、
+  不挂监听、不落事件），运行期设成 `0` 也会在下一个 tick 停手。
+- **监控**——每次触发往 `~/.dsh/verispring-monitor.jsonl` 追加 `idle-compact-start`，结束记
+  `idle-compact-done`（带 `compacted`）、`idle-compact-fail` 或 `idle-compact-cancelled`
+  （含 `agent`、`epoch`、`idleMs` / `idleMinutes`、`totalTokens` / `minTokens`）。
+
 ## 安装
 
 ```bash
@@ -427,6 +459,7 @@ tree-sitter 语言包按需动态加载，缺包只降级该语言不崩。密�
 | 测绘/执行智能体渠道 / 模型 / 思考强度 | `~/.dsh/verispring.json` | 两套路由分别由派遣门禁执法；执行路由同时写回 tool-subagent 默认值 |
 | Manon Deep Query 渠道 / 模型 / 思考强度 | `~/.dsh/manon.env` 的 `MANON_DEEPQUERY_*` | 随注入调用式 source 进 manon-kg |
 | embedding 端点 / 模型 | `~/.dsh/manon.env` 的 `MANON_EMBEDDING_*` | 更换模型后需重新 sync 重建向量 |
+| 主会话空闲自动压缩开关 / 空闲分钟 / token 下限（`idleCompactEnabled` / `idleCompactMinutes` / `idleCompactMinTokens`） | `verispring-config` 面板状态（volatile 字段，不写 `verispring.json`） | `gates/idle-compact.js` 的下一个 60s tick 即读新生效；开关关闭只是不量测，`CASEOS_IDLE_COMPACT=0` 才整体不装定时器 |
 
 面板 schema 依赖 `@deepseek-ai/schemastery`，按候选路径解析——插件自身目录、profile 目录、宿主安装树。`link:` 安装时裸标识符会从仓库真目录解析，仓库没有 `node_modules` 就会让整条目 import 失败；三处都解析不到时只降级面板（stderr 一行给出缺失依赖与修复命令），路由、门禁与派遣照常工作。
 

@@ -19,6 +19,7 @@ Verispring three-role session architecture plus a bundled local knowledge graph 
 | 10 | manon bridge | Resolves the local graph CLI (`MANON_KG_BIN` > bundled `manon/manon-kg` > legacy `~/manon/manon-kg`) and, when present, injects per role: the scout gets the full surface (commands, sourced invocation rule, ownership discipline), the leader gets one line ("graph facts come from the scout"), the executor gets one line — **manon is scout-owned; leader and executors never invoke it directly**; semantics in `~/.dsh/specs/Manon调用规则.md`. **The load-bearing part is the invocation rule**: dsh's subprocess service strips KEY/TOKEN-shaped env vars from children (anti-leak), so a bare `manon-kg sync` always fails with a missing key — the injected form sources `~/.dsh/manon.env` inside the bash command first (the scrub only strips the first hop; grandchildren inherit freely). Secret values never pass through or get printed |
 | 11 | Secret hygiene | Credential/env files (`manon.env`, `verispring.env`, project `.env*`) cannot be read via `read` or echoed via `cat`/`sed` and friends (matched per command segment, so the sanctioned `source` prefix and pipes on manon output are not false positives); whole-environment dumps — bare `env`/`printenv`, `ps eww`, `/proc/*/environ`, `docker inspect` without `--format` — are denied |
 | 12 | Runtime monitor | Role drift, gate denials, scout reachability changes and subagent start/end (role + route + stop reason, recorded only after a successful start) are appended to `~/.dsh/verispring-monitor.jsonl`, so audits no longer require decompressing session logs |
+| 13 | Idle auto-compaction | A single 60s tick looks at **main sessions only** — subagent context belongs to the parent's dispatch lifecycle and is never touched. When a main session has gone `idleCompactMinutes` (default 55) without a real model request and `tokenMeter`'s `totalTokens` is **strictly greater than** `idleCompactMinTokens` (default 50000), it calls the host's `compaction.compactNow` once. Idle is the only window that reclaims context without interrupting a turn, and it flattens the large cache writes of the first request after the cache TTL expired. No double compaction: compaction's summarise goes straight to `ctx.llm.stream` and never fires `agent/request`, so it neither refreshes the idle clock nor advances the request epoch; `compactedEpoch` records the epoch **captured at trigger time** (not at completion), so requests queued during compaction still qualify later. An `inflight` set blocks re-entry (the host keeps `agent.status` `idle` during maintenance, so status cannot), a failure or cancel cools down 10 minutes per agent, each agent owns an `AbortController`, and after a restart `epoch === compactedEpoch === 0` means nothing compacts before a real request. Services come from `agentPresets.serviceFor(agent, "compaction")` (the preset-isolated realm; `web-app` disables root-level `compaction-basic`), with older-host fallbacks. Scope: preset-bound main sessions (web/desktop) only — the headless one-shot driver composes no preset and never triggers (the same surface where `/compact` does not exist). Panel fields `idleCompactEnabled` (default true) / `idleCompactMinutes` (55) / `idleCompactMinTokens` (50000); kill switch `CASEOS_IDLE_COMPACT=0` |
 
 ### Environment variables
 
@@ -46,10 +47,11 @@ Verispring three-role session architecture plus a bundled local knowledge graph 
 | `CASEOS_WATCHDOG_RESTART_MS` | `2000` | base delay for re-forking the child; retry n waits n× this |
 | `CASEOS_EVICT` | on | `0` disables the subagent-release gate at assembly time (no `agents.resume` wrapper, no telemetry scan, no `release_subagent` tool, no events) |
 | `CASEOS_EVICT_SCAN_MS` | `60000` | telemetry scan interval; the scan only reports the releasable-child count, it never releases anything |
+| `CASEOS_IDLE_COMPACT` | on | `0` disables the idle auto-compaction gate at assembly time: no 60s timer, no `agent/request` / `agent/created` listeners, no events |
 
 ### Monitor events
 
-`kind` values in `~/.dsh/verispring-monitor.jsonl`: `subagent-start` / `subagent-start-failed` / `subagent-end` / `subagent-error` (lifecycle + role + route), `child-route-updated`, `role-route-mismatch`, `scout-unreachable`, `scout-tools-restricted` (scout child id; its `edit`/`write` were restricted on `agent/created`), `dispatch-deny` (with `rule`: `scout-missing`, `brief-lint`, `map-baseline-missing`, `map-stale`, `executor-cap`), `gate-deny` (dispatch spec / resident-scout / missing-map denials, plus codestyle and manon), `leader-guard-deny` (with `rule`: `sleep-in-loop`, `sleep-long`, `sleep-background`, `list-agents-repeat`), `leader-write-hint` (with `rule`: `write-whitelist`, `git-mutation`, `package-mutation`, `in-place-edit`, `recursive-remove`, `workspace-redirect` — non-blocking leader write hints), `ask-scout`, `structure-forward`, `checkpoint-saved` / `checkpoint-save-failed` / `checkpoint-injected` / `checkpoint-inject-failed`, `scout-relay-error`, `mem-guard-boot` (activation self-report: `heapLimitBytes`, `nodeArgv`, `pid`, `softBytes`, `hardBytes`, `thresholdsSource`, `checkMs`, `readGuard`, `readGuardMaxBytes`), `mem-guard-recycle` / `mem-guard-skip` (heap watchdog: `heapUsed`, `released`, `reason`), `mem-guard-read-deny` (whole-file read guard: `tool`, `session`, `path`, `size`), `mem-guard-sample` (a 5-minute `heapUsed` / `rss` / `heapLimitBytes` growth curve), `mem-guard-soft` (soft-threshold heartbeat, rate-limited to 5 minutes), `mem-guard-release-hint` (non-blocking leader hint after a tool result while over the soft threshold: `session`, `heapUsed`, `softBytes`, `candidates`), `mem-guard-release` (leader-requested subagent release: `caller`, `child`, `mode`: `drain` / `dispose` / `noop` / `refused`, `reason`, `heapUsedBefore`, `heapUsedAfter`), `mem-guard-evict-boot` (release gate self-report at apply time: `scanMs`, `tracked`, `untracked`, `releaseTool`, `subagentProbe`), `mem-guard-evict-tool` (final tool-registration state: `tool`, `registered`, `via`: `root` / `inject`, `elapsedMs`), `mem-guard-evict-follow` (follow-wrapper install: `source`, `preexistingFollowers`, `elapsedMs`), `mem-guard-evict-scan` (5-minute telemetry: `tracked`, `candidates`, `resident`, `followerTotal`, `followerTracked`, `followerUntracked`, `followerProbe`, `subagentProbe`, `heapUsed`), `mem-guard-evict-skip` (`reason`: `scan-failed`), `host-watchdog-boot` (child start self-report: `pid`, `ppid`, `execPath`, `electron`, `sampleMs`, `stallMs`, `surgeBytes`, `rssAlertBytes`), `host-stall` / `host-stall-tick` / `host-stall-end` (blocked host event loop: stalled ms, last heartbeat `seq` / `heapUsed`, RSS curve, recovery duration + peak RSS), `host-mem-surge` (`reason`: `rss-surge` / `rss-alert`, window start/end RSS, last heartbeat `heapUsed`), `host-exit` (parent died: last heartbeat age, last `heapUsed` / RSS, the last 10 RSS samples, newer `crash-*.log` names), `host-watchdog-sample` (5-minute child summary), `host-watchdog-gave-up` (3 failed re-forks).
+`kind` values in `~/.dsh/verispring-monitor.jsonl`: `subagent-start` / `subagent-start-failed` / `subagent-end` / `subagent-error` (lifecycle + role + route), `child-route-updated`, `role-route-mismatch`, `scout-unreachable`, `scout-tools-restricted` (scout child id; its `edit`/`write` were restricted on `agent/created`), `dispatch-deny` (with `rule`: `scout-missing`, `brief-lint`, `map-baseline-missing`, `map-stale`, `executor-cap`), `gate-deny` (dispatch spec / resident-scout / missing-map denials, plus codestyle and manon), `leader-guard-deny` (with `rule`: `sleep-in-loop`, `sleep-long`, `sleep-background`, `list-agents-repeat`), `leader-write-hint` (with `rule`: `write-whitelist`, `git-mutation`, `package-mutation`, `in-place-edit`, `recursive-remove`, `workspace-redirect` — non-blocking leader write hints), `ask-scout`, `structure-forward`, `checkpoint-saved` / `checkpoint-save-failed` / `checkpoint-injected` / `checkpoint-inject-failed`, `scout-relay-error`, `mem-guard-boot` (activation self-report: `heapLimitBytes`, `nodeArgv`, `pid`, `softBytes`, `hardBytes`, `thresholdsSource`, `checkMs`, `readGuard`, `readGuardMaxBytes`), `mem-guard-recycle` / `mem-guard-skip` (heap watchdog: `heapUsed`, `released`, `reason`), `mem-guard-read-deny` (whole-file read guard: `tool`, `session`, `path`, `size`), `mem-guard-sample` (a 5-minute `heapUsed` / `rss` / `heapLimitBytes` growth curve), `mem-guard-soft` (soft-threshold heartbeat, rate-limited to 5 minutes), `mem-guard-release-hint` (non-blocking leader hint after a tool result while over the soft threshold: `session`, `heapUsed`, `softBytes`, `candidates`), `mem-guard-release` (leader-requested subagent release: `caller`, `child`, `mode`: `drain` / `dispose` / `noop` / `refused`, `reason`, `heapUsedBefore`, `heapUsedAfter`), `mem-guard-evict-boot` (release gate self-report at apply time: `scanMs`, `tracked`, `untracked`, `releaseTool`, `subagentProbe`), `mem-guard-evict-tool` (final tool-registration state: `tool`, `registered`, `via`: `root` / `inject`, `elapsedMs`), `mem-guard-evict-follow` (follow-wrapper install: `source`, `preexistingFollowers`, `elapsedMs`), `mem-guard-evict-scan` (5-minute telemetry: `tracked`, `candidates`, `resident`, `followerTotal`, `followerTracked`, `followerUntracked`, `followerProbe`, `subagentProbe`, `heapUsed`), `mem-guard-evict-skip` (`reason`: `scan-failed`), `host-watchdog-boot` (child start self-report: `pid`, `ppid`, `execPath`, `electron`, `sampleMs`, `stallMs`, `surgeBytes`, `rssAlertBytes`), `host-stall` / `host-stall-tick` / `host-stall-end` (blocked host event loop: stalled ms, last heartbeat `seq` / `heapUsed`, RSS curve, recovery duration + peak RSS), `host-mem-surge` (`reason`: `rss-surge` / `rss-alert`, window start/end RSS, last heartbeat `heapUsed`), `host-exit` (parent died: last heartbeat age, last `heapUsed` / RSS, the last 10 RSS samples, newer `crash-*.log` names), `host-watchdog-sample` (5-minute child summary), `host-watchdog-gave-up` (3 failed re-forks), `idle-compact-start` / `idle-compact-done` / `idle-compact-fail` / `idle-compact-cancelled` (idle auto-compaction: `agent`, `epoch`, `idleMs` / `idleMinutes`, `totalTokens` / `minTokens`; `done` carries `compacted`).
 
 
 ## Memory guard
@@ -431,6 +433,43 @@ so a cold resume recomposes from the session log. The headless one-shot runner
 not get the `standard` 400k policy — only a root-level `compaction-basic` if the profile enables
 one; subagents are unaffected.
 
+### Idle auto-compaction of the main session
+
+An idle main session is the only window that reclaims context without interrupting a turn, and it is
+also where the cache TTL bites: the first request after an idle stretch re-sends the whole history as
+cache *writes*. `gates/idle-compact.js` turns that window into one compaction:
+
+- **Tick** — a single 60s timer; each tick looks at main sessions only (child headers carry
+  `origin` / `parentSession`, and subagent context belongs to the parent's dispatch lifecycle) and only
+  while `agent.status` is `idle`.
+- **Threshold** — a session becomes eligible after `idleCompactMinutes` (default 55) with no real model
+  request, and only when `tokenMeter.measure(session).totalTokens` is **strictly greater than**
+  `idleCompactMinTokens` (default 50000). The idle clock is driven by `agent/request` alone; background
+  events never refresh it (at load time it is conservatively seeded from the session log's last event
+  time, or `now`).
+- **Compaction** — `compaction.compactNow(agent, signal)` through
+  `agentPresets.serviceFor(agent, "compaction")` (compaction lives in the preset-isolated realm;
+  `web-app` disables root-level `compaction-basic`), with older-host fallbacks. A `null` result (nothing
+  to compact) counts as a finished round too.
+- **No double compaction** — compaction's summarise goes straight to `ctx.llm.stream` and never fires
+  `agent/request`, so it neither refreshes the idle clock nor advances the request epoch. Eligibility is
+  epoch-based: `epoch` advances only on a real request, and `compactedEpoch` records the epoch
+  **captured when the trigger fired**, not the one at completion — so a request queued while compaction
+  runs still qualifies afterwards. The host keeps `agent.status` `idle` during maintenance, so an
+  `inflight` set is the re-entry guard; a failure or cancel cools down 10 minutes per agent; each agent
+  owns an `AbortController` aborted on dispose; after a restart `epoch === compactedEpoch === 0`, so
+  nothing compacts before a real request (no compaction right after a restart).
+- **Scope** — only preset-bound main sessions (web/desktop) trigger. The headless one-shot runner
+  (`dsh --profile … "<task>"`) composes no preset for the main session, so it never triggers — the same
+  surface where `/compact` does not exist.
+- **Configuration** — three panel fields: `idleCompactEnabled` (default on), `idleCompactMinutes`
+  (default 55) and `idleCompactMinTokens` (default 50000). `CASEOS_IDLE_COMPACT=0` is the assembly-level
+  kill switch (no timer, no listeners, no events); setting it to `0` at runtime also stops the next
+  tick.
+- **Monitor** — each trigger appends `idle-compact-start` to `~/.dsh/verispring-monitor.jsonl`; the end
+  is recorded as `idle-compact-done` (with `compacted`), `idle-compact-fail` or
+  `idle-compact-cancelled` (`agent`, `epoch`, `idleMs` / `idleMinutes`, `totalTokens` / `minTokens`).
+
 ## Install
 
 ```bash
@@ -501,6 +540,7 @@ native values:
 | Surveying/execution provider / model / effort | `~/.dsh/verispring.json` | each route is enforced by the dispatch gate; execution defaults are also written to `tool-subagent` |
 | Manon Deep Query provider / model / effort | `MANON_DEEPQUERY_*` keys in `~/.dsh/manon.env` | flows into manon-kg with the sourced invocation |
 | embedding endpoint / model | `MANON_EMBEDDING_*` keys in `~/.dsh/manon.env` | re-run sync after switching models |
+| Idle auto-compaction switch / idle minutes / min tokens (`idleCompactEnabled` / `idleCompactMinutes` / `idleCompactMinTokens`) | `verispring-config` panel state (volatile fields; never written into `verispring.json`) | read fresh on the next 60s tick of `gates/idle-compact.js`; switch off means no measuring, `CASEOS_IDLE_COMPACT=0` removes the timer entirely |
 
 The panel schema is built from `@deepseek-ai/schemastery`, resolved by candidate path — the
 plugin's own directory, the profile directory, then the host install tree — because a `link:`
