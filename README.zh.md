@@ -1,406 +1,53 @@
 # dsh-plugin-verispring
 
-Verispring 三角色会话架构 + 本地知识图谱 manon，大幅度优化主会话上下文，大幅节省顶级模型API费用。
+三角色会话架构插件（领导 — 测绘 — 执行）+ 自带本地知识图谱 manon。主会话保留顶级模型，但自己
+不再通读代码：重活交给 DeepSeek Flash，主会话上下文保持干净，从而大幅节省顶级模型 API 费用。
+
+*领导派遣 → 测绘建图并回答事实 → 执行者出手 → 回执回到领导*
+
 [English](README.md) | 中文
 
-## 它强制什么
+## 它做什么
 
-| # | 门禁 | 行为 |
-|---|---|---|
-| 1 | 派遣规范门 | `subagent` / `subagent_fork` 前本会话必须出现过《子代理派遣规范》内容（读结果含规范首行标记即记为已读；状态持久化在会话日志里，跨进程重启不丢） |
-| 2 | 测绘身份（按派遣意图） | 角色由**领导写的 `description` 前缀**决定：前缀是「测绘智能体」或 `scout` 的派遣是测绘派遣，其余一律是执行派遣。可达性只决定这一笔能不能派，不改变角色：可达测绘还在时再派测绘一律拒绝，指路 `send_message` 复用（测绘应询结束显示 finished/inactive 属正常，`send_message` 会冷恢复它）；没有可达测绘时**执行派遣被拒**（规则 `scout-missing`），文案给出三条路——`send_message` 续接上一任测绘、用测绘前缀重派、先让测绘建图/校对地图。绝不会被悄悄改写成测绘。凡测绘派遣都先注入职责说明（只读、上任测绘不可达的事实、仓库地图全文）；只有测绘派遣成功启动才写 `scoutId`，执行派遣不写也不改该字段。子代理角色 spawn 时落盘（`session-state/<子会话id>.json`），重载后按落盘角色、标题与登记的 scoutId 恢复 |
-| 3 | 地图前置 + 基准 | 非测绘派遣要求 `<会话工作区>/.project-map.md` 存在（`.git`/`.manon` 在场才认定项目根，否则 fail-open）；对该文件的 `write`/`edit` 成功即把当前 HEAD 登记为地图基准，HEAD 前进过基准就拒绝执行派遣（指路测绘增量校对 + 用 `write` 整文件重写登记新基准）。地图在而基准缺失同样拒绝，不再 fail-open——陈旧地图不会永久放行。仅 `CASEOS_SCOUT=0` 或读不到 HEAD 时放行 |
-| 4 | 任务书闸 + 并发上限 | 执行任务书是成果描述，不是调研请求：含调研型措辞（`gates/dispatch-gate.js` 的 `BRIEF_LINT_TERMS`）即拒绝并指路 `send_message` 测绘——**带否定的说法豁免**（命中词前 6 个字符内有否定词，如「不要通读实现」「禁止先调研」）。同一领导会话里运行中的执行子代理有上限（缺省 8），超限拒绝并提示结束回合等回执。两者各有开关（`CASEOS_BRIEF_LINT=0`、`CASEOS_MAX_EXECUTORS`） |
-| 5 | 模型钉死 | 路由在运行时**按角色**强制注入：测绘派遣走面板测绘路由，执行派遣走执行路由（角色来自 `description` 前缀）；调用里显式写的 `provider`/`model` 一律忽略。`subagent_fork` 一律拒绝 |
-| 6 | 提交门 | `git commit` 前必须先读 `~/.dsh/specs/代码写作规范.md`；提交形状强制 `-F 文件 -- 显式路径`，`timeout`/`env`/`nice`/`nohup`/`stdbuf` 等包装命令穿透识别 |
-| 7 | 领导面限定 | 领导会话工具面收缩到复核五件（`bash`/`edit`/`write`/`read`/`read_image`）+ 派遣面（`subagent`/`send_message`/`interrupt_agent`/`list_agents`/`release_subagent`），名单与领导视图里实际存在的工具取交集（桌面工具在 preset 层，headless 在根层），派遣工具以瘦身定义遮蔽，这些模型可见定义按会话冻结（见「工具面与系统段的逐会话冻结」）；`subagent-base` 在 root 层无条件隐藏（路由执行体异常时模型无路可绕）。测绘/执行子代理用 `verispring-subagent` preset 的全量工具面；测绘的 `edit`/`write` 在运行时硬禁——`gates/dispatch-gate.js` 在 `agent/created` 时按派遣队列计划里的 `scout` 角色，在子代理自己的作用域上调 `rtc.tools.restrict({ deny: ["edit", "write"] })`，工具列表里直接没有这两个工具（执行者与领导保留）。逃生开关 `CASEOS_SCOUT=0` 关闭分工条款中的测绘部分与该硬禁 |
-| 8 | 领导守卫（leader-guard） | 两类处置。**拒绝（不变）**：有子代理运行时 `bash` 里的 `sleep`/循环等待被拒；同一回合第二次 `list_agents` 被拒。**提示（1.3.66 起）**：白名单（`.project-map.md`、路径含 `/reports/`、`~/.dsh/AGENTS.md`，外加 `CASEOS_LEADER_WRITE_ALLOW` 前缀）之外的 `edit`/`write` 与 `bash` 变更命令——`git commit/push/merge/rebase/restore/stash`（只有 `git stash list` / `git stash show` 按只读静默）、`npm`/`pnpm` 的 publish/install、`sed -i`/`perl -i`、`rm -rf`、工作区重定向——**不再拒绝**：调用照常执行，在工具结果后经宿主 `tools/post-execute` 的 `additionalContexts` 追加一次提示（「有明确边界的代码和写作任务，请交给执行子代理；领导自己只做小修正、地图、报告和验收所需的写入」），同一回合只提示一次，monitor 记 `leader-write-hint`（规则名 + 摘要）。子代理会话不受限。逃生开关 `CASEOS_LEADER_GUARD=0` |
-| 9 | 测绘接力（scout-relay） | 三条原本只在提示词里的闭环：`ask_scout` 让执行者把定位/事实问题代发给常驻测绘并等它新答复（sender 取领导 Agent，`sendMessage` 按血缘授权；答复按 marker 从测绘会话事件关联，测绘答完即结算离场也能送达；每轮等待都由真实 ≥250ms 计时器让出，等待结束即清除）；非测绘子代理收尾文本里的「结构增量」段自动转给测绘；异常结束（`error`/`aborted`/`refusal`）落检查点，领导续接时由插件携现场代发。非测绘子代理另有注入的 ≤4 行定位纪律（有可达测绘指 `ask_scout`，没有则写进汇报）+ 必带的「结构增量」段。逃生开关 `CASEOS_SCOUT_RELAY=0`；`CASEOS_ASK_SCOUT_TIMEOUT_MS` 控制等待时限 |
-| 10 | manon 桥接 | 解析本地图谱 CLI（`MANON_KG_BIN` > 组件自带 `manon/manon-kg` > 旧地 `~/manon/manon-kg`），存在则按角色注入：测绘拿全量（命令面、source 调用铁则、维护纪律），领导只拿"图谱事实找测绘"，执行只拿一行说明。manon 是测绘专责，领导和执行都不直接调用；语义详见 `~/.dsh/specs/Manon调用规则.md`。**承重墙是调用铁则**：dsh 子进程服务会把 KEY/TOKEN 形状的环境变量从子进程剥掉（防泄漏），直接跑 `manon-kg sync` 必报缺密钥——注入的调用式让 bash 命令先 `source ~/.dsh/manon.env` 再执行（清洗只剥第一层，孙进程自由继承）。密钥值不经过也不打印 |
-| 11 | 密钥卫生 | 凭据/环境文件（`manon.env`、`verispring.env`、项目 `.env*`）禁止 read、禁止用 `cat`/`sed` 等命令输出（按命令段判定，受控 source 与 manon 输出管道不误伤）；无参数 `env`/`printenv`、`ps eww`、`/proc/*/environ`、无 `--format` 的 `docker inspect` 这类整环境倾倒一律拦截 |
-| 12 | 运行监控 | 角色漂移、门禁拦截、测绘可达性变化、子代理 start/end（角色 + 路由 + 停止原因，启动成功后才记）追加落盘 `~/.dsh/verispring-monitor.jsonl`，事后审计无需解压会话日志 |
-| 13 | 空闲自动压缩 | 单一 60s tick **只检查主会话**——子代理的上下文由父会话的派遣生命周期管理，这里绝不介入。主会话连续 `idleCompactMinutes`（默认 55）分钟没有真实模型请求，且 `tokenMeter` 读到的 `totalTokens` **严格超过** `idleCompactMinTokens`（默认 50000）时，调宿主 `compaction.compactNow` 压一次。空闲期是唯一不打断回合的压缩时机，能摊平缓存 TTL 过期后下一次请求的大额缓存写入。防重复靠请求纪元：压缩自身的 summarize 直连 `ctx.llm.stream`、不触发 `agent/request`，因此既不刷新空闲计时也不推进纪元；`compactedEpoch` 记**触发时**捕获的 epoch（不是完成时），压缩期间排队的新请求之后仍具备资格。`inflight` 集合挡住重入（维护期间宿主仍报 `agent.status` 为 `idle`，不能靠状态），失败/取消每代理冷却 10 分钟，每个代理一个 `AbortController`（dispose 时 abort）；重启后 `epoch === compactedEpoch === 0`，没有真实请求绝不压缩（避免重启即压）。服务取自 `agentPresets.serviceFor(agent, "compaction")`（预设隔离领域；`web-app` 在 root 层禁用了 `compaction-basic`），并带老宿主兜底。适用范围：仅 preset 绑定的主会话（web/desktop）触发；headless 一次性驱动器不为主会话组合 preset，因而不触发（与 `/compact` 的可用范围一致）。面板字段 `idleCompactEnabled`（默认 true）/ `idleCompactMinutes`（55）/ `idleCompactMinTokens`（50000）；开关 `CASEOS_IDLE_COMPACT=0` |
+### 三角色分工，由派遣纪律强制执行
 
-### 环境变量
+领导负责规划、派遣与验收；常驻测绘掌握仓库地图、对代码只读；执行者写码、跑命令。角色由派遣本身
+决定，没有可达测绘时执行派遣会被拒，地图不存在或不新鲜时执行者也不会启动。任务书直达子会话，
+结果以结算回执返回——主会话不会被原始探索污染。manon 图谱是测绘专责工具，领导与执行都不直接调用，
+有图谱问题就问测绘。同一领导会话里同时运行的执行者默认上限 8 个，派遣不会摊成一堆并发。
 
-| 变量 | 缺省 | 作用 |
-|---|---|---|
-| `CASEOS_SCOUT` | 开 | `0` 关闭分工条款中的测绘部分、地图新鲜度/基准判定与 `scout-missing` 拒绝（没有测绘也放行执行派遣） |
-| `CASEOS_BRIEF_LINT` | 开 | `0` 关闭执行任务书的调研措辞拦截 |
-| `CASEOS_MAX_EXECUTORS` | `8` | 每领导会话运行中执行子代理上限（`0` 等于禁止一切执行派遣）。插件上限 8 与宿主 `maxActiveSubagents` 的缺省值 8 同值（测绘也计入宿主名额），因此测绘在运行时第 8 个执行者可能被宿主以 `ACTIVATION_LIMIT_REACHED` 拒绝 |
-| `CASEOS_LEADER_GUARD` | 开 | `0` 在装配时关闭领导守卫 |
-| `CASEOS_LEADER_WRITE_ALLOW` | 空 | 以 `:` 分隔的额外可写路径前缀（领导 `edit`/`write`） |
-| `CASEOS_SCOUT_RELAY` | 开 | `0` 不注册 `ask_scout`，且停止转交、检查点与提示注入 |
-| `CASEOS_ASK_SCOUT_TIMEOUT_MS` | `600000` | `ask_scout` 等测绘答复的时限，超时返回超时文案 |
-| `CASEOS_MEM_GUARD` | 开 | `0` 在装配时关闭 host 内存看门狗（不装定时器、不挂监听） |
-| `CASEOS_MEM_CHECK_MS` | `15000` | host 堆内存检查间隔 |
-| `CASEOS_READ_GUARD` | 开 | `0` 关闭整读门（`tools/pre-execute` 里拒绝超大文件整读） |
-| `CASEOS_READ_GUARD_MAX_BYTES` | `2097152`（2MiB） | 整读允许的最大文件；超过就拒绝并给出分段读法 |
-| `CASEOS_READ_GUARD_ALLOW` | 空 | 逗号分隔的放行前缀（`~` 展开、按目录边界匹配），命中的路径整读门直接放行 |
-| `CASEOS_MEM_SOFT_BYTES` | 顶棚 × 60% | 软阈值：给主会话发非阻断释放提示 + 剪本插件的只增索引（4GiB 顶棚即 2.4GiB） |
-| `CASEOS_MEM_HARD_BYTES` | 顶棚 × 80% | 硬阈值：空闲态记 `mem-guard-skip` + 重启提示（绝不退出；4GiB 顶棚即 3.2GiB） |
-| `CASEOS_HOST_WATCHDOG` | 开 | `0` 关闭独立子进程看门狗（不 fork、不发心跳） |
-| `CASEOS_WATCHDOG_SAMPLE_MS` | `5000` | 子进程采样间隔（用 `ps -o rss= -p <ppid>` 采父进程 RSS） |
-| `CASEOS_WATCHDOG_STALL_MS` | `10000` | 心跳静默多久算 host 事件循环卡死 |
-| `CASEOS_WATCHDOG_SURGE_BYTES` | `536870912`（512MiB） | 30s 内 RSS 增长多少记 `host-mem-surge` |
-| `CASEOS_WATCHDOG_RSS_ALERT_BYTES` | `2791728742`（2.6GiB） | RSS 首次越过多少记 `host-mem-surge`（`rss-alert`） |
-| `CASEOS_WATCHDOG_RESTART_MS` | `2000` | 重拉子进程的基础间隔；第 n 次等待 n 倍 |
-| `CASEOS_EVICT` | 开 | `0` 在装配时关闭子代理释放器（不包装 `agents.resume`、不装扫描、不注册 `release_subagent`、不落事件） |
-| `CASEOS_EVICT_SCAN_MS` | `60000` | 遥测扫描间隔；只上报可释放子代理数，绝不释放任何会话 |
-| `CASEOS_IDLE_COMPACT` | 开 | `0` 在装配时关闭空闲自动压缩门禁：不装 60s 定时器、不挂 `agent/request` / `agent/created` 监听、不落事件 |
+### 省钱的模型分工
 
-### monitor 事件
+主会话用顶级模型（默认 Claude Opus 5.5），测绘与执行默认 DeepSeek Flash。路由在运行时按角色强制
+注入——派遣调用里写的 provider/model 一律被忽略——便宜路由不是建议而是纪律。两套智能体路由都在
+插件面板选择，主会话用 DSH 原生模型选择器。
 
-`~/.dsh/verispring-monitor.jsonl` 的 `kind`：`subagent-start` / `subagent-start-failed` / `subagent-end` / `subagent-error`（生命周期 + 角色 + 路由）、`child-route-updated`、`role-route-mismatch`、`scout-unreachable`、`scout-tools-restricted`（带测绘子代理 id；其 `edit`/`write` 已在 `agent/created` 时摘除）、`dispatch-deny`（带 `rule`：`scout-missing`、`brief-lint`、`map-baseline-missing`、`map-stale`、`executor-cap`）、`gate-deny`（派遣规范门/测绘常驻/缺地图，以及 codestyle 与 manon 的拒绝）、`leader-guard-deny`（带 `rule`：`sleep-in-loop`、`sleep-long`、`sleep-background`、`list-agents-repeat`）、`leader-write-hint`（带 `rule`：`write-whitelist`、`git-mutation`、`package-mutation`、`in-place-edit`、`recursive-remove`、`workspace-redirect`——非阻断的领导写入提示）、`ask-scout`、`structure-forward`、`checkpoint-saved` / `checkpoint-save-failed` / `checkpoint-injected` / `checkpoint-inject-failed`、`scout-relay-error`、`mem-guard-boot`（激活自报：`heapLimitBytes`、`nodeArgv`、`pid`、`softBytes`、`hardBytes`、`thresholdsSource`、`checkMs`、`readGuard`、`readGuardMaxBytes`）、`mem-guard-recycle` / `mem-guard-skip`（内存看门狗：`heapUsed`、释放条数 `released`、`reason`）、`mem-guard-read-deny`（整读门：`tool`、`session`、`path`、`size`）、`mem-guard-sample`（每 5 分钟的 `heapUsed` / `rss` / `heapLimitBytes` 增长曲线）、`mem-guard-soft`（软阈值越线心跳，5 分钟限流）、`mem-guard-release-hint`（软阈值期间主会话下一次工具结果后的非阻断提示：`session`、`heapUsed`、`softBytes`、`candidates`）、`mem-guard-release`（主会话点名释放子代理：`caller`、`child`、`mode`：`drain` / `dispose` / `noop` / `refused`、`reason`、`heapUsedBefore`、`heapUsedAfter`）、`mem-guard-evict-boot`（释放器 apply 时刻自报：`scanMs`、`tracked`、`untracked`、`releaseTool`、`subagentProbe`）、`mem-guard-evict-tool`（工具注册终态：`tool`、`registered`、`via`：`root` / `inject`、`elapsedMs`）、`mem-guard-evict-follow`（follow 包装安装：`source`、`preexistingFollowers`、`elapsedMs`）、`mem-guard-evict-scan`（每 5 分钟遥测：`tracked`、`candidates`、`resident`、`followerTotal`、`followerTracked`、`followerUntracked`、`followerProbe`、`subagentProbe`、`heapUsed`）、`mem-guard-evict-skip`（`reason`：`scan-failed`）、`host-watchdog-boot`（子进程启动自报：`pid`、`ppid`、`execPath`、`electron`、`sampleMs`、`stallMs`、`surgeBytes`、`rssAlertBytes`）、`host-stall` / `host-stall-tick` / `host-stall-end`（host 事件循环卡死：卡住毫秒、最后心跳 `seq` / `heapUsed`、RSS 曲线、恢复总时长与期间峰值）、`host-mem-surge`（`reason`：`rss-surge` / `rss-alert`、窗口起止 RSS、最近心跳 `heapUsed`）、`host-exit`（父进程死亡：最后心跳距今、最后 `heapUsed` / RSS、最近 10 个 RSS 样本、更新的 `crash-*.log` 文件名）、`host-watchdog-sample`（子进程 5 分钟汇总）、`host-watchdog-gave-up`（重拉 3 次仍失败）、`idle-compact-start` / `idle-compact-done` / `idle-compact-fail` / `idle-compact-cancelled`（空闲自动压缩：`agent`、`epoch`、`idleMs` / `idleMinutes`、`totalTokens` / `minTokens`；`done` 带 `compacted`）。
+### 缓存成本防线
 
-## 内存看门狗（memory-guard）
+工具定义与系统段逐会话冻结，新版本改的文案不会让在跑会话重写提示前缀。压缩按角色分档：主会话在
+窗口 40% 触发，子代理 60%。主会话空闲 55 分钟且超过 50K token 时自动压一次——摊平缓存 TTL 过期
+后那笔大额缓存写入。认账的代价：超大工具结果会一直留在上下文里，直到某次压缩把它摘要掉。
 
-host 进程自己从不淘汰点开的会话；没有释放路径，跑久了必然 OOM。`gates/memory-guard.js` 在 host 内读
-`process.memoryUsage()`（每 `CASEOS_MEM_CHECK_MS`，默认 15s；`subagent/end` 后与每次工具结果
-（`tools/post-execute`）后都立即补一次——一次巨型结果就能在两次采样之间把堆顶上去）：
+### 内存与宿主守护
 
-- **启动自报**——激活时往 `~/.dsh/verispring-monitor.jsonl` 追加一条 `mem-guard-boot`：
-  `heapLimitBytes`（`v8.getHeapStatistics().heap_size_limit`）、`nodeArgv`（`process.execArgv`）、
-  `pid`、`softBytes` / `hardBytes`、`thresholdsSource`（`proportional` / `env`）、`checkMs`。这是判断
-  「顶棚到底是多少、有没有真的变」的唯一锚点：阈值、实证读数与宿主真实堆上限都从这条线读。
-- **阈值按顶棚比例**——默认 soft = `floor(heapLimitBytes × 0.6)`、hard = `floor(heapLimitBytes × 0.8)`：
-  4GiB 顶棚即 2.4GiB / 3.2GiB（与旧版固定值同档），8GiB 顶棚自动抬到 4.8GiB / 6.4GiB。
-  `CASEOS_MEM_SOFT_BYTES` / `CASEOS_MEM_HARD_BYTES` 显式设置时按 env 覆盖（可只覆盖一侧），此时
-  `thresholdsSource: "env"`。读不到 V8 顶棚时按 4GiB 兜底，不会让看门狗整个失活。
-- **软阈值**——只观测、不行动。插件绝不自行释放任何会话：按活会话剪掉本插件自己的只增索引
-  （记 `mem-guard-recycle`，5 分钟冷却），并保留 `mem-guard-soft` 心跳；没有可剪条目时记
-  `mem-guard-skip`（`reason: "soft-threshold-no-targets"`）。
-- **释放提示**——堆越过软阈值期间，**主会话**的下一次工具结果后追加一条非阻断
-  `additionalContexts`：列出主会话可释放的已结束子代理（`id`、截断的描述、测绘/执行）并建议调用
-  `release_subagent`。落 `mem-guard-release-hint`；同一主会话 5 分钟最多一次，子代理会话永远收不到。
-- **整读门**——突发大头是「一份巨型工具结果进 `Session.log`」（宿主 pruner 原会对 >8KB 的结果再
-  复制一份；本包已不再挂该截断器，见「上下文压缩」），所以 `tools/pre-execute` 先查会整篇进
-  结果的调用：没带 `offset`/`limit` 的 `read`，以及 bash 里的整读动词（`cat`、`less`、`more`、
-  `most`、`nl`、`tac`、`strings`、`xxd`、`hexdump`、`od`、`base64`、`wc`、带 `-n 'a,bp'` 行范围
-  之外的 `sed`、`tail -n +N`）。目标超过 `CASEOS_READ_GUARD_MAX_BYTES`（默认 2MiB）即拒绝，
-  拒绝文案写明文件大小与分段读法，并记 `mem-guard-read-deny`。`stat` 失败、相对路径拿不到会话
-  cwd、以及任何解析歧义（重定向、命令替换、引号不闭合）一律放行——只在确定超限时才拒绝。
-  根 ctx 的监听器收到全部 agent 的调用，子代理会话同样受检。
-- **观测面**——阈值以下也每 5 分钟落一条 `mem-guard-sample`（`heapUsed` / `rss` /
-  `heapLimitBytes`），增长曲线不再只在越线后可见；软阈值越线每 5 分钟落一条
-  `mem-guard-soft`。一次检查若卡在宿主释放的 await 上超过 `max(2×checkMs, 60s)`，记
-  `mem-guard-skip`（`reason: "check-stuck"`）并把 `checking` 置回，后续 tick 不再被永久静默。
-- **硬阈值**——只在空闲态（无运行中子代理、近 90s 无工具活动）记 `mem-guard-skip` 并在 stderr
-  提示人工重启。**不退出 host**：`main.js` 把 host 子进程的任何 close（含 exit 0）都当作失败停止
-  且不会重新 spawn，靠退出触发重启只会打断当前 desktop 后端（热重启接缝见下节，插件层不可达）。
-- `mem-guard-skip` 还记录忙态、冷却跳过与回收失败，一律带 `heapUsed`（必要时 `hardBytes` /
-  `released` / `reason`）。
+堆阈值在触顶前很早就告警并剪掉插件自己的索引；进程外看门狗在宿主事件循环卡住时照常采样；超大
+文件整读被拒并给出分段读法；领导可以点名释放已结束的子代理把内存交还。宿主绝不会被悄悄杀掉——
+硬阈值只记一条重启提示。
 
-一键全关：`CASEOS_MEM_GUARD=0`（连 boot 自报与整读门也不落、不挂）；只想关整读门用
-`CASEOS_READ_GUARD=0`。
+### 密钥卫生
 
-## 独立子进程看门狗（host-watchdog）
+凭据文件（`manon.env`、`verispring.env`、项目 `.env*`）禁止读取、禁止命令输出，整环境倾倒一律
+拦截；密钥值不进会话日志。
 
-进程内定时器在 host 事件循环被占住时无法留证：2026-10-21 10:48 的 OOM 里 host 卡了 45 秒，15s 的
-`mem-guard` 定时器一条都没写。`gates/memory-guard.js` 在 apply 时 fork `gates/host-watchdog-child.js`
-——一个独立 node 进程，host 卡死时它照常采样：
+### 可观测
 
-- 每 1000ms 经 IPC 收心跳（`seq`、`t`、`heapUsed`、`heapTotal`、`rss`），定时器 `unref`，发送失败静默。
-- 每 `CASEOS_WATCHDOG_SAMPLE_MS`（默认 5000）用 `ps -o rss= -p <ppid>` 异步采父进程 RSS（2s 超时；
-  macOS 的 KB 换算成字节）。
-- **卡死**——父进程仍活着但 `CASEOS_WATCHDOG_STALL_MS`（默认 10000）没有心跳：先一条 `host-stall`
-  （卡了多久、最后心跳 `seq` / `heapUsed`、当前 RSS），卡死期间每个采样周期一条 `host-stall-tick`
-  （RSS 曲线），心跳恢复写 `host-stall-end`（总时长、期间峰值 RSS）。
-- **暴涨**——任意 30s 窗口 RSS 增长 ≥ `CASEOS_WATCHDOG_SURGE_BYTES`（默认 512MiB），或 RSS 首次
-  越过 `CASEOS_WATCHDOG_RSS_ALERT_BYTES`（默认 2.6GiB）：`host-mem-surge` 带窗口起止 RSS 与最近
-  心跳的 `heapUsed`；同类 60s 节流。
-- **父进程死亡**——IPC `disconnect` 或 `process.kill(ppid, 0)` 失败：写 `host-exit`（最后心跳距今、
-  最后 `heapUsed` / RSS、最近 10 个 RSS 样本），再列出 `~/Library/Logs/DeepSeek Harness/` 下比子进程
-  启动时间新的 `crash-*.log` **文件名**（只列名字、不读内容），然后退出——绝不留孤儿。
-- 启动一条 `host-watchdog-boot`（pid、ppid、execPath、阈值），每 5 分钟一条 `host-watchdog-sample`
-  汇总（RSS / 峰值 / 卡死与暴涨计数）。
+角色漂移、门禁拦截、派遣、释放与内存事件全部落到 `~/.dsh/verispring-monitor.jsonl`，事后审计
+无需解压会话日志。
 
-子进程**绝不**杀进程、发信号或重启 host，只留证。父侧管着重拉：子进程意外退出时最多重拉 3 次，
-间隔按 `CASEOS_WATCHDOG_RESTART_MS`（默认 2000）递增（1×、2×、3×），超过就写
-`host-watchdog-gave-up` 并停止。`ctx.effect` 释放时停心跳、断 IPC 并 `kill()` 自己的子进程，插件
-重载不累积进程。开关：`CASEOS_HOST_WATCHDOG=0`；`CASEOS_MEM_GUARD=0` 连子进程一起关。
+### 一切可关
 
-host 本身是 Electron 二进制跑 node 模式：桌面壳用 `spawn(this.node, ...)` +
-`ELECTRON_RUN_AS_NODE: "1"` 拉起它（`/tmp/dsh-asar-extract/lib/main.js:245`、`:3652`、`:3794`），
-线上 host 进程的 `nodeArgv` 是 `["--expose-internals"]`。所以子进程沿用 `process.execPath` 并显式带
-`ELECTRON_RUN_AS_NODE=1`；`mem-guard-boot` 现在同时记 `execPath` 与 `process.versions.electron`，
-每次重启后可核对。
-
-开销：一个常驻 node 子进程（实测 Electron node 模式约 67MB RSS，普通 node 约 45MB）加每 5s 一次
-`ps`；关掉时两者都不存在。
-
-## 子代理释放由主会话决定（session-evictor）
-
-host 把每次 promote 的会话整份常驻：session-controller 的 promote 链把 `ctx.agents.resume()`
-返回的 `{ agent, dispose }` 里的 `dispose` 丢掉（`dsh-api-session-controller/lib/index.js:
-396-403`），而 resume 的 owner 是长期存活的控制器作用域（`dsh-agent/lib/index.js:466-470`），
-所以被 UI 跟随过的会话（含 caseos 工作流里的子代理会话）本会一直留到 host 退出。本门禁
-**自己不做任何决定**：
-
-- **主会话永不被自动卸载**；
-- **子代理也不再自动卸载**——由主会话通过 `release_subagent` 工具逐个决定（只有主会话看得见、
-  调得动；子代理调用一律拒绝）；
-- 定时扫描（`CASEOS_EVICT_SCAN_MS`，默认 60s）**只是遥测**：上报「主会话当前可释放几个已结束
-  子代理」，绝不调用 dispose。
-
-`gates/session-evictor.js` 仍在插件激活时包装 `AgentRegistry.prototype.resume`：cordis 的
-`ctx.agents` 是 traceable proxy，每次方法访问都重新沿原型链取 `resume`（`cordis/lib/index.js:
-84-157`、`:675`、`:686`、`:763-764`），所以 session-controller 的 `this.ctx.agents.resume`
-必然经过包装；包装只旁路记录 handle，返回值原样透传——这份 handle 正是 `release_subagent`
-释放「冷续接过、已 settle」的子代理时要用的。激活前已经 promote 的会话拿不到 handle，只在
-`mem-guard-evict-boot.untracked` 里上报，不动它们。
-
-`release_subagent` 只有一个参数 `agent_ids: string[]`，逐 id 返回 `released` / `not-loaded` /
-`refused`（带原因）以及 `heapUsedBefore` / `heapUsedAfter`。授权与安全判据：
-
-- 调用方必须是主会话（`session.header.origin !== "subagent"`）；子代理调用直接拒绝，且不释放
-  任何目标；
-- 目标必须是调用方的**后代**（`header.parentSession` 链可达）；主会话（含调用方自己）或无关
-  会话一律拒绝；
-- 目标必须已结束：`agent.status === "idle"`、durable inbox 无 pending、manager 的
-  `ChildLock.tails` 无在途续接/投递、`session-controller` 无在途 resume/claim；
-- 目标**没有活着的后代**：孙代先释放，否则一并拒绝（本实现选择拒绝，绝不隐式拆整棵子树）；
-- 目标没有 UI follow 流：`sessionController.history.follow` 包装按 sessionId 归属活跃 follow；
-  包装安装前就存在的 follow 无法归属，此时保守拒绝（`follower-untracked`）。
-
-拒绝原因（工具结果的 `reason` 与 `mem-guard-release.reason`）：
-
-| 原因 | 含义 |
-|---|---|
-| `main-session` | 目标（或调用方）是主会话，不是子代理 |
-| `not-descendant` | 活/持久化 `parentSession` 链到不了调用方 |
-| `unknown-session` | 内存内外的会话头都查不到这个 id |
-| `header-unreadable` | 持久化头存在但在 5s 内读不出，或已损坏/版本不支持 |
-| `not-captured` | agent 还活着，但本插件没捕获到 `dispose` handle（激活前已 promote） |
-| `drain-parent-not-live` | resident 目标的直接父已不在 agents 注册表 |
-| `running`、`pending-inbox`、`operation-in-flight`、`subagent-operation-in-flight`、`live-descendant`、`followed`、`follower-untracked` | 目标还没结束，或此刻释放不安全 |
-| `not-leader` | 调用方是子代理（工具只给主会话） |
-| `subagents-unavailable`、`still-registered`、`drain-failed: …`、`dispose-failed: …` | 宿主前置条件消失或释放调用失败；目标保持存活 |
-
-**释放路径**：目标仍在 `subagents.manager.resident` → 调宿主 `subagents.drainChildren(parent,
-[id])`，宿主要求 **exact live direct parent**（`dsh-subagent/lib/index.js:1372-1383`）；调用方是
-祖父时用该 activation 自己的直接父，且它必须仍在 agents 注册表里（否则 `drain-parent-not-live`）。
-不用 `drainDescendants`（`:1334`）：它释放 root 的全部后代，不能只挑一个孙代。已 settle 但仍在
-内存的目标走捕获的 `handle.dispose()`；本就不在内存的返回 `not-loaded`（成功无操作）；
-活着但本插件没捕获到 handle 的（激活前已 promote）返回 `not-captured`，不谎报已释放。不在内存的
-目标，其血缘来自**持久化会话头**：`ctx.get("sessionPersistence").stat(id)` 只读首行——zstd 时只解
-头部帧，均按 8KB 块读（`dsh-session-persistence-jsonl/lib/index.js:2570-2601`、`:3352-3403`）——
-不解析事件日志、不 promote、不走 `observeSession`。持久化头显示是后代且未加载 → `not-loaded`；
-查不到头 → `unknown-session`；查到的父子关系回填进程内 lineage，重复调用不再读盘，祖先链最多查
-32 层。每次尝试都落 `mem-guard-release`（`caller`、`child`、`mode`：`drain` / `dispose` / `noop` /
-`refused`、`reason`、`heapUsedBefore`、`heapUsedAfter`）。
-
-**释放效果**：`handle.dispose()` 会 stop loop → await idle → 拆 scope → 关持久化 handle →
-`detachAgent` / `detachSession`（`dsh-agent-loop/lib/index.js:1740-1810`），SessionStore
-（`dsh-session:1886-1893`）与 AgentRegistry（`dsh-agent:544`）的条目一起消失；本插件还会在
-`sessionQuery._observations.cache` 里对 `refs === 0` 的目标做一次定点清退（冷观察缓存上限 5，
-`dsh-session-query/lib/index.js:327-341`），persistence 的 `coldLogMemo`（上限 2）按会话 id
-点名删一条可重建缓存。被释放的子代理若之后收到 `send_message`，会走 manager 的
-`coldResume → materialize → agents.resume` 正常冷恢复并被再次捕获，不丢会话。
-
-follow 归属包装在 host 启动阶段就安装：apply 先试装，若 session-controller 尚未 provide，则用
-`ctx.inject(["sessionController"], …)` 在服务可用时立即补装，故界面首条 follow 前包装已就位。
-boot 的 `followerProbe:"deferred"` 表示在等服务 provide，实际安装另落 `mem-guard-evict-follow`
-（`source`：`apply` / `inject` / `scan` / `release`、`preexistingFollowers`、`elapsedMs`）。
-每 5 分钟落 `mem-guard-evict-scan`：`tracked`、`candidates`（当前可释放的已结束子代理数）、
-`resident`、`followerTotal`、`followerTracked`、`followerUntracked`、`followerProbe`、
-`subagentProbe`、`heapUsed`。
-
-工具注册遥测分两条：`mem-guard-evict-boot.releaseTool` 是 apply 时刻快照（`tools` 服务尚未
-provide 时可以是 `false`）；root 注册或 `ctx.inject(["tools"], …)` 兜底完成后，
-`mem-guard-evict-tool` 落终态（`registered`、`via`：`root` / `inject`、`elapsedMs`）。
-
-堆越过软阈值时，内存看门狗会在主会话下一次工具结果后追加非阻断的
-`mem-guard-release-hint`（见上节），列出的正是同一批候选；它自己绝不释放任何东西。
-
-旧的 `CASEOS_EVICT_IDLE_MS` 与「堆压力 ≥ 50% 降阈」机制一并删除：不再自动释放，也就没有
-空闲门槛可调。
-
-一键全关：`CASEOS_EVICT=0`（不包装、不扫描、不注册 `release_subagent`、不落事件）。
-
-### 堆顶棚：4GB 是 V8 构建硬上限，启动参数抬不动（实测）
-
-v2 原本要把顶棚抬到 128GB 机器该有的水平。本机实测的结论是**抬不动**，且原因不在 DSH 的注入路径：
-
-| 实验（只读、临时进程、结束即退） | 结果 |
-|---|---|
-| `ELECTRON_RUN_AS_NODE=1 "<app>" --max-old-space-size=1024/2048/3072/4095 -e 'console.log(require("v8").getHeapStatistics().heap_size_limit)'` | 1.09 / 2.09 / 3.09 / 4.09GiB，线性跟随参数 |
-| 同上，参数取 4097 / 4352 / 4608 / 5120 / 6144 / 8192 / 12288 / 16384 / 32768 | **全部 4395630592（4.09GiB）**，old space 精确封顶 4096MiB |
-| 系统 node（26.11.1）`NODE_OPTIONS=--max-old-space-size=8192` | 8.09GiB，正常生效（对照证明参数本身没问题） |
-| 进程内 `v8.setFlagsFromString("--max-old-space-size=8192")` | 仍 4.09GiB（堆在 isolate 创建时已配置好） |
-
-原因：app 内置 Electron 44.7.0 / V8 15.2 的 `process.config.variables` 为
-`v8_enable_pointer_compression=1`、`v8_enable_sandbox=1`；指针压缩把同一进程的 V8 堆硬限在 4GB
-（Electron 官方博客 [Electron and the V8 Memory Cage](https://www.electronjs.org/zh/blog/v8-memory-cage)）。
-超过 4GB 的 `--max-old-space-size` 被 V8 静默截到 4096MiB，所以 **NODE_OPTIONS、给 spawn 加参数、
-换 node 二进制都无效**——这是构建期属性，不是运行期可调项。
-
-注入路径本身是通的（供上游修复时参考，均为只读取证）：
-- `~/.dsh/{deepseek,manon,verispring}.env` 不被宿主读取；宿主只在启动时读 `<DSH_HOME>/.env` 与
-  调用目录 `.env`（`dsh-app-boot` 的 `loadLayeredEnv`），且 `NODE_OPTIONS` 属 bootstrap-only 名单，
-  写了会被直接拒绝；即便不拒，`.env` 也是在 host 进程内加载，V8 早已完成初始化。
-- 登录 shell 里 `export NODE_OPTIONS=...` 会进 host 的 spawn env：`main.js` 读登录 shell 环境后按
-  **黑名单**只剔除 `DSH_` / `ELECTRON_` 前缀（`mergeLoginShellEnvironment`），`NODE_OPTIONS` 原样
-  透传；Electron 只在「父进程签名不是本 app」时剥离它（macOS 安全策略），而 host 的父进程就是本
-  app，不会被剥。所以这条链是通的——只是被 4GB 上限吃掉。
-
-**用户可执行的一次性验证（只读，不修改任何文件）**：
-
-```bash
-# 8192 被 V8 截到 4096MiB：输出 4395630592
-ELECTRON_RUN_AS_NODE=1 "/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSeek Harness" \
-  --max-old-space-size=8192 -e 'console.log(require("v8").getHeapStatistics().heap_size_limit)'
-
-# 对照：普通 node 同参数输出 8690597888（说明参数与命令都写对了）
-node --max-old-space-size=8192 -e 'console.log(require("v8").getHeapStatistics().heap_size_limit)'
-```
-
-App（⌘Q 后重开）每次激活都会写 `mem-guard-boot`，核对当前真实顶棚与阈值来源：
-
-```bash
-grep '"kind":"mem-guard-boot"' "${DSH_HOME:-$HOME/.dsh}/verispring-monitor.jsonl" | tail -1
-```
-
-**为什么没有「抬顶棚」指令**：在本二进制上不存在。要真正超过 4GB 只能换构建/换宿主形态（均属上游）：
-
-1. 上游用 `v8_enable_pointer_compression=false`（sandbox 需相应调整）重建 Electron——代价是内存占用
-   上升、GC 变慢，Electron 官方不建议为个别 app 这么做；
-2. 把 host 拆成多进程/多 isolate，让每组会话各有 4GB 顶棚（架构改动）；
-3. 治本仍是淘汰会话事件史（`Session.log` 只增不减）与「点开即整份常驻」的 promote 行为。
-
-**app.asar 补丁方案（最小 diff，仅供配合去指针压缩的 Electron 重建；单独打上不生效）**：
-
-```diff
---- a/lib/main.js   DesktopHostProcess.start()
-+++ b/lib/main.js
- const child = spawn(this.node, [
-+  "--max-old-space-size=8192",
-   "--expose-internals",
-```
-
-风险清单：改 `app.asar` 破坏代码签名与 asar integrity（`EnableEmbeddedAsarIntegrityValidation` 开启时
-直接拒绝启动）；每次应用更新覆盖；macOS Gatekeeper/quarantine 需重签名；非官方支持路径；且实测 V8 仍
-截到 4.09GiB，收益为零。**本仓库不修改 /Applications 下任何文件**。
-
-### 后端热重启：插件层不可达（上游 ask）
-
-理想状态是硬阈值 + 空闲时「热重启 host」：host 重新 spawn、会话从磁盘恢复，1–2 秒无感循环。取证结论
-是**没有插件可达的接缝**：
-
-- `DesktopBackendController.start()` 只有三个调用点：启动时 `reconcileBackend`（main.js:13178 →
-  :12313）、更新安装失败后的恢复（:12283）。host 任意退出（含 exit 0）→ `fail` → `errorState` →
-  `reportFatal(..., "host")`（:12254-12257）→ 原生崩溃对话框；对话框的 Restart 是 `app.relaunch()`
-  + quit（:11844-11848）——整 app 重启且必须用户点击。
-- main 的 IPC 通道表（`DESKTOP_IPC`，:6981-7008）没有 restart/reload；host 控制协议只有
-  `shutdown-complete` / `ready` / `platform-session` / `fatal` / `quit-inspection` / `update-tasks`
-  （`dsh-desktop-host/lib/index.js:252-360`）；渲染端 `client.js` 只能触达 host 的 HTTP/WS，够不到
-  Electron main。
-- 因此 v2 不实现「recycle 触发 host 重启」：硬阈值保持「monitor + stderr 提示人工重启」。
-
-**上游 ask 原文（可直接提 issue）**：
-
-> Expose a host recycle path to the plugin/renderer layer: add e.g. a `dsh-desktop:recycle-host` IPC
-> (`assertProductSender`) that runs `await backend.stop(); await backend.start(prepareHostEnvironment);
-> await navigateMain(applicationUrl);` gated on the host's idle check, so a plugin inside the host
-> (memory-guard) can request a warm backend restart when the V8 heap approaches its 4GB build limit.
-> Today `DesktopBackendController.start()` is reachable only from startup and update-recovery, and a
-> host exit only opens the fatal dialog.
-
-## 回执制（不轮询）
-
-子代理完成任务时 DSH 会把结算回执（含收尾报告）注入领导收件箱并唤醒领导回合；测绘的回报以消息直达。领导系统提示负责解释纪律（派遣后直接结束回合等回执，全部回执验收后才给最终答复），**由 leader-guard 在运行时执行**：有子代理运行时 `sleep`/循环等待、同一回合第二次 `list_agents` 都会被拒——轮询不是劝告，是拒绝。纪律的另一半——领导自己的写入与变更命令——改为非阻断提示，追加在工具结果之后（见第 8 行）。
-
-组合包 patch 还把子代理工具配置为：`backgroundMode: continuable`（后台可续派遣，`send_message`
-纠偏）、`maxDepth: 1`（不派孙代理）、执行层 persona；两个 preset 的 `tool-subagent` 关闭
-`modelSelectionSettings`（路由按角色强制注入，模型选择无效；开启时 `subagent` 工具注册进每个
-会话自己的层，路由包装无法遮蔽）。派遣入口使用 DSH 官方 activation API，立即返回子代理 ID；
-后续消息通过子代理续接工具发送。headless/CLI 场景进程随回合退出，子代理工作不会在进程结束后保留。
-
-## 工具面与系统段的逐会话冻结（缓存前缀稳定）
-
-工具定义（name/description/parameters 及顺序）在 Anthropic 提示缓存前缀的最前面，系统段紧随其后：
-任何一个字节变化，在跑会话的下一轮就要把前缀整段重写。会话日志
-（`~/.dsh/sessions/**/session.v4.jsonl.zstd` 里 `type=request/header` 的 `data.header.tools`）实证过
-同一会话内工具集反复变化：5cc6c9 ↔ 00f363 是 `subagent` 三个参数（cwd/description/prompt）的说明在
-「全局手写 schema」与「宿主基座 slim」两条注册路径之间来回切，一份有说明、一份整段缺失；一次
-`SLIM_DESC.subagent` 文案提交直接进了在跑会话；新增一个工具让工具数 10 → 11。每次都对上一次生产
-网关的整段重写（实测 15 万~39 万 token）。
-
-修复分两层：
-
-1. **单一路径 + 固定顺序**：`subagent` 的参数只有一份 canonical schema（cwd/description/prompt 都带
-   说明，长度控制在瘦身口径内），全局入口与会话层入口都用它——宿主有没有 `subagent-base` 都不改变模型面；
-   插件工具的会话层注册顺序固定（`gates/tool-surface.js` 的 `SURFACE_TOOL_ORDER`）。
-2. **逐会话快照**：会话首次构建工具面时，把该会话最终顺序的模型可见定义与插件注入的系统段文本写进
-   `~/.dsh/caseos/session-state/<会话id>.surface.json`；此后同一会话（恢复、重启、热重载）一律按快照
-   注册与出文案，执行闭包取当前实现。于是：
-   - 新增/改写的工具文案与系统段只对**新会话**生效，在跑会话的前缀逐字节不变；
-   - 快照里没有的新工具不暴露给旧会话（插件全局注册的那些用该会话的 `restrict` 摘掉）；
-   - 快照有而当前实现没有的工具跳过，并在 stderr 记一行；
-   - 快照损坏/缺失按当前定义重建并写回（升级后第一次恢复按当时实现重建一次，此后照旧冻结）。
-
-边界（认账）：`caseos:scout-relay` 段随「本会话可达测绘 id」变化——这是会话状态事实，冻结会把执行者
-指向已换掉的旧测绘，因此保持现行为；冻结只覆盖**模型可见字段**（description/parameters/系统段文本）
-与工具顺序，返回值、`output.schema`、`execute` 永远取当前实现。要让某个在跑会话换到新文案：新开会话；
-或删掉它的 `<会话id>.surface.json` 后再恢复（会按当前实现重建一次）。
-
-## 上下文压缩（分角色）
-
-| 角色 | 挂载位置 | 触发 → 摘要上限 |
-|---|---|---|
-| 主会话（领导） | `standard` preset 的 compaction 组 | 上下文窗口 40%（1M 窗口即约 400k）→ 摘要上限 40k token |
-| 测绘/执行子代理 | `verispring-subagent` preset 的 compaction 组 | 上下文窗口 60%（约 600k）→ 摘要上限 60k token |
-
-两条策略都不挂宿主的工具结果截断器（`dsh-compaction-tool-result-pruner`）。截断器会改写历史里
-任何超预算的 `tool/result`——包括已经发给模型的结果；而 compaction-basic 在量测**之前**就调它
-（`index.ts:324`，`:325` 重测，若仅靠截断降到阈值下就直接返回、不做压缩），上下文溢出恢复时再调
-一次（`:296`）。一次截断就让 system 之后的提示缓存整段失效：请求不再是上一次的前缀延伸，下一次
-请求把整段历史当**写缓存**重发，而不是读缓存。生产实测：约 40 万 token 时截掉 2518 token
-（2026-10-22 06:45），下一次请求整段重写 37.1 万 token；21:30/00:19/19:05/20:44 同形态
-（38.9 万/34.7 万/38.4 万/38.4 万）。回改这些旧块还会让其后每个 thinking 块的签名失效，网关按
-绑定键直接 400。
-
-自动压缩本身保留：按 DSH 结构化模板合并可安全压缩的历史，不额外保留原文尾部，上下文溢出时
-自动重试；摘要长度由模型按固定模板决定，上限只是封顶，实际摘要通常远短于上限。树里没有截断器时
-compaction-basic 读不到 `toolResultPruner` 服务，直接进入摘要——不报错；压缩请求本身仍读缓存：
-它复用最近一次的 system 与 tools，指令只追加在末尾。认账的代价：超大工具结果会留在上下文里，
-直到某次压缩把它摘要掉，40%/60% 阈值因此更早到达。
-
-子代理挂 `verispring-subagent`：harness 的 spawn 请求没有 preset 字段，子代理默认继承父会话
-preset；dispatch-gate 在子代理创建窗口（`agent/created`，早于首个 prompt）把它切过去并写入
-`agent-preset/selected` 事件，冷恢复时按会话记录重新组合。headless 一次性驱动器
-（`dsh --profile … "<任务>"`）不为主会话组合任何 preset，主会话不吃 `standard` 的 400k 策略，
-只受 profile 根层启用的 `compaction-basic`（若有）约束；子代理不受影响。
-
-### 主会话空闲自动压缩
-
-主会话空闲期是唯一能在不打断回合的前提下回收上下文的窗口，也是缓存 TTL 咬人的地方：空闲
-一段时间后的第一次请求会把整段历史当**写缓存**重发。`gates/idle-compact.js` 把这个窗口变成
-一次压缩：
-
-- **tick**——单一 60s 定时器；每次只检查主会话（会话头带 `origin` / `parentSession` 的子会话
-  直接跳过，子代理上下文归父会话的派遣生命周期管），且只在 `agent.status` 为 `idle` 时看。
-- **阈值**——连续 `idleCompactMinutes`（默认 55）分钟没有真实模型请求，且
-  `tokenMeter.measure(session).totalTokens` **严格大于** `idleCompactMinTokens`（默认 50000）
-  才具备资格。空闲计时只由 `agent/request` 驱动，后台事件不刷新它（装载时按会话日志末事件时间
-  保守初始化一次，读不到就按 `now`，宁可晚压不早压）。
-- **压缩**——经 `agentPresets.serviceFor(agent, "compaction")` 取压缩服务（compaction 挂在 preset
-  的隔离领域里，`web-app` 在 root 层禁用了 `compaction-basic`），调
-  `compaction.compactNow(agent, signal)`；返回 `null`（无可压区间）同样算本轮完成。
-- **不重复压**——压缩的 summarize 直连 `ctx.llm.stream`，不触发 `agent/request`，因此既不刷新
-  空闲计时也不推进请求纪元。资格按纪元判定：`epoch` 只在真实请求时 +1，`compactedEpoch` 记
-  **触发时**捕获的纪元（不是完成时的），所以压缩期间排入的新请求之后仍具备资格。维护期间宿主
-  仍报 `agent.status` 为 `idle`，重入只能靠本门禁的 `inflight` 集合挡住；失败/取消每代理冷却
-  10 分钟；每个代理一个 `AbortController`，dispose 时 abort；重启后 `epoch` 与 `compactedEpoch`
-  都是 0，没有真实请求绝不压缩（避免重启即压）。
-- **适用范围**——只有 preset 绑定的主会话（web/desktop）会触发。headless 一次性驱动器
-  （`dsh --profile … "<任务>"`）不为主会话组合 preset，因此不触发，与 `/compact` 的可用范围一致。
-- **配置**——面板三个字段：`idleCompactEnabled`（默认开）、`idleCompactMinutes`（默认 55）、
-  `idleCompactMinTokens`（默认 50000）；`CASEOS_IDLE_COMPACT=0` 是装配级总开关（不装定时器、
-  不挂监听、不落事件），运行期设成 `0` 也会在下一个 tick 停手。
-- **监控**——每次触发往 `~/.dsh/verispring-monitor.jsonl` 追加 `idle-compact-start`，结束记
-  `idle-compact-done`（带 `compacted`）、`idle-compact-fail` 或 `idle-compact-cancelled`
-  （含 `agent`、`epoch`、`idleMs` / `idleMinutes`、`totalTokens` / `minTokens`）。
+门禁都由 `CASEOS_*` 环境变量控制，可以单独关一条，也可以整体关掉，不必卸载：比如
+`CASEOS_MEM_GUARD=0` 关掉内存守卫与看门狗，`CASEOS_SCOUT=0` 去掉分工条款里的测绘部分。
 
 ## 安装
 
@@ -411,158 +58,23 @@ dsh plugin --profile <你的profile> add github:brandonzyy/dsh-plugin-verispring
 # 桌面版：设置 → 插件 → 安装，粘贴同一条 spec
 ```
 
-桌面版默认启用 HMR（base 组合包随 profile 上下文开启），插件管理器发起的安装**即时生效**，无需重启；
-已经在跑的会话保持旧组合，新会话/新派遣拿到新树。仅当 HMR 被显式禁用（如 headless/SDK/ACP）时才需要重启。
-更新方式：卸载后重装同一条 spec（非官方插件的「更新」按钮按平台设计仅提供给官方按需插件）。
+桌面版默认启用 HMR，通过插件管理器安装即时生效——无需重启。已在跑的会话保持旧组合，新会话与新
+派遣拿到新树；仅当 HMR 被显式禁用（headless/SDK/ACP）时才需要重启。更新方式：卸载后重装同一条
+spec。
 
-## manon 组件（随包分发）
-
-`manon/` 内置本地图谱 CLI 全套：`manon-kg` 入口 + `matrixone_graph`/`codeindex`/`core`
-源码 + 冻结的 `requirements.txt`（click/httpx/networkx/numpy/rich/PyYAML + tree-sitter
-全语言家族，均为预编译 wheel）。桥接解析顺序：`MANON_KG_BIN` 显式指路 > **组件自带**
-（与本包版本配对）> 旧地 `~/manon/manon-kg`（历史本机安装）。
-
-索引默认即全主流语言（Python/TS/TSX/JS/Java/PHP/Go/Rust/C/C++/C#/Ruby/Lua/Bash，与冻结
-的 tree-sitter 包一一对应），不依赖浅层语言检测——任何仓开箱 `sync` 就是全语言索引；
-缺包语言自动降级不崩。`query -j` 默认瘦身输出（紧凑字段，实体 ≤40 条、关系 ≤60 条、
-描述/代码片段截断），全量 payload 加 `--full`。
-
-组件版首次运行自举 Python venv 并装依赖（一次性联网，需 python3 ≥3.11），此后离线可用；
-venv 落在 `${DSH_HOME:-~/.dsh}/manon-kg-runtime`（安装包目录只读，运行环境不入包）。
-tree-sitter 语言包按需动态加载，缺包只降级该语言不崩。密钥沿用 `~/.dsh/manon.env` +
-`~/.dsh/verispring.env`，由注入的调用式在 bash 命令内 source。
-
-## 前置约定（不满足时门禁会告诉你缺什么）
-
-- **profile 组合**：需含 agent preset 注册表与 `preset-standard`（桌面版 / web 组合包自带）。
-  纯 `dsh-headless` profile 没有这一条目，插件 patch 加载即报 `entry "preset-standard" not found`。
-- **规范文件**：`~/.dsh/specs/子代理派遣规范.md` 与 `~/.dsh/specs/代码写作规范.md`（路径按
-  主目录解析）。缺规范时对应门禁会持续拦截并指路——这是特性：拒绝必须可满足。
-- **模型路由**：profile 需有 `verispring` 渠道（pi-ai）及 `deepseek-flash` 模型，与领导面的
-  `claude-opus-5-5` 同一个渠道——同一网关只需一个渠道。`deepseek-flash` 条目必须声明
-  `reasoningEfforts`（off/low/high/max）与 `compat.forceAdaptiveThinking: true`，否则 pi-ai
-  拒发 effort（`UNSUPPORTED_REASONING_EFFORT`）。
-  `gates/dispatch-gate.js` 的 `DEFAULT_ROUTES` 与包内 `agentOptions` 同为此路由，两处保持一致
-  （面板保存后以 `~/.dsh/verispring.json` 为准）。换网关时改这两处 + profile 里的 `baseURL`。
-- **manon（可选）**：组件自带，无需本机安装；密钥放 `~/.dsh/manon.env`
-  （`MANON_EMBEDDING_API_KEY`，sync 的向量嵌入）与 `~/.dsh/verispring.env`
-  （`VERISPRING_API_KEY`，deep-query 缺省回退）——注入的调用式会自行 source 这两个文件，
-  模型/端点的环境变量覆盖（`MANON_DEEPQUERY_*` / `MANON_EMBEDDING_*`）也写在这里即随会话生效。
-  不用 manon 时包内其余门禁不受影响。
-
-## 配置面板（v1.3+）
-
-安装后组合包详情页直接显示配置。面板使用 DSH 共用表单控件并读取实时模型目录，渠道和模型选项与模型设置保持一致，保存即生效。面板从未保存（全部取默认）时插件不改写任何执法面——`verispring.json`、`manon.env` 里的原生配置不被默认值覆盖：
-
-| 面板字段 | 落盘位置 | 生效方式 |
-|---|---|---|
-| 测绘/执行智能体渠道 / 模型 / 思考强度 | `~/.dsh/verispring.json` | 两套路由分别由派遣门禁执法；执行路由同时写回 tool-subagent 默认值 |
-| Manon Deep Query 渠道 / 模型 / 思考强度 | `~/.dsh/manon.env` 的 `MANON_DEEPQUERY_*` | 随注入调用式 source 进 manon-kg |
-| embedding 端点 / 模型 | `~/.dsh/manon.env` 的 `MANON_EMBEDDING_*` | 更换模型后需重新 sync 重建向量 |
-| 主会话空闲自动压缩开关 / 空闲分钟 / token 下限（`idleCompactEnabled` / `idleCompactMinutes` / `idleCompactMinTokens`） | `verispring-config` 面板状态（volatile 字段，不写 `verispring.json`） | `gates/idle-compact.js` 的下一个 60s tick 即读新生效；开关关闭只是不量测，`CASEOS_IDLE_COMPACT=0` 才整体不装定时器 |
-
-面板 schema 依赖 `@deepseek-ai/schemastery`，按候选路径解析——插件自身目录、profile 目录、宿主安装树。`link:` 安装时裸标识符会从仓库真目录解析，仓库没有 `node_modules` 就会让整条目 import 失败；三处都解析不到时只降级面板（stderr 一行给出缺失依赖与修复命令），路由、门禁与派遣照常工作。
-
-写入根为 Harness home（`DSH_HOME`），多 home / 探针环境互不串扰；`manon.env` 只 upsert 面板键，用户凭据行原样保留。测绘智能体和执行智能体分别选择渠道、模型、思考强度；Verispring key 通过 DSH 凭据库保存，保存后自动发现网关模型目录并刷新选项，embedding 模型保留文本输入。
-
-## 模型配置建议
-
-三个智能体路由位在插件面板配置；主会话使用 DSH 原生模型选择器。
-
-| 模型位 | 配置处 | 建议 |
-|---|---|---|
-| 测绘智能体 / 执行智能体 | 插件面板分别选择 | 默认都用 **DeepSeek Flash**；两套路由可独立选择渠道、模型和思考强度 |
-| Manon Deep Query | 面板选择 verispring 渠道、模型、思考强度；密钥回退 `VERISPRING_API_KEY` | **DeepSeek Flash + off**（出厂即推荐）；保存后写入 `~/.dsh/manon.env`，随注入调用式生效。 |
-| embedding | 环境变量：`MANON_EMBEDDING_URL` / `MANON_EMBEDDING_MODEL` / `MANON_EMBEDDING_API_KEY`（默认硅基流动 `BAAI/bge-m3`） | 内置 bge-m3 即推荐；更换需重新 sync 重建向量 |
-
-主会话与派遣共用一个 `verispring` 渠道（pi-ai）：领导面 `claude-opus-5-5`，派遣面
-`deepseek-flash`。同一网关只需一个渠道；`deepseek-flash` 条目必须声明 `reasoningEfforts`
-与 `compat.forceAdaptiveThinking`，否则 pi-ai 拒发 effort（`UNSUPPORTED_REASONING_EFFORT`）。
-包内 `cordis.patch.yml` 已带这组条目，profile 侧按需覆盖：
-
-```yaml
-- id: llm-pi-ai
-  config:
-    providers:
-      verispring:
-        displayName: Verispring
-        apiKeyEnv: VERISPRING_API_KEY
-        api: anthropic-messages
-        baseURL: https://api.verispring.cn
-        streamIdleTimeoutMs: 600000
-        models:
-          - id: claude-opus-5-5
-            name: Claude Opus 5.5
-            contextWindow: 1000000
-            maxTokens: 128000
-            input:
-              - text
-              - image
-            compat:
-              forceAdaptiveThinking: true
-            reasoningEfforts:
-              low: low
-              medium: medium
-              high: high
-              xhigh: xhigh
-              max: max
-          - id: deepseek-flash
-            name: deepseek-flash
-            contextWindow: 1000000
-            maxTokens: 256000
-            input:
-              - text
-              - image
-            reasoningEfforts:
-              off: off
-              low: low
-              high: high
-              max: max
-            compat:
-              forceAdaptiveThinking: true
-
-- id: agent-default-model
-  config:
-    provider: verispring
-    model: claude-opus-5-5
-```
-
+**前置条件** —— profile 需含 agent preset 注册表与 `preset-standard`（桌面版 / web 组合包自带）；
+`~/.dsh/specs/子代理派遣规范.md` 与 `~/.dsh/specs/代码写作规范.md` 需存在（缺规范时门禁会持续
+拦截并指路）；`verispring` 渠道需同时服务领导模型与一条声明了 `reasoningEfforts` 和
+`compat.forceAdaptiveThinking` 的 `deepseek-flash` 条目。manon 随包分发、可选：首次运行自举
+Python venv（一次性联网，需 python3 ≥3.11），密钥放 `~/.dsh/manon.env` 与 `~/.dsh/verispring.env`。
 
 > **专属优惠**：找插件发布包作者领取——**Claude 8 折，DeepSeek Flash 5 折**；微信：`jinyong0716`。
 
-## 兼容性
+## 测试
 
-`peerDependencies` 钉 `@deepseek-ai/cordis` `4.0.4 || ~4.0.5-alpha.1`，`engines.dsh` 覆盖
-dsh 0.2.0-rc.2 至 0.2.1-rc.1。版本不满足时安装被拒；确要强装走官方豁免流程
-（`dsh plugin --profile <p> allow-version <pkg@ver> --dsh-version <runtime> --accept-risk`）。
-
-## 测试与升级检查
-
-`pnpm test` 依次跑各门禁行为测试与冒烟：`node scripts/test-dispatch-gate.mjs`、
-`node scripts/test-leader-guard.mjs`、`node scripts/test-scout-relay.mjs`、
-`node scripts/test-tool-surface.mjs`（工具面逐会话冻结：同会话两次构建逐字节相同、文案变更只对新会话
-生效、subagent 参数说明在所有注册路径同一形态、返回值与 `output.schema` 一致），再跑 `pnpm smoke`。
-mock 测试证明不了真实宿主装载门禁，所以升级 dsh 后跑 `pnpm smoke` 检查版本声明、源码语法与
-插件入口；设置 `DSH_BIN` 与 `DSH_SMOKE_PROFILE` 后会再执行官方 `--dump-config` 组合检查，
-确认派遣门禁、配置入口和子代理 preset 均已装配。
-
-## 依赖与升级边界
-
-- 插件本体只 import `node:fs` / `node:os` / `node:path` / `node:url`，零 npm 第三方依赖；
-  manon 组件的 Python 依赖冻结在 `manon/requirements.txt`。
-- 依赖的 cordis 表面：`ctx.tools.guard`、`ctx.on("tools/result")`、`ctx.on("agent/created")`、
-  `ctx.on("subagent/end")`、`ctx.on("agent/error")`、`ctx.on("tools/pre-execute")`、
-  `ctx.tools.restrict({allow/deny})`、`ctx.tools.schemas/get/register`、`ctx.systemPrompt.section`、
-  `ctx.inject`、`ctx.logger.warn`。上游改这些签名时本包需要适配。
-- manon 组件与上游 manon 仓库同源；上游改动后整组重测 sync/query/deep-query 再更新本包。
-
-## 卸载
-
-```bash
-dsh plugin --profile <你的profile> remove dsh-plugin-verispring
-```
-
-桌面版在插件页取消选择并删除。卸载即回到无门禁状态（会话内已注入的系统提示条款随新会话消失）。
+`npm test` 依次跑各门禁行为测试与冒烟（`npm run smoke`）。mock 测试证明不了真实宿主装载门禁，
+所以升级 dsh 后单独跑一次 `npm run smoke`：检查版本声明、源码语法与插件入口；设置了 `DSH_BIN` 与
+`DSH_SMOKE_PROFILE` 时会追加官方 `--dump-config` 组合检查。
 
 ## License
 
