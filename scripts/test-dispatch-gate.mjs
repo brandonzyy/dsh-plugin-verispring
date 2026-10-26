@@ -8,13 +8,28 @@
 // 执行子代理并发上限、回执保留 started subagent 前缀并附路由。
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import plugin from "../gates/dispatch-gate.js";
 
 const MAP_TEXT = "## 入口表\n- gates/dispatch-gate.js: 派遣门禁\n- scripts/smoke-test.mjs: 冒烟\n";
 const SPEC_TEXT = "# 子代理派遣规范\n";
+// 全局工作规范夹具：代表 ~/.claude/CLAUDE.md 的完整正文与硬禁令。门禁唯一源由 apply 参数
+// 指向本夹具，测试绝不读写用户真实 CLAUDE.md。
+const GLOBAL_SPEC_LINES = [
+  "# 全局工作规范",
+  "**这份文件每个会话都载入，只放不知道就会做错的东西：不变量、入口命令、硬禁令。**",
+  "## 硬禁令（不知道就会做错的十二条）",
+  "1. **提交一律 `git commit -F msg -- <显式路径>`。** 裸 commit 会带走别的会话暂存的东西。",
+  "2. **未公开项目对外不点名、也不描述产品具体情况。**",
+  "3. **取配置与凭据文件只点名取值。** 禁 `cat` / `head` / `grep -v`。",
+  "## 入口",
+  "- 代码写作：`~/.claude/specs/代码写作规范.md`（完整判据按路径按需读取）。",
+];
+const GLOBAL_SPEC_TEXT = GLOBAL_SPEC_LINES.join("\n");
+const GLOBAL_SPEC_SECTION = "caseos:global-work-spec";
+const GLOBAL_SPEC_RULE = "spec-source-missing";
 const GIT_CONFIG = ["-c", "user.email=gate@test", "-c", "user.name=gate", "-c", "core.hooksPath=/dev/null"];
 let harnessSeq = 0;
 
@@ -43,6 +58,9 @@ function makeHarness(options = {}) {
   harnessSeq += 1;
   const home = mkdtempSync(join(tmpdir(), "verispring-gate-home-"));
   const cwd = mkdtempSync(join(tmpdir(), "verispring-gate-cwd-"));
+  // 全局工作规范源的测试替身：apply 的仅内部参数指向它，生产默认值仍是唯一真实源。
+  const specFile = join(home, "global-work-spec.md");
+  writeFileSync(specFile, options.specText ?? GLOBAL_SPEC_TEXT);
   if (options.git) {
     git(cwd, ["init", "-q", "."]);
     for (let i = 0; i < (options.commits ?? 1); i += 1) commitFile(cwd, `file-${i}.md`);
@@ -91,7 +109,16 @@ function makeHarness(options = {}) {
     rename: (target, title) => calls.rename.push([target, title]),
   };
   const sessionController = { agents: { selectForNextRequest: (...args) => calls.select.push(args) } };
-  const services = { agents, sessionTitle, sessionController, sessionProjections: { stateOf: () => void 0 } };
+  // root 动态系统段：section 只记录定义，text 由测试在需要的时刻求值（模拟每次 assemble）。
+  const promptSections = [];
+  const systemPrompt = {
+    getSectionOrder: (name) => ({ TOOL_SUBAGENT: 2800, TOOL_REPORT: 2900 }[name] ?? 0),
+    section: (definition) => {
+      promptSections.push(definition);
+      return () => {};
+    },
+  };
+  const services = { agents, sessionTitle, sessionController, sessionProjections: { stateOf: () => void 0 }, systemPrompt };
 
   const spawned = async (spec, index) => {
     if (options.startActivation) return options.startActivation(spec, index, home);
@@ -171,7 +198,7 @@ function makeHarness(options = {}) {
     },
   };
 
-  plugin.apply(ctx);
+  plugin.apply(ctx, { specFile });
 
   // 领导作用域（agent.ctx）：注入链来自 agent-loop（没有 subagents / sessionController），
   // 属性直取 subagents 会抛 without inject；get() 照常可读——线上故障 1 就在这一层。
@@ -197,11 +224,20 @@ function makeHarness(options = {}) {
   const stateDir = `${home}/caseos/session-state`;
   const baselineFile = `${home}/caseos/map-baselines.json`;
   const head = () => git(cwd, ["rev-parse", "HEAD"]);
+  const runGuards = (name, args, agent) => {
+    const exec = { name, agent, arguments: args };
+    for (const callback of guards) {
+      const reason = callback(exec);
+      if (typeof reason === "string") return reason;
+    }
+    return void 0;
+  };
 
   return {
     leader,
     cwd,
     home,
+    specFile,
     scopedTools,
     scopedRestricted,
     calls,
@@ -210,14 +246,17 @@ function makeHarness(options = {}) {
       for (const callback of listeners.get(name) ?? []) callback(payload);
     },
     /** 走所有 guard 回调，返回第一条拒绝文案 */
-    guard: (args, agent = leader) => {
-      const exec = { name: "subagent", agent, arguments: args };
-      for (const callback of guards) {
-        const reason = callback(exec);
-        if (typeof reason === "string") return reason;
-      }
-      return void 0;
+    guard: (args, agent = leader) => runGuards("subagent", args, agent),
+    /** 任意工具走全部 guard 回调（既有子代理的工具调用面） */
+    guardTool: (name, args, agent = leader) => runGuards(name, args, agent),
+    /** 求值 root 动态规范段（每次调用即一次 assemble） */
+    sectionText: (scope = leader.ctx) => {
+      const section = promptSections.find((candidate) => candidate.name === GLOBAL_SPEC_SECTION);
+      return typeof section?.text === "function" ? section.text({ scope }) : section?.text;
     },
+    sections: promptSections,
+    writeSpec: (text) => writeFileSync(specFile, text),
+    removeSpec: () => rmSync(specFile, { force: true }),
     /** 领导的工具结果（tools/result 广播）：地图基准登记走这条 */
     toolResult: (name, args, agent = leader) => {
       const exec = { name, agent, arguments: args };
@@ -965,6 +1004,158 @@ test("派遣回执保留 started subagent 前缀并附路由与角色，测绘�
   assert.ok(executorText.startsWith(`started subagent ${executor.subagentId}`));
   assert.match(executorText, /（路由：verispring\/deepseek-flash@high · 角色：executor）/);
   assert.doesNotMatch(executorText, /已接替不可达测绘/);
+});
+
+// ---- 全局工作规范供给：唯一源 + root 动态段 + fail closed ----
+
+test("root 动态规范段：三角色拿到完整正文，连续两次求值反映源文件更新（续接不冻结）", () => {
+  const harness = makeHarness();
+  const section = harness.sections.find((candidate) => candidate.name === GLOBAL_SPEC_SECTION);
+  assert.ok(section, "root 作用域必须注册全局规范段");
+  assert.equal(section.order, 2800, "与 TOOL_SUBAGENT 同序");
+  assert.equal(section.interpolate, false, "规范里的 {{...}} 模板必须逐字注入，禁止宿主变量展开");
+
+  const scopes = {
+    leader: harness.leader.ctx,
+    scout: { session: { header: { id: "child-scout", origin: "subagent", parentSession: harness.leader.id } } },
+    executor: { session: { header: { id: "child-exec", origin: "subagent", parentSession: harness.leader.id } } },
+  };
+  for (const [role, scope] of Object.entries(scopes)) {
+    const text = harness.sectionText(scope);
+    assert.ok(text.includes(GLOBAL_SPEC_TEXT), `${role} 必须拿到完整正文，不能只给首行或摘要`);
+    for (const line of GLOBAL_SPEC_LINES) assert.ok(text.includes(line), `${role} 缺正文行：${line}`);
+    assert.match(text, /子代理任务书不能豁免、覆盖或替代本段/);
+    assert.match(text, /任务涉及某份规范时，先按正文路径完整读取对应规范再执行/);
+    assert.match(text, /不得用全局段摘要替代该规范/);
+  }
+
+  // 同尺寸、同一路径的连续更新：读的必须是文件当前内容，不缓存正文、mtime 或大小。
+  const v1 = "# 全局工作规范\n硬禁令：提交一律 git commit -F msg -- <显式路径>。".padEnd(120, " ");
+  const v2 = "# 全局工作规范\n硬禁令：取凭据只点名取值，禁 cat 全文。".padEnd(120, " ");
+  assert.equal(v1.length, v2.length, "两次更新必须同尺寸，才能证明不靠 mtime/大小判新旧");
+  harness.writeSpec(v1);
+  const first = harness.sectionText(scopes.executor);
+  assert.ok(first.includes("提交一律"));
+  assert.ok(!first.includes("取凭据只点名取值"));
+  harness.writeSpec(v2);
+  const second = harness.sectionText(scopes.executor);
+  assert.ok(second.includes("取凭据只点名取值"));
+  assert.ok(!second.includes("提交一律"), "第二次求值不得返回上一次的旧正文");
+});
+
+test("子代理任务书之外仍由系统段供给：scout 与 executor 都不漏完整规范", async () => {
+  const harness = makeHarness();
+  const scout = await harness.dispatch({ description: "scout: 建图", prompt: "建图" });
+  const executor = await harness.dispatch({ description: "改代码", prompt: "把 a 改成 b" });
+
+  for (const [role, id] of [["scout", scout.subagentId], ["executor", executor.subagentId]]) {
+    const child = harness.agent(id);
+    assert.ok(child?.session, `${role} 子代理会话必须已登记`);
+    const text = harness.sectionText(child);
+    assert.ok(text.includes(GLOBAL_SPEC_TEXT), `${role} 的系统段必须是完整正文`);
+    assert.match(text, /此段对 leader \/ scout \/ executor 一律生效/);
+  }
+
+  const executorBrief = harness.calls.activation[1].request.prompt[0].text;
+  assert.ok(executorBrief.startsWith("【实际路由：executor"));
+  assert.ok(!executorBrief.includes(GLOBAL_SPEC_LINES[3]), "任务书不得成为规范正文的第二份来源");
+});
+
+test("规范源缺失或空白时新派遣被拒：spec-source-missing 落监控，段不退回空串", () => {
+  const harness = makeHarness();
+  harness.primeScout("scout-A"); // 排除其它门禁，拒绝只可能来自规范源
+  assert.equal(harness.guard({ description: "改代码", prompt: "把 a 改成 b" }), void 0, "源正常时派遣应放行");
+
+  harness.removeSpec();
+  const missing = harness.guard({ description: "改代码", prompt: "把 a 改成 b" });
+  assert.match(missing, /全局工作规范源缺失/);
+  assert.match(missing, /fail closed/);
+  assert.match(missing, /恢复为可读且非空白/);
+  assert.match(missing, /不退回空规范/);
+
+  const denied = harness.monitor().filter((entry) => entry.rule === GLOBAL_SPEC_RULE);
+  assert.equal(denied.length, 1);
+  assert.equal(denied[0].kind, "dispatch-deny");
+  assert.equal(denied[0].tool, "subagent");
+  assert.match(denied[0].reason, /global-work-spec\.md/);
+  assert.match(denied[0].reason, /缺失/);
+
+  const notice = harness.sectionText();
+  assert.ok(notice.trim().length > 0, "源缺失时段不得静默变空");
+  assert.match(notice, /fail closed/);
+  assert.ok(!notice.includes(GLOBAL_SPEC_TEXT), "不得把旧正文当作仍有效规范继续供给");
+
+  harness.writeSpec("  \n\t\n");
+  assert.match(
+    harness.guard({ description: "改代码", prompt: "把 a 改成 b" }),
+    /全局工作规范源空白/,
+  );
+});
+
+test("既有子代理的工具调用在源失效时被拒，领导普通工具不被误拒", () => {
+  const harness = makeHarness();
+  const executor = harness.seedAgent({ id: "child-exec", role: "executor" });
+  const scout = harness.seedAgent({ id: "child-scout", role: "scout" });
+  assert.equal(harness.guardTool("read", { path: "/tmp/a" }, executor), void 0, "源正常时子代理工具放行");
+
+  harness.removeSpec();
+  for (const agent of [executor, scout]) {
+    const reason = harness.guardTool("read", { path: "/tmp/a" }, agent);
+    assert.match(reason, /全局工作规范源缺失/);
+    assert.match(reason, /已拒绝本次调用（read）/);
+  }
+  const denied = harness.monitor().filter((entry) => entry.rule === GLOBAL_SPEC_RULE);
+  assert.equal(denied.length, 2, "每只既有子代理的调用各记一条");
+  assert.deepEqual(denied.map((entry) => entry.session).sort(), ["child-exec", "child-scout"]);
+  assert.ok(denied.every((entry) => entry.kind === "dispatch-deny" && entry.tool === "read"));
+
+  // 领导普通工具不属于强制面：不拒、不落 dispatch-deny。
+  assert.equal(harness.guardTool("read", { path: "/tmp/a" }, harness.leader), void 0);
+  assert.equal(harness.guardTool("write", { file_path: "/tmp/a" }, harness.leader), void 0);
+  assert.equal(harness.monitor().filter((entry) => entry.rule === GLOBAL_SPEC_RULE).length, 2);
+});
+
+test("只有 parentSession 的续接/旧子代理同样纳入 fail closed，领导普通工具不误伤", () => {
+  const harness = makeHarness();
+  // 冷恢复/旧会话可能只有父会话血缘、没有 origin：身份口径与 scout-relay 一致。
+  const legacy = {
+    id: "child-legacy",
+    session: { header: { id: "child-legacy", parentSession: harness.leader.id } },
+  };
+  assert.equal(harness.guardTool("read", { path: "/tmp/a" }, legacy), void 0, "源正常时旧子代理放行");
+
+  harness.removeSpec();
+  const reason = harness.guardTool("read", { path: "/tmp/a" }, legacy);
+  assert.match(reason, /全局工作规范源缺失/);
+  assert.match(reason, /已拒绝本次调用（read）/);
+  const denied = harness.monitor().filter((entry) => entry.rule === GLOBAL_SPEC_RULE);
+  assert.equal(denied.length, 1);
+  assert.equal(denied[0].kind, "dispatch-deny");
+  assert.equal(denied[0].session, "child-legacy");
+  assert.equal(denied[0].tool, "read");
+
+  // 领导会话没有 parentSession：普通工具仍不属于强制面。
+  assert.equal(harness.guardTool("read", { path: "/tmp/a" }, harness.leader), void 0);
+  assert.equal(harness.guardTool("write", { file_path: "/tmp/a" }, harness.leader), void 0);
+  assert.equal(harness.monitor().filter((entry) => entry.rule === GLOBAL_SPEC_RULE).length, 1);
+});
+
+test("恢复有效源后动态段与允许路径立即恢复，无缓存旧正文", () => {
+  const harness = makeHarness();
+  harness.primeScout("scout-A");
+  const child = harness.seedAgent({ id: "child-exec", role: "executor" });
+  harness.removeSpec();
+  assert.ok(harness.guard({ description: "改代码", prompt: "把 a 改成 b" }));
+  assert.ok(harness.guardTool("read", {}, child));
+  assert.match(harness.sectionText(), /当前缺失/);
+
+  harness.writeSpec(`${GLOBAL_SPEC_TEXT}\n- 恢复后的新行：RESUMED-MARKER。`);
+  assert.equal(harness.guard({ description: "改代码", prompt: "把 a 改成 b" }), void 0);
+  assert.equal(harness.guardTool("read", {}, child), void 0);
+  const text = harness.sectionText();
+  assert.ok(text.includes("RESUMED-MARKER"), "恢复后必须读到新正文，不得命中旧缓存");
+  assert.ok(text.includes(GLOBAL_SPEC_TEXT));
+  assert.ok(!text.includes("当前缺失"));
 });
 
 let failed = 0;

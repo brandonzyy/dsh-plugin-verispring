@@ -15,8 +15,9 @@
 // - 快照损坏/缺失按当前定义重建并写回（升级后第一次恢复即按当时的实现重建一次）。
 // 唯一按「当前实现」出的工具定义是执行体本身（execute/output）；模型可见字段只来自快照。
 //
-// 已知例外（保持现行为，见 README）：caseos:scout-relay 段随「可达测绘 id」变化，那是会话
-// 状态事实，冻结会把执行者指向已换掉的旧测绘，因此不纳入快照。
+// 已知例外（保持现行为，见 README）：caseos:scout-relay 段随「可达测绘 id」变化，冻结会把
+// 执行者指向已换掉的旧测绘；caseos:global-work-spec 段现读唯一规范源，冻结会让续接/旧会话
+// 遵守过期规范。两者都不纳入快照。
 
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 

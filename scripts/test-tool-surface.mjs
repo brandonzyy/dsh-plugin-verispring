@@ -90,6 +90,9 @@ function createHost(options = {}) {
   const sessionId = options.sessionId ?? "session-surface-1";
   const cwd = options.cwd ?? home;
   mkdirSync(`${home}/caseos/session-state`, { recursive: true });
+  // 全局工作规范段读的是唯一源：测试用夹具文件隔离，不读取/改写用户真实 CLAUDE.md。
+  const specFile = `${home}/global-work-spec.md`;
+  writeFileSync(specFile, "# 全局工作规范（测试夹具）\n硬禁令：提交一律 `git commit -F msg -- <显式路径>`。\n");
   // 插件读 MANON_KG_BIN 判断图谱是否可用；给一个真实存在的文件让 manon 段真正注入。
   const kgPath = `${home}/manon-kg`;
   writeFileSync(kgPath, "#!/bin/sh\n");
@@ -228,7 +231,7 @@ function createHost(options = {}) {
   };
   const agent = makeAgent(sessionId);
 
-  for (const plugin of PLUGINS) plugin.apply(ctx);
+  for (const plugin of PLUGINS) plugin.apply(ctx, plugin === dispatchGate ? { specFile } : void 0);
 
   const emit = async (name, payload) => {
     for (const callback of listeners.get(name) ?? []) await callback(payload);
@@ -373,7 +376,20 @@ test("旧会话快照里没有的工具不暴露，快照有而当前没有的�
   assert.equal(visible.has("ask_scout"), false, "快照有而当前没有的工具不得出现");
   assert.match(stderr, /快照里有 ask_scout，当前实现没有该工具，跳过注册/);
   assert.match(stderr, /新工具只对新会话生效/);
-  assert.deepEqual(host.sectionTexts(), [], "旧会话快照里没有的系统段不得注入");
+  // 快照只冻结 registerSurfaceSection 的会话段；全局规范段是 root 动态段（每次装配现读），
+  // 旧会话/续接必须继续拿到，不属于快照冻结面。
+  const textOf = (section) => (typeof section.text === "function" ? section.text({ scope: host.agent }) : section.text);
+  assert.deepEqual(
+    host.sections
+      .filter((section) => section.name !== "caseos:global-work-spec")
+      .map(textOf)
+      .filter((text) => text !== ""),
+    [],
+    "旧会话快照里没有的系统段不得注入",
+  );
+  const globalSection = host.sections.find((section) => section.name === "caseos:global-work-spec");
+  assert.ok(globalSection, "root 动态规范段必须注册");
+  assert.ok(textOf(globalSection).includes("硬禁令：提交一律"), "root 动态规范段不得被旧会话快照冻结");
 });
 
 // ---------------------------------------------------------------------------

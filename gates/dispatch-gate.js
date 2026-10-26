@@ -1,4 +1,4 @@
-// Verispring 派遣门禁（七条代码级强制 + 监控）：
+// Verispring 派遣门禁（八条代码级强制 + 监控）：
 // 1 规范门：subagent / subagent_fork 调用前，本会话必须出现过《子代理派遣规范》首行标记
 //   （read/bash 结果内容判定，增量扫描会话事件；会话日志是唯一事实源，跨进程重启不丢）。
 // 2 测绘身份（由派遣意图判定）：description 以「测绘智能体」或「scout」开头 = 测绘派遣，
@@ -38,6 +38,11 @@
 //   本节的拒绝都记 kind=dispatch-deny 并带规则名，与既有 gate-deny 分开，便于审计哪条规则在
 //   拦。派遣回执保留 "started subagent <id>" 前缀原样（宿主与 client.js 的解析契约），追加
 //   路由、角色与测绘接替事实。
+// 8 全局工作规范供给：~/.claude/CLAUDE.md 是唯一正文源，root 作用域动态 systemPrompt 段
+//   （caseos:global-work-spec）每次装配现读全文，供给 leader / scout / executor（send_message
+//   续接与冷恢复同样走 root 段）。源缺失/空白/读取失败即 fail closed：新 subagent 派遣与既有
+//   子代理的全部工具调用按 spec-source-missing 拒绝并落监控；领导普通工具不受影响。不复制
+//   正文、无备选源、不缓存（同尺寸同时间戳的更新下一轮立即生效）。
 // 规范目录按主目录解析（~/.dsh/specs/），搬家无需改码。
 const MARKER = "# 子代理派遣规范";
 const SPEC_FRAGMENT = "specs/子代理派遣规范.md";
@@ -84,6 +89,54 @@ import { resolve } from "node:path";
 import { SLIM_DESC } from "./leader-scope.js";
 import { monitorEvent } from "./monitor-log.js";
 import { installSessionSurface, registerSurfaceTool } from "./tool-surface.js";
+
+// 全局工作规范的唯一正文源：生产只读这一份，不复制正文、无备选源、无旧值回退。
+const GLOBAL_SPEC_FILE = `${homedir()}/.claude/CLAUDE.md`;
+// root 作用域动态段的 id：所有角色、所有会话（含续接与冷恢复）都从它取正文。
+const GLOBAL_SPEC_SECTION = "caseos:global-work-spec";
+// 源不可用时的拒绝规则名（fail closed）：新派遣与既有子代理的工具调用共用。
+const GLOBAL_SPEC_RULE = "spec-source-missing";
+
+// 规范源的唯一读取点：动态段与两道门禁都调用它。绝不缓存——每次装配、每次工具调用现读，
+// 同尺寸同时间戳的更新下一轮立即生效。返回明确状态，调用方一律 fail closed，不拿空串顶替。
+function readGlobalSpec(specFile) {
+  try {
+    const text = readFileSync(specFile, "utf8");
+    return text.trim() ? { ok: true, text } : { ok: false, state: "空白", detail: "文件只有空白字符" };
+  } catch (error) {
+    return {
+      ok: false,
+      state: error?.code === "ENOENT" ? "缺失" : "读取失败",
+      detail: String(error?.message ?? error),
+    };
+  }
+}
+
+// 段文本 = 强制约束头 + 完整正文。源不可用时明示 fail closed 与拒绝面，绝不静默给空规范。
+function globalSpecSectionText(specFile) {
+  const source = readGlobalSpec(specFile);
+  const header = [
+    "【全局工作规范 · DSH 强制供给】",
+    `唯一正文源：${specFile}（壳每次装配现读，不缓存、不复制、无备选源）。`,
+    "此段对 leader / scout / executor 一律生效；子代理任务书不能豁免、覆盖或替代本段。",
+    "任务涉及某份规范时，先按正文路径完整读取对应规范再执行，不得用全局段摘要替代该规范。",
+  ];
+  if (!source.ok) {
+    return [
+      ...header,
+      `当前${source.state}，${GLOBAL_SPEC_RULE} 生效（fail closed）：不供给空规范；`
+        + "新 subagent 派遣与既有子代理的全部工具调用都会被拒绝，直到该文件恢复可读且非空白。",
+      ...(source.detail ? [source.detail] : []),
+    ].join("\n");
+  }
+  return [...header, "", source.text].join("\n");
+}
+
+function globalSpecDenyReason(specFile, source, tool) {
+  const detail = source.detail ? `：${source.detail}` : "";
+  return `全局工作规范源${source.state}（${specFile}${detail}）：规范供给 fail closed，已拒绝本次调用（${tool}）。`
+    + "把该文件恢复为可读且非空白后重试；不退回空规范，也不存在备选源。";
+}
 
 function loadRoutes(configFile) {
   try {
@@ -634,15 +687,27 @@ const plugin = {
   // subagents 故意不在这里：它是每笔派遣现注入的服务（见 withInjected），声明成插件依赖会让
   // 整个门禁在缺少该服务的宿主上永不激活。sessionController 同理——它只用于写子代理模型
   // 选择，缺了照常派遣（applyChildRoute 已容错），不该拖住派遣门禁本身。
-  inject: ["tools", "agents", "sessionTitle", "profileContext"],
-  apply(ctx) {
+  inject: ["tools", "agents", "sessionTitle", "profileContext", "systemPrompt"],
+  apply(ctx, options) {
     const dshHome = ctx.profileContext?.home ?? process.env.DSH_HOME ?? `${homedir()}/.dsh`;
+    // 测试隔离：仅内部 apply 参数可指向测试源文件；生产唯一来源是 GLOBAL_SPEC_FILE。
+    const specFile = options?.specFile ?? GLOBAL_SPEC_FILE;
     const configFile = `${dshHome}/verispring.json`;
     const stateDir = `${dshHome}/caseos/session-state`;
     const specPath = `${dshHome}/specs/子代理派遣规范.md`;
     const denyReason =
       `派遣前必读 ${specPath}：先用 read 工具读取该规范（含任务书模板与派发前自查），然后重新发起本次调用。`;
     let routes = loadRoutes(configFile);
+    // 全局工作规范的唯一供给面：root 作用域段 = 每个会话的每一轮都拿到（leader / scout /
+    // executor，含 send_message 续接与冷恢复）。text 是函数，每次 assemble 现读文件——不注册
+    // 进 tool-surface 的冻结快照，也不缓存正文，避免旧快照/旧 mtime 冻结规范。
+    ctx.systemPrompt.section({
+      name: GLOBAL_SPEC_SECTION,
+      order: ctx.systemPrompt.getSectionOrder("TOOL_SUBAGENT"),
+      // 正文含 Docker 等工具的 {{...}} 模板，必须逐字注入，不能交给宿主做变量展开。
+      interpolate: false,
+      text: () => globalSpecSectionText(specFile),
+    });
     // 子代理生命周期落监控：不再需要解压会话日志就能审计"谁、什么角色、什么路由、怎么结束的"。
     // end 也入账可达性：completed 只是应询结束（send_message 冷恢复），其余 stopReason 才算失联。
     ctx.root.on("subagent/end", (info) => {
@@ -1045,7 +1110,12 @@ const plugin = {
     });
 
     ctx.tools.guard((exec) => {
-      if (!GATE_TOOLS.has(exec.name)) return undefined;
+      const session = exec.agent?.session;
+      // 既有子代理身份与仓库既有口径一致（scout-relay）：origin=subagent，或只有父会话血缘
+      // parentSession 的续接/旧会话（header 里可能没有 origin）；不看 description 文本。
+      // 领导普通工具在下面的早退里，不受规范源影响。
+      const subagent = session?.header?.origin === "subagent" || session?.header?.parentSession !== void 0;
+      if (!GATE_TOOLS.has(exec.name) && !subagent) return undefined;
       const deny = (reason, rule) => {
         monitorEvent(dshHome, {
           kind: rule ? "dispatch-deny" : "gate-deny",
@@ -1057,12 +1127,16 @@ const plugin = {
         });
         return reason;
       };
+      // 全局工作规范 fail closed：新派遣与既有子代理的每次工具调用先验源；读取点与动态段
+      // 是同一函数（无缓存）。源失效时领导普通工具已在上方早退，不会被误伤。
+      const spec = readGlobalSpec(specFile);
+      if (!spec.ok) return deny(globalSpecDenyReason(specFile, spec, exec.name), GLOBAL_SPEC_RULE);
+      if (!GATE_TOOLS.has(exec.name)) return undefined;
       if (exec.name === "subagent_fork") {
         return deny("本插件统一使用 subagent spawn 入口；subagent_fork 不属于三智能体架构。");
       }
       const description = exec.arguments?.description;
       const prompt = exec.arguments?.prompt;
-      const session = exec.agent?.session;
       const state = sessionState(session);
       if (!state.specRead) return deny(denyReason);
       const sessionId = sessionIdOf(session);

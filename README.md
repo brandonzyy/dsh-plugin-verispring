@@ -21,6 +21,18 @@ so the main session is never polluted by raw exploration. The manon graph is sco
 and executors never invoke it directly; they ask the scout. Running executors per leader session are
 capped (default 8), so a dispatch fan-out cannot turn into a crowd.
 
+### Global work-spec supply
+
+The global work spec has a single production source: `~/.claude/CLAUDE.md`. The plugin supplies it
+through the root-scope dynamic system section `caseos:global-work-spec`, reading the full text at
+every prompt assembly for leader, scout and executor sessions alike — including `send_message`
+continuations and cold recovery; a subagent brief cannot opt out. When a task touches the specialized
+specs the source references, those specs are read in full at the paths the source gives.
+
+If the source is missing, blank, or unreadable, new subagent dispatches and every tool call from an
+existing subagent are refused with `spec-source-missing` and written to the monitor; the leader's
+ordinary tools are unaffected. Once the source is restored the next round proceeds — nothing is cached.
+
 ### Model division that saves money
 
 The main session runs the premium model (Claude Opus 5.5 by default); scouts and executors default
@@ -30,8 +42,9 @@ the plugin panel; the main session uses DSH's native model picker.
 
 ### Cache cost defense
 
-Tool definitions and system sections are frozen per session, so new copy shipped in a release never
-rewrites the prompt prefix of a session already running. Compaction is per role: the main session at
+Tool definitions and regular system sections are frozen per session, so new copy shipped in a release
+never rewrites the prompt prefix of a session already running; the global spec section is an
+intentional dynamic exception and is re-read every round. Compaction is per role: the main session at
 40% of its window, subagents at 60%. A main session that has been idle for 55 minutes with more than
 50K tokens is compacted once — flattening the large cache write that follows an expired cache TTL.
 The accepted cost: oversized tool results stay in context until a compaction summarises them.
@@ -53,11 +66,12 @@ whole-environment dumps are refused. Key values never reach a session log.
 Role drift, gate denials, dispatches, releases and memory events all land in
 `~/.dsh/verispring-monitor.jsonl`, so audits no longer require decompressing session logs.
 
-### Kill switches
+### Operational switches
 
-The gates are controlled by environment variables (`CASEOS_*`), so any of them can be turned off —
-one at a time or all together — without uninstalling anything: e.g. `CASEOS_MEM_GUARD=0` disables the
-memory guard and its watchdog, `CASEOS_SCOUT=0` drops the scout part of the division clause.
+Capabilities including the memory guard and scout division have `CASEOS_*` switches, so they can be
+disabled individually without uninstalling: e.g. `CASEOS_MEM_GUARD=0` disables the memory guard and
+its watchdog, and `CASEOS_SCOUT=0` drops the scout part of the division clause. Global work-spec
+supply and its fail-closed gate have no such bypass.
 
 ## Install
 
@@ -75,8 +89,10 @@ and reinstall the same spec.
 
 **Prerequisites** — the profile needs the agent preset registry and a `preset-standard` entry
 (desktop and web bundles ship them); `~/.dsh/specs/子代理派遣规范.md` and
-`~/.dsh/specs/代码写作规范.md` must exist (the gates keep denying with directions otherwise); the
-`verispring` channel must serve the leader model and a `deepseek-flash` entry that declares
+`~/.dsh/specs/代码写作规范.md` must exist (the gates keep denying with directions otherwise);
+`~/.claude/CLAUDE.md` must exist, be readable and non-blank (subagent dispatches and subagent tool
+calls are refused otherwise); the `verispring` channel must serve the leader model and a
+`deepseek-flash` entry that declares
 `reasoningEfforts` and `compat.forceAdaptiveThinking`. manon is bundled and optional: it bootstraps a
 Python venv on first run (one-time network, python3 ≥3.11), with keys in `~/.dsh/manon.env` and
 `~/.dsh/verispring.env`.
