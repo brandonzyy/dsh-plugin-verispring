@@ -9,8 +9,8 @@
 #   2) insert 代码级门禁插件（gates/ 目录，含 host 内存看门狗与空闲会话卸载器）。
 # 代码级兜底在 dispatch-gate：即便调用显式指定其它 provider/model 也会被忽略，路由按
 # 角色从面板配置（verispring.json）强制注入。两个 preset 的 tool-subagent 都关闭
-# modelSelectionSettings：开启时 subagent 工具注册进每个 agent 自己的层，dispatch-gate 的
-# 路由包装无法同层遮蔽，领导面 restrict 也点不到它。
+# modelSelection（DSH 0.2.2 起由 modelSelectionSettings 改名）：开启时 subagent 工具注册进
+# 每个 agent 自己的层，dispatch-gate 的路由包装无法同层遮蔽，领导面 restrict 也点不到它。
 # 逃生开关：CASEOS_SCOUT=0 关闭领导分工条款；CASEOS_MEM_GUARD=0 关闭内存看门狗；
 # 各门禁拒绝信息均含可满足的解锁步骤。
 # 换网关：在配置面板分别选择测绘智能体与执行智能体的渠道、模型、思考强度。
@@ -211,7 +211,7 @@
             config:
               provider: spawn
               toolName: subagent-base
-              modelSelectionSettings: false
+              modelSelection: false
               backgroundMode: continuable
               maxDepth: 1
               agentPreset: verispring-subagent
@@ -402,7 +402,7 @@
                 config:
                   provider: spawn
                   toolName: subagent-base
-                  modelSelectionSettings: false
+                  modelSelection: false
                   backgroundMode: continuable
                   maxDepth: 1
               - id: tool-subagent-codex

@@ -5,7 +5,7 @@ import { spawnSync } from "node:child_process";
 
 const root = resolve(new URL("..", import.meta.url).pathname);
 const packageData = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
-const expectedEngine = ">=0.2.0-rc.2 <0.2.2-0";
+const expectedEngine = ">=0.2.0-rc.2 <0.2.3-0";
 const patchText = readFileSync(join(root, "cordis.patch.yml"), "utf8");
 const configText = readFileSync(join(root, "gates/verispring-config.js"), "utf8");
 const clientText = readFileSync(join(root, "client.js"), "utf8");
