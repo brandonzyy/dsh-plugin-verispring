@@ -204,8 +204,6 @@
         config:
           - id: tool-subagent-control
             name: '@deepseek-ai/dsh-tool-subagent-control'
-          - id: tool-subagent-list-agents
-            name: '@deepseek-ai/dsh-tool-subagent-control/list-agents'
           - id: tool-subagent
             name: '@deepseek-ai/dsh-tool-subagent'
             config:
@@ -393,11 +391,9 @@
             isolate:
               workflowEngine: true
             config:
-              - id: tool-subagent-control
+              - id: vs-tool-subagent-control
                 name: '@deepseek-ai/dsh-tool-subagent-control'
-              - id: tool-subagent-list-agents
-                name: '@deepseek-ai/dsh-tool-subagent-control/list-agents'
-              - id: tool-subagent
+              - id: vs-tool-subagent
                 name: '@deepseek-ai/dsh-tool-subagent'
                 config:
                   provider: spawn
@@ -405,7 +401,7 @@
                   modelSelection: false
                   backgroundMode: continuable
                   maxDepth: 1
-              - id: tool-subagent-codex
+              - id: vs-tool-subagent-codex
                 name: '@deepseek-ai/dsh-tool-subagent'
                 disabled: true
                 config:
@@ -413,7 +409,7 @@
                   toolName: subagent_codex
                   backgroundMode: one-shot
                   maxDepth: provider-managed
-              - id: tool-subagent-claude-code
+              - id: vs-tool-subagent-claude-code
                 name: '@deepseek-ai/dsh-tool-subagent'
                 disabled: true
                 config:
@@ -421,13 +417,13 @@
                   toolName: subagent_claude_code
                   backgroundMode: one-shot
                   maxDepth: provider-managed
-              - id: workflow-ptc
+              - id: vs-workflow-ptc
                 name: '@deepseek-ai/dsh-workflow-ptc'
                 config:
                   provider: spawn
-              - id: tool-workflow
+              - id: vs-tool-workflow
                 name: '@deepseek-ai/dsh-tool-workflow'
-              - id: tool-ralph
+              - id: vs-tool-ralph
                 name: '@deepseek-ai/dsh-tool-ralph'
                 disabled: true
                 config:
