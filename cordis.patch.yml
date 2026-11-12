@@ -477,6 +477,11 @@
     # 阈值在配置面板（verispring-config 的 idleCompact* 字段）调整。
     - id: caseos-idle-compact
       name: './gates/idle-compact.js'
+    # 自动更新：周期对比 GitHub main 版本，新版经 pluginManager.installBundle 重装同一条
+    # spec（= README 官方更新语义），桌面版 HMR 即时生效；无管理面的宿主不激活。
+    # CASEOS_AUTO_UPDATE=0 关闭，CASEOS_UPDATE_CHECK_MS 默认 6h。
+    - id: caseos-auto-update
+      name: './gates/auto-update.js'
     # 配置面板：Config schema 提供宿主表单服务；client 组合包页渲染并把模型位落盘到执法面
     - id: verispring-config
       name: './gates/verispring-config.js'

@@ -74,6 +74,13 @@ dsh plugin --profile <你的profile> add github:brandonzyy/dsh-plugin-verispring
 派遣拿到新树；仅当 HMR 被显式禁用（headless/SDK/ACP）时才需要重启。更新方式：卸载后重装同一条
 spec。
 
+**自动更新**（v1.6.0 起）：装好后无需再手动重装——插件每 6 小时对比 GitHub main 上的版本，
+发现新版本自动经宿主插件管理器重装同一条 spec（与上面手动更新完全同路径），桌面版 HMR 即时
+生效；更新动作落 `~/.dsh/verispring-monitor.jsonl`（auto-update-applied / auto-update-failed）。
+`CASEOS_AUTO_UPDATE=0` 关闭；`CASEOS_UPDATE_CHECK_MS` 改检查周期（下限 10 分钟）；
+`CASEOS_UPDATE_SPEC` / `CASEOS_UPDATE_BRANCH` 覆盖重装来源。headless/SDK 等没有插件管理面的
+宿主上自动更新不激活（gate 里不绕过宿主自己跑 pnpm）。
+
 **前置条件** —— profile 需含 agent preset 注册表与 `preset-standard`（桌面版 / web 组合包自带）；
 `~/.dsh/specs/子代理派遣规范.md` 与 `~/.dsh/specs/代码写作规范.md` 需存在（缺规范时门禁会持续
 拦截并指路）；`~/.claude/CLAUDE.md` 需存在、可读且非空白（否则子代理派遣与子代理工具调用被拒）；
