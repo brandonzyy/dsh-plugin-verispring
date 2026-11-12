@@ -34,11 +34,13 @@
             maxTokens: 128000
             compat:
               forceAdaptiveThinking: true
+            # 网关统一口径 low/high/max（2026-11-12 cp 实测：evolai opus-5-5 thinking_tokens
+            # low 88 / high 109 / max 652，梯度成立）。不声明 off：claude 系上游关不掉——
+            # evolai 对 disabled 静默忽略照思考计费，arklin 直接 400；声明了 off 反而
+            # 诱导用户选一个烧钱没效果的档。
             reasoningEfforts:
               low: low
-              medium: medium
               high: high
-              xhigh: xhigh
               max: max
           # 派遣路由用的 flash 必须显式声明 reasoningEfforts 与 forceAdaptiveThinking，
           # 否则 pi-ai 拒发 effort（UNSUPPORTED_REASONING_EFFORT）。

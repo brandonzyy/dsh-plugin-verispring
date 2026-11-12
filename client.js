@@ -23,11 +23,13 @@ window.__ModuleLoader__.load({
       embeddingModel: "BAAI/bge-m3",
     };
     // 目录未就绪时的兜底渠道表：面板已选中的值必须在这里，否则会显示成「值无效」。
+    // 档位与网关统一口径一致（2026-11-12 cp 实测）：deepseek-flash 四档全支持；
+    // claude 系关不掉思考（evolai 假关计费、arklin 400），只声明 low/high/max。
     const FALLBACK_GROUPS = [{
       id: "verispring",
       name: "Verispring",
       models: [
-        { id: "claude-opus-5-5", name: "Claude Opus 5.5", reasoning: { efforts: ["low", "medium", "high", "xhigh", "max"].map(id => ({ id, name: id })) } },
+        { id: "claude-opus-5-5", name: "Claude Opus 5.5", reasoning: { efforts: ["low", "high", "max"].map(id => ({ id, name: id })) } },
         { id: "deepseek-flash", name: "DeepSeek Flash", reasoning: { efforts: [{ id: "off", name: "off" }, { id: "low", name: "low" }, { id: "high", name: "high" }, { id: "max", name: "max" }] } },
       ],
     }];
