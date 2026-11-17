@@ -27,6 +27,18 @@
         # 网关 STREAMING_TIMEOUT=300s 与 pi-ai 默认看门狗同为 300s，叠一起容易误杀长流。
         # 调到 600s（网关侧同步放到 900s），让看门狗只兜真正挂死的流。
         streamIdleTimeoutMs: 600000
+        # 重试策略（2026-11-17 平台瞬时不可达事故后调大）：默认 5 次、退避封顶 10s，秒级故障
+        # 窗口内 8 秒烧完全部重试，领导与执行者同时判死、管道停摆。8 次 × 封顶 60s，
+        # 单步承灾约 4.2 分钟。mode 必须显式写；provider 级 maxRetries 会被宿主拒绝。
+        # 运行时生效层是 ~/.dsh/profiles/desktop/cordis.patch.yml（本仓版为正本，改渠道配置两处同步）。
+        retryPolicy:
+          mode: normal
+          maxRetries: 8
+          retryableCodes: [EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT]
+          backoff:
+            initialDelayMs: 2000
+            maxDelayMs: 60000
+            jitterRatio: 0.2
         models:
           - id: claude-opus-5-5
             name: Claude Opus 5.5

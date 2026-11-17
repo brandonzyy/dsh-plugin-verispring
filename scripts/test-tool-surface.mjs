@@ -317,6 +317,23 @@ test("同一会话重启后重建工具面与系统段，逐字节相同", async
 });
 
 // ---------------------------------------------------------------------------
+// 1b 领导分工段带执行者失败处置指引（失败通知不含原因 → 先续接再重派）
+// ---------------------------------------------------------------------------
+test("领导分工段含失败处置指引：先 send_message 续接，续接仍失败才重派", async () => {
+  const home = mkdtempSync(join(tmpdir(), "verispring-surface-f-"));
+  const host = createHost({ home });
+  await host.created();
+  const dispatch = host.sectionTexts().find((text) => text.includes("分工："));
+  assert.ok(dispatch, "领导分工段必须注入");
+  assert.ok(dispatch.includes("failed before it finished"), "指引必须点名失败通知原文");
+  assert.ok(dispatch.includes("先 send_message 续接该执行者一次"), "指引必须先续命");
+  assert.ok(dispatch.includes("才重派"), "指引必须限定重派条件");
+  const child = host.newAgent("child-revive", "subagent");
+  const childTexts = host.sectionTexts(child);
+  assert.equal(childTexts.some((text) => text.includes("failed before it finished")), false, "子代理面不得带领导指引");
+});
+
+// ---------------------------------------------------------------------------
 // 2 subagent 参数说明：所有注册路径同一形态
 // ---------------------------------------------------------------------------
 test("subagent 参数说明在全局入口/会话冻结/有无宿主基座四种路径下同一形态", async () => {
