@@ -40,9 +40,10 @@
             maxDelayMs: 60000
             jitterRatio: 0.2
         models:
-          # claude-sonnet-5-5 在 desktop profile 层（2026-11-17 起）：带
-          # forceAdaptiveThinking——新供应商 claude 落点（Bedrock 托管）只认
-          # adaptive/between_tools thinking 形态，enabled 必 400。正本在此记形态口径，
+          # claude 系三模型（sonnet-5-5 / opus-5-5 / sonnet-5）2026-11-17 起统一
+          # forceAdaptiveThinking：新供应商 claude 落点（Bedrock 托管）前置校验只认
+          # adaptive，enabled 必 400；sonnet-5-5 的关闭态走 between_tools（网关翻译），
+          # opus-5-5 / sonnet-5 连 between_tools 都不认故不声明 off。正本记形态口径，
           # 运行时以 ~/.dsh/profiles/desktop/cordis.patch.yml 为准。
           - id: claude-sonnet-5-5
             name: claude-sonnet-5-5
@@ -56,6 +57,17 @@
               low: low
               medium: medium
               high: high
+          - id: claude-sonnet-5
+            name: claude-sonnet-5
+            compat:
+              forceAdaptiveThinking: true
+            input:
+              - text
+              - image
+            reasoningEfforts:
+              low: low
+              high: high
+              max: max
           - id: claude-opus-5-5
             name: Claude Opus 5.5
             contextWindow: 1000000
