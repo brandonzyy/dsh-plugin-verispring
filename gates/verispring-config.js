@@ -257,11 +257,6 @@ export function apply(ctx, config) {
     const embeddingUrl = valueOf("embeddingUrl", "https://api.siliconflow.cn/v1");
     const embeddingModel = valueOf("embeddingModel", "BAAI/bge-m3");
 
-    const allDefault =
-      scoutProvider === "verispring" && scoutModel === "deepseek-flash" && scoutEffort === "high" &&
-      executorProvider === "verispring" && executorModel === "deepseek-flash" && executorEffort === "high" &&
-      deepQueryProvider === "verispring" && deepQueryModel === "deepseek-flash" && deepQueryEffort === "off" &&
-      embeddingUrl === "https://api.siliconflow.cn/v1" && embeddingModel === "BAAI/bge-m3";
     const configRows = typeof editor.configuration === "function" ? editor.configuration() : [];
     const row = configRows.find(({ entry, inherited }) =>
       entry.options.id === "tool-subagent" ||
@@ -306,8 +301,6 @@ export function apply(ctx, config) {
       model: executorModel,
       reasoningEffort: executorEffort,
     });
-
-    if (allDefault) return;
 
     const routeFile = `${dshHome}/verispring.json`;
     const routeTemp = `${routeFile}.tmp-${process.pid}`;

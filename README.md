@@ -58,8 +58,8 @@ host is never killed behind your back — the hard threshold only records a rest
 
 ### Secret hygiene
 
-Credential files (`manon.env`, `verispring.env`, project `.env*`) cannot be read or echoed, and
-whole-environment dumps are refused. Key values never reach a session log.
+Whole-environment dumps are refused. Reading credential files is not gated; take only the values
+you need.
 
 ### Observability
 

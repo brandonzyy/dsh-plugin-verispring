@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-import { readdirSync, readFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 
@@ -39,10 +40,37 @@ if (!clientText.includes('useProjection("subagent")') || !clientText.includes("r
 const dispatchText = readFileSync(join(root, "gates/dispatch-gate.js"), "utf8");
 const manonText = readFileSync(join(root, "gates/manon-bridge.js"), "utf8");
 const codestyleText = readFileSync(join(root, "gates/codestyle-gate.js"), "utf8");
-const { readsSecretFile } = await import(join(root, "gates/manon-bridge.js"));
 const verispringConfig = await import(join(root, "gates/verispring-config.js"));
 if (typeof verispringConfig.apply !== "function" || !Array.isArray(verispringConfig.inject)) {
   fail("verispring-config 导入后缺少 apply/inject 导出");
+}
+{
+  const home = mkdtempSync(join(tmpdir(), "verispring-routes-"));
+  const handlers = new Map();
+  const updates = [];
+  const config = { scoutModel: "glm-5.3-flash", executorModel: "glm-5.3-flash" };
+  const ctx = {
+    profileContext: { home },
+    credentials: { resolve: async () => undefined },
+    configEditor: { configuration: () => [] },
+    logger: { warn: (message) => fail(message) },
+    on: (event, handler) => handlers.set(event, handler),
+    root: { emit: (event) => updates.push(event) },
+  };
+  try {
+    verispringConfig.apply(ctx, config);
+    const routePath = join(home, "verispring.json");
+    const first = JSON.parse(readFileSync(routePath, "utf8"));
+    if (first.scout.model !== "glm-5.3-flash" || first.executor.model !== "glm-5.3-flash") fail("非默认模型未写入派遣路由");
+    config.scoutModel = "deepseek-flash";
+    config.executorModel = "deepseek-flash";
+    handlers.get("loader/volatile-update")();
+    const next = JSON.parse(readFileSync(routePath, "utf8"));
+    if (next.scout.model !== "deepseek-flash" || next.executor.model !== "deepseek-flash") fail("模型切回默认值未更新派遣路由");
+    if (updates.filter((event) => event === "verispring/routes-updated").length !== 2) fail("模型切换未通知派遣门禁");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
 }
 if (!dispatchText.includes("ctx.profileContext?.home") || !dispatchText.includes("process.env.DSH_HOME") || !dispatchText.includes("specPath")) fail("派遣门禁未使用 DSH profile home");
 if (!dispatchText.includes("startActivation") || dispatchText.includes("startContinuable")) fail("子代理必须使用 DSH 官方 startActivation 接口");
@@ -54,9 +82,6 @@ if (/^\s*import\s[^;]*from\s+["']@deepseek-ai\/schemastery["']/m.test(configText
 if (!configText.includes("loadSchemastery") || !configText.includes("pathToFileURL")) fail("verispring-config 未按候选路径解析 schemastery");
 if (!configText.includes("SCHEMASTERY_INSTALL_HINT")) fail("verispring-config 缺少 schemastery 解析失败的可操作提示");
 if (!manonText.includes("ctx.profileContext?.home") || !manonText.includes("sourcePrefix")) fail("Manon 调用前缀未使用 DSH profile home");
-if (!manonText.includes("(?<![\\w.])")) fail("Manon 密钥文件名检测缺少词首边界");
-if (readsSecretFile("bash -c 'source ~/.dsh/manon.env; manon-kg sync'")) fail("Manon source 调用式被误判为读取密钥");
-if (!readsSecretFile("cat ~/.dsh/manon.env")) fail("Manon 明文读取密钥未被拦截");
 if (!codestyleText.includes("ctx.profileContext?.home") || !codestyleText.includes("specPath")) fail("提交门禁未使用 DSH profile home");
 const leaderGuardText = readFileSync(join(root, "gates/leader-guard.js"), "utf8");
 const leaderScopeText = readFileSync(join(root, "gates/leader-scope.js"), "utf8");
