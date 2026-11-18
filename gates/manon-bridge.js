@@ -42,16 +42,134 @@ function segmentsOf(command) {
   return String(command ?? "").split(/(?:&&|\|\||;|\||\n)/);
 }
 
+// sed 原地纯替换豁免的判定面：命令段里只认这些 sed 选项，白名单外（-n、-f、-l 等）一律不豁免。
+const SED_BASENAME_RE = /^(?:[^/\s]*\/)*sed$/;
+const SED_IN_PLACE_RE = /^(?:-i(?:\.[\w.-]+)?|--in-place(?:=.*)?)$/;
+const SED_EXPRESSION_OPT_RE = /^(?:-e(.+)|--expression=(.+))$/;
+const SED_PLAIN_OPT_RE = /^(?:-E|-r|--regexp-extended|--separate|--posix|--null-data|--unbuffered|--binary|--follow-symlinks)$/;
+// s<分隔符>…<分隔符>…<分隔符><标志>：标志里出现 p/w/e 就会把内容打进 stdout 或写到别处。
+const SED_SUBSTITUTE_RE = /^s(\S)((?:\\.|(?!\1)[\s\S])*)\1((?:\\.|(?!\1)[\s\S])*)\1([A-Za-z0-9]*)$/;
+const SED_FILE_ENV_SHAPE_RE = /^[^\s]*\.env(?:\.[\w-]+)?$/;
+
+// sh 风格轻量分词：引号包住的空白不切分、内容去引号；引号未闭合返回 null（无法审计，不豁免）。
+function sedTokens(segment) {
+  const tokens = [];
+  let current = "";
+  let quoted = false;
+  let openQuote = null;
+  for (let i = 0; i < segment.length; i++) {
+    const ch = segment[i];
+    if (openQuote) {
+      if (ch === openQuote) openQuote = null;
+      else current += ch;
+      continue;
+    }
+    if (ch === "'" || ch === '"') { openQuote = ch; quoted = true; continue; }
+    if (ch === "\\") { current += ch; if (i + 1 < segment.length) current += segment[++i]; continue; }
+    if (/\s/.test(ch)) {
+      if (current || quoted) { tokens.push({ text: current, quoted }); current = ""; quoted = false; }
+      continue;
+    }
+    current += ch;
+  }
+  if (openQuote) return null;
+  if (current || quoted) tokens.push({ text: current, quoted });
+  return tokens;
+}
+
+// 脚本只由 s/// 替换命令构成（; 连写多条也行），标志不含 p/w/e。
+function isPureSubstituteScript(script) {
+  return script.split(";").every((statement) => {
+    const trimmed = statement.trim();
+    if (!trimmed) return true;
+    const match = SED_SUBSTITUTE_RE.exec(trimmed);
+    return Boolean(match) && !/[pwe]/.test(match[4]);
+  });
+}
+
+// sed 原地纯替换豁免：该段是一个只做 s/// 替换并写回原文件的 sed 调用时，stdout 无输出，
+// 会话日志拿不到文件内容。判定（全部满足才豁免）：
+// 1 带 -i / -i<.后缀> / --in-place[=<后缀>]；-n/--quiet/--silent 一律不豁免，-f 从文件读脚本
+//   无法审计，也不豁免；
+// 2 脚本（-e/--expression 参数，或无 -e 时的第一个操作数）只由 s<分隔符>…<分隔符>…<分隔符><标志>
+//   构成（; 连写多条也行），标志不含 p/w/e；
+// 3 裸 -i 后第一个操作数 GNU/BSD 语义二歧（GNU=脚本，BSD=后缀），两种解释都要无害：BSD 形态
+//   `-i ''`（空后缀）时第二个操作数按脚本校验；GNU 形态时第二个操作数必须是 env 文件名形状
+//   （堵住 BSD 语义里 `sed -i 's#a#b#' p x.env` 把 p 当打印脚本的漏网），其余文件名不校验。
+function isSedInPlaceSubstitution(segment) {
+  const tokens = sedTokens(segment.trim());
+  if (!tokens) return false;
+  const sedIndex = tokens.findIndex((token) => SED_BASENAME_RE.test(token.text));
+  if (sedIndex < 0) return false;
+  let inPlace = false;
+  let ambiguousSuffix = false; // 裸 -i 后等第一个操作数（GNU=脚本，BSD=后缀）
+  let scriptStage = "none";    // none → gnu|bsd|explicit
+  const candidates = [];
+  const files = [];
+  for (let i = sedIndex + 1; i < tokens.length; i++) {
+    const { text } = tokens[i];
+    if (ambiguousSuffix && !text.startsWith("-")) {
+      ambiguousSuffix = false;
+      if (text === "" && tokens[i].quoted) { scriptStage = "bsd"; continue; }
+      candidates.push(text);
+      scriptStage = "gnu";
+      continue;
+    }
+    if (text.startsWith("-")) {
+      ambiguousSuffix = false;
+      if (text === "--") continue;
+      if (SED_IN_PLACE_RE.test(text)) {
+        inPlace = true;
+        ambiguousSuffix = text === "-i";
+        continue;
+      }
+      const expression = SED_EXPRESSION_OPT_RE.exec(text);
+      if (expression) {
+        candidates.push(expression[1] ?? expression[2]);
+        scriptStage = "explicit";
+        continue;
+      }
+      if (text === "-e" || text === "--expression") {
+        const next = tokens[i + 1];
+        if (!next) return false;
+        candidates.push(next.text);
+        scriptStage = "explicit";
+        i++;
+        continue;
+      }
+      if (SED_PLAIN_OPT_RE.test(text)) continue;
+      return false; // -n/-f 与其余白名单外选项：无法确认无输出，不豁免
+    }
+    if (scriptStage === "none") { candidates.push(text); scriptStage = "gnu"; continue; }
+    if (scriptStage === "bsd") { candidates.push(text); scriptStage = "done"; continue; }
+    files.push(text);
+  }
+  if (!inPlace || candidates.length === 0) return false;
+  if (!candidates.every(isPureSubstituteScript)) return false;
+  return scriptStage !== "gnu" || files.length === 0 || SED_FILE_ENV_SHAPE_RE.test(files[0]);
+}
+
+// 段内除 sed 外还有读取动词（cat/head/grep/…）时，env 文件内容可能经其输出，不受豁免。
+function hasOtherReaderVerbs(segment) {
+  const verbs = new Set(String(segment).match(new RegExp(READER_VERB_RE.source, "g")) ?? []);
+  verbs.delete("sed");
+  return verbs.size > 0;
+}
+
 // 判定改为按命令段：读取动词与密钥文件名必须出现在同一段才算读取。
 // 这样受控调用式（[ -f ... ] && source 的段没有读取动词）和给 manon-kg 输出接管道
 // （manon-kg query … | head，该段没有密钥文件名）都不再误伤；`cat manon.env`、
 // `sed … demo-executor.env` 依然拦截。
+// 唯一豁免是 sed 原地纯替换（isSedInPlaceSubstitution，判定标准见其注释）：改
+// /etc/changquan/updater.env 这类 env 文件里的路径片段不被逼停；同段还有其他读取动词
+// 仍判读取。SECRET_FILES 两个密钥正本（manon.env / verispring.env）不享受豁免。
 function readsSecretFile(command) {
   for (const segment of segmentsOf(command)) {
     if (!READER_VERB_RE.test(segment)) continue;
     if ([...SECRET_FILES].some((name) => segment.includes(name))) return true;
     const match = /([A-Za-z0-9._/-]*\.env(?:\.[A-Za-z0-9_-]+)?)/.exec(segment);
-    if (match && !ENV_FILE_EXEMPT.test(match[1])) return true;
+    if (!match || ENV_FILE_EXEMPT.test(match[1])) continue;
+    if (!isSedInPlaceSubstitution(segment) || hasOtherReaderVerbs(segment)) return true;
   }
   return false;
 }
