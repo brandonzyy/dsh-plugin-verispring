@@ -1,10 +1,12 @@
 #!/usr/bin/env node
 // 三条闭环的运行时行为测试：纯 node、无依赖，mock ctx 只提供 apply() 实际用到的服务面。
 // 覆盖：ask_scout 以领导为 sender 代发并返回新答复；测绘自身/领导/无可达测绘报错；超时文案；
-// 结构增量自动转交的三种收尾（有增量、无增量、测绘自己结束）；失败检查点落盘；
+// 结构增量自动转交的三种收尾（有增量、无增量、测绘自己结束）；转交附插件实测事实与核实纪律
+// （本地 bare 仓当 origin + clone 作工作区，真实 git 输出算数）；失败检查点落盘；
 // 领导续接命中检查点时拒绝并代发合并消息；代发失败时放行；CASEOS_SCOUT_RELAY=0 全部不生效。
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import plugin, { extractStructureDelta } from "../gates/scout-relay.js";
@@ -90,18 +92,29 @@ function makeHarness(options = {}) {
     get: (name) => services[name],
     root: ctx,
   };
-  const leader = { id: leaderId, session: { header: { id: leaderId }, snapshotEvents: () => [] }, ctx: liveCtx };
+  // 会话头 cwd 是插件事实计算的工作区来源（与 dispatch-gate 同源）；不传即无 cwd，
+  // 用于「取不到工作区」的退化口径。
+  const leader = {
+    id: leaderId,
+    session: { header: { id: leaderId, ...(options.cwd ? { cwd: options.cwd } : {}) }, snapshotEvents: () => [] },
+    ctx: liveCtx,
+  };
   agentsMap.set(leaderId, leader);
 
   // 开关在 apply 读一次（所以要在 apply 前设置）；超时在每次 ask 时读。
   // 用例结束后由 runner 复位这两个变量。
   plugin.apply(ctx);
 
-  const childAgent = (childId, parentId = leaderId, events = []) => {
+  const childAgent = (childId, parentId = leaderId, events = [], childOptions = {}) => {
     const agent = {
       id: childId,
       session: {
-        header: { id: childId, origin: "subagent", parentSession: parentId },
+        header: {
+          id: childId,
+          origin: "subagent",
+          parentSession: parentId,
+          ...(childOptions.cwd ? { cwd: childOptions.cwd } : {}),
+        },
         snapshotEvents: () => events,
       },
       ctx: liveCtx,
@@ -194,6 +207,55 @@ const toolCallEvent = (name, path) => ({
   type: "tool/call",
   data: { name, arguments: JSON.stringify({ path }) },
 });
+
+// ---- 转交事实段夹具：本地 bare 仓当 origin + clone 作工作区，不碰真实远端与真实仓 ----
+
+const GIT_CONFIG = ["-c", "user.email=gate@test", "-c", "user.name=gate", "-c", "core.hooksPath=/dev/null"];
+const gitRoots = [];
+
+function relayGit(cwd, args) {
+  return execFileSync("git", ["-C", cwd, ...GIT_CONFIG, ...args], { encoding: "utf8" }).trim();
+}
+
+function relayCommit(cwd, name) {
+  mkdirSync(join(cwd, name, ".."), { recursive: true });
+  writeFileSync(join(cwd, name), `${name}\n`);
+  relayGit(cwd, ["add", "--", name]);
+  relayGit(cwd, ["commit", "-q", "-m", `add ${name}`, "--", name]);
+}
+
+// bare 当 origin，donor 推种子提交后 clone，origin/HEAD 由 clone 正常建立。
+function makeRelayRepo() {
+  const root = mkdtempSync(join(tmpdir(), "scout-relay-repo-"));
+  gitRoots.push(root);
+  const bare = join(root, "origin.git");
+  relayGit(root, ["init", "-q", "--bare", "-b", "main", bare]);
+  const donor = join(root, "donor");
+  relayGit(root, ["init", "-q", "-b", "main", donor]);
+  relayCommit(donor, "seed.md");
+  relayGit(donor, ["push", "-q", bare, "main"]);
+  const work = join(root, "work");
+  relayGit(root, ["clone", "-q", bare, work]);
+  return { root, work };
+}
+
+// 迁移文件推进 origin/main：事实读的是远端跟踪 ref，只在工作区提交未推送的文件不算数。
+function pushMigrations(work) {
+  for (let n = 1; n <= 12; n += 1) {
+    const prefix = n < 12 ? String(n).padStart(3, "0") : String(n);
+    relayCommit(work, `backend/migrations/${prefix}_${String.fromCharCode(96 + n)}.sql`);
+  }
+  relayGit(work, ["push", "-q", "origin", "main"]);
+}
+
+// 无远端的普通仓：originHead 无读数，迁移与 worktree 事实改由 HEAD 与本地命令提供。
+function makeRelayPlain() {
+  const plain = mkdtempSync(join(tmpdir(), "scout-relay-plain-"));
+  gitRoots.push(plain);
+  relayGit(plain, ["init", "-q", "-b", "main", "."]);
+  relayCommit(plain, "a.md");
+  return plain;
+}
 
 test("执行者 ask_scout 以领导 Agent 为 sender 代发，并返回测绘的新答复", async () => {
   const harness = makeHarness();
@@ -433,6 +495,160 @@ test("无可达测绘时结构增量跳过并记 monitor", async () => {
   assert.equal(line.child, "exec-1");
 });
 
+const emitExecutorEnd = async (harness, childId, deltaLine) => {
+  await harness.emit("subagent/end", {
+    id: childId,
+    provider: "spawn",
+    stopReason: "completed",
+    lastAssistantMessage: [{ type: "text", text: `## 结构增量\n- ${deltaLine}` }],
+  });
+};
+
+test("转交附插件实测事实：origin/main 真实 sha、迁移最大号 12、worktree 原文含额外树", async () => {
+  const { root, work } = makeRelayRepo();
+  pushMigrations(work);
+  relayGit(work, ["worktree", "add", "-q", "-b", "wt-extra", join(root, "extra-tree")]);
+  const sha = relayGit(work, ["rev-parse", "refs/remotes/origin/main"]);
+  const harness = makeHarness({ cwd: work });
+  harness.primeScout("scout-A");
+  harness.childAgent("scout-A", harness.leaderId, []);
+  const child = harness.childAgent("exec-1");
+
+  await emitExecutorEnd(harness, child.id, "新增 a 于 gates/a.js:1");
+
+  assert.equal(harness.sent.length, 1);
+  const text = harness.sent[0].text;
+  assert.match(text, /【结构增量自动转交 · 执行者 exec-1】/);
+  assert.match(text, /【插件实测事实（转交前由插件执行，照抄，勿凭记忆改写）】/);
+  assert.match(text, new RegExp(`- origin/main = ${sha}（git fetch 成功）`));
+  assert.match(text, /- 迁移目录最大编号：backend\/migrations=12（12 个）/);
+  assert.match(text, /- git worktree list 原文：/);
+  // macOS 的 tmpdir 在 /var 下是软链，git worktree list 输出的是 realpath。
+  const realRoot = realpathSync(root);
+  const realWork = realpathSync(work);
+  assert.ok(text.includes(`  ${join(realRoot, "extra-tree")} `), "worktree 原文应含额外树路径");
+  assert.ok(text.includes(`  ${realWork} `), "worktree 原文应含工作区自身");
+});
+
+test("核实纪律硬规则：fetch+merge-base 判据、未核实/未核对，不再要求回报最新全表", async () => {
+  const { work } = makeRelayRepo();
+  pushMigrations(work);
+  const harness = makeHarness({ cwd: work });
+  harness.primeScout("scout-A");
+  harness.childAgent("scout-A", harness.leaderId, []);
+  const child = harness.childAgent("exec-2");
+
+  await emitExecutorEnd(harness, child.id, "新增 b 于 gates/b.js:2");
+
+  assert.equal(harness.sent.length, 1);
+  const text = harness.sent[0].text;
+  assert.match(text, /git fetch 之后 git merge-base --is-ancestor <sha> origin\/main 的输出/);
+  assert.match(text, /没有输出就写「未核实」/);
+  assert.match(text, /分支头存在、已推送、PR 状态均不等于已并入/);
+  assert.match(text, /未核对的标「未核对」/);
+  assert.match(text, /git status --short/);
+  assert.match(text, /不能证明任何合并状态/);
+  assert.match(text, /照抄，不得凭记忆改写/);
+  assert.match(text, /以命令输出为准并回报差异/);
+  assert.equal(text.includes("回报最新全表"), false, "不得再要求测绘回报最新全表");
+});
+
+test("fetch 失败：转交照发、origin 行标注失败、monitor fetchOk=false、远端路径不泄漏", async () => {
+  const { root, work } = makeRelayRepo();
+  pushMigrations(work);
+  const missing = join(root, "missing-origin.git");
+  relayGit(work, ["remote", "set-url", "origin", missing]);
+  const sha = relayGit(work, ["rev-parse", "refs/remotes/origin/main"]);
+  const harness = makeHarness({ cwd: work });
+  harness.primeScout("scout-A");
+  harness.childAgent("scout-A", harness.leaderId, []);
+  const child = harness.childAgent("exec-3");
+
+  await emitExecutorEnd(harness, child.id, "新增 c 于 gates/c.js:3");
+
+  assert.equal(harness.sent.length, 1, "fetch 失败不得拦转交");
+  const text = harness.sent[0].text;
+  assert.equal(text.includes(missing), false, "远端路径不得出现在消息里");
+  assert.match(text, new RegExp(`- origin/main = ${sha}（git fetch 失败：读数可能过期）`));
+  const line = harness.monitor().find((entry) => entry.kind === "structure-forward" && entry.result === "forwarded");
+  assert.equal(line.fetchOk, false);
+  assert.equal(JSON.stringify(harness.monitor()).includes(missing), false, "远端路径不得出现在 monitor 里");
+});
+
+test("取不到 cwd：转交照发、事实段写未取到、relay-facts-unavailable 记录", async () => {
+  const harness = makeHarness();
+  harness.primeScout("scout-A");
+  harness.childAgent("scout-A", harness.leaderId, []);
+  const child = harness.childAgent("exec-4");
+
+  await emitExecutorEnd(harness, child.id, "新增 d 于 gates/d.js:4");
+
+  assert.equal(harness.sent.length, 1, "取不到 cwd 不得中断转交");
+  assert.match(harness.sent[0].text, /插件未取到工作区，事实未附/);
+  const unavailable = harness.monitor().find((entry) => entry.kind === "relay-facts-unavailable");
+  assert.equal(unavailable.child, "exec-4");
+  assert.equal(unavailable.reason, "no-cwd");
+  const line = harness.monitor().find((entry) => entry.kind === "structure-forward" && entry.result === "forwarded");
+  assert.equal(line.factsAttached, false);
+  assert.equal(line.fetchOk, false);
+  assert.equal(line.originSha7, void 0);
+});
+
+test("领导会话头没有 cwd 时退回子代理会话头的 cwd，事实照常附", async () => {
+  const { work } = makeRelayRepo();
+  const harness = makeHarness();
+  harness.primeScout("scout-A");
+  harness.childAgent("scout-A", harness.leaderId, []);
+  const child = harness.childAgent("exec-5", harness.leaderId, [], { cwd: work });
+
+  await emitExecutorEnd(harness, child.id, "新增 e 于 gates/e.js:5");
+
+  assert.equal(harness.sent.length, 1);
+  assert.match(harness.sent[0].text, /- git worktree list 原文：/);
+  assert.equal(harness.monitor().some((entry) => entry.kind === "relay-facts-unavailable"), false);
+});
+
+test("无 origin：迁移改读 HEAD、origin 行写不得报已并入、fetchOk=false", async () => {
+  const plain = makeRelayPlain();
+  relayCommit(plain, "backend/migrations/007_x.sql");
+  const harness = makeHarness({ cwd: plain });
+  harness.primeScout("scout-A");
+  harness.childAgent("scout-A", harness.leaderId, []);
+  const child = harness.childAgent("exec-6");
+
+  await emitExecutorEnd(harness, child.id, "新增 f 于 gates/f.js:6");
+
+  assert.equal(harness.sent.length, 1);
+  const text = harness.sent[0].text;
+  assert.match(text, /- 无 origin 远端，不得报告任何「已并入」/);
+  assert.match(text, /- 迁移目录最大编号：backend\/migrations=7（1 个）/);
+  assert.match(text, /- git worktree list 原文：/);
+  const line = harness.monitor().find((entry) => entry.kind === "structure-forward" && entry.result === "forwarded");
+  assert.equal(line.factsAttached, true);
+  assert.equal(line.fetchOk, false, "无 remote 时 fetch 不可成功");
+  assert.equal(line.originSha7, void 0);
+});
+
+test("monitor structure-forward payload 附 factsAttached/fetchOk/originSha7", async () => {
+  const { work } = makeRelayRepo();
+  pushMigrations(work);
+  const sha = relayGit(work, ["rev-parse", "refs/remotes/origin/main"]);
+  const harness = makeHarness({ cwd: work });
+  harness.primeScout("scout-A");
+  harness.childAgent("scout-A", harness.leaderId, []);
+  const child = harness.childAgent("exec-7");
+
+  await emitExecutorEnd(harness, child.id, "新增 g 于 gates/g.js:7");
+
+  const line = harness.monitor().find((entry) => entry.kind === "structure-forward" && entry.result === "forwarded");
+  assert.equal(line.child, "exec-7");
+  assert.equal(line.scout, "scout-A");
+  assert.equal(line.factsAttached, true);
+  assert.equal(line.fetchOk, true);
+  assert.equal(line.originSha7, sha.slice(0, 7));
+  assert.match(line.originSha7, /^[0-9a-f]{7}$/);
+});
+
 test("error 结束时落盘检查点，含改过的文件与最后结论", async () => {
   const harness = makeHarness();
   harness.primeScout("scout-A");
@@ -640,4 +856,5 @@ for (const { name, fn } of tests) {
   }
 }
 console.log(`scout-relay: ${tests.length - failed}/${tests.length} passed`);
+for (const root of gitRoots) rmSync(root, { recursive: true, force: true });
 if (failed > 0) process.exit(1);

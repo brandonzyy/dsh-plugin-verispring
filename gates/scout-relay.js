@@ -1,6 +1,7 @@
 // 三条原本只写在提示词里的闭环的运行时实现：
 // - ask_scout（P2）：执行者把定位/事实问题代发给测绘，等到测绘的新答复再返回；
-// - 结构增量自动转交（P4）：非测绘子代理收尾文本里的「结构增量」段直接转给测绘；
+// - 结构增量自动转交（P4）：非测绘子代理收尾文本里的「结构增量」段，连同插件现场算出的
+//   可机读事实（repo-facts.js）与合并状态核实纪律一起转给测绘；
 // - 失败检查点（P5）：子代理异常结束时把现场落盘，领导续接时由插件携检查点代发。
 //
 // 身份事实与 gates/dispatch-gate.js 同源（这里只读；写入权仍归 dispatch-gate，
@@ -16,6 +17,7 @@
 import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { monitorEvent } from "./monitor-log.js";
+import { fetchOrigin, migrationMax, originHead, worktreeList } from "./repo-facts.js";
 import { registerSurfaceTool } from "./tool-surface.js";
 
 const TOOL_NAME = "ask_scout";
@@ -25,6 +27,8 @@ const DEFAULT_ASK_TIMEOUT_MS = 600000;
 // 先由这个计时器让出宏任务，禁止用「已 resolve 的 Promise」让循环原地空转。
 const POLL_MS = 250;
 const CHECKPOINT_TEXT_LIMIT = 4000;
+// 转交事实段长度上限：极端 worktree 清单也不得把转交消息撑爆，超出按行截断并标注。
+const RELAY_FACTS_LIMIT = 4000;
 const RELAY_ENV = "CASEOS_SCOUT_RELAY";
 // 无可达测绘时的统一拒绝文案：执行者据此把问题写进汇报，由领导处理。
 const UNAVAILABLE_TEXT = "无可达测绘，请在汇报里写明问题，由领导处理";
@@ -336,6 +340,76 @@ export function extractStructureDelta(text) {
   return section;
 }
 
+function headerCwdOf(header) {
+  const cwd = header?.cwd;
+  return typeof cwd === "string" && cwd ? cwd : void 0;
+}
+
+// 转交事实段：可机读事实全部由 repo-facts 现场算出（fetch 先于一切读数），供测绘照抄。
+// cwd 取不到、或 git 整体读不出（目录不是仓库）时不附任何数字，只写占位——空读数会被
+// 测绘当成事实抄走。fetch 失败不拦转交，只在 origin 行标注读数可能过期；reason 只用枚举，
+// 不携带 stderr 与远端 URL。
+function relayFacts(cwd) {
+  if (!cwd) {
+    return { attached: false, reason: "no-cwd", fetchOk: false, text: "- 插件未取到工作区，事实未附" };
+  }
+  const fetched = fetchOrigin(cwd);
+  const origin = originHead(cwd);
+  const migrations = origin === undefined ? migrationMax(cwd, "HEAD") : migrationMax(cwd, `origin/${origin.branch}`);
+  const worktrees = worktreeList(cwd);
+  if (origin === undefined && migrations.length === 0 && worktrees === "") {
+    return {
+      attached: false,
+      reason: "git-unavailable",
+      fetchOk: fetched.ok,
+      text: "- 插件未取得该工作区的 git 事实，事实未附",
+    };
+  }
+  const lines = [];
+  if (origin === undefined) {
+    const fetchNote = fetched.ok || fetched.reason === "no-remote" ? "" : "（git fetch 失败：读数可能过期）";
+    lines.push(`- 无 origin 远端，不得报告任何「已并入」${fetchNote}`);
+  } else {
+    lines.push(`- origin/${origin.branch} = ${origin.sha}（git fetch ${fetched.ok ? "成功" : "失败：读数可能过期"}）`);
+  }
+  if (migrations.length === 0) lines.push("- 迁移目录最大编号：无迁移目录");
+  for (const row of migrations) lines.push(`- 迁移目录最大编号：${row.dir}=${row.max}（${row.count} 个）`);
+  lines.push("- git worktree list 原文：");
+  if (worktrees === "") lines.push("  （无输出）");
+  else for (const line of worktrees.split("\n")) lines.push(`  ${line}`);
+  let text = lines.join("\n");
+  if (text.length > RELAY_FACTS_LIMIT) {
+    const capped = [];
+    let used = 0;
+    for (const line of lines) {
+      if (used + line.length + 1 > RELAY_FACTS_LIMIT) break;
+      capped.push(line);
+      used += line.length + 1;
+    }
+    text = `${capped.join("\n")}\n…（事实段超长，已截断）`;
+  }
+  return {
+    attached: true,
+    branch: origin?.branch,
+    fetchOk: fetched.ok,
+    originSha7: origin?.sha.slice(0, 7),
+    text,
+  };
+}
+
+// 核实纪律：git status 只看本地工作区，证明不了任何「已并入」；分支头存在、已推送、PR 状态
+// 都不等于已并入，判据只有 fetch 之后的 merge-base 祖先关系输出。
+function relayDiscipline(branch) {
+  return [
+    "【核实纪律（硬规则）】",
+    `1. 合并状态只认 git fetch 之后 git merge-base --is-ancestor <sha> origin/${branch} 的输出；`
+      + "回报必须附该命令原始输出，没有输出就写「未核实」；分支头存在、已推送、PR 状态均不等于已并入。",
+    "2. 先 git status --short 自校，仅用于捕获未申报漂移，它不能证明任何合并状态；"
+      + "只回报本次增量与被核对过的条目，每条带命令与输出，禁止沿用上一轮未重新核对的条目，未核对的标「未核对」。",
+    "3. 事实段里的数字照抄，不得凭记忆改写；与你自己命令的输出不一致时，以命令输出为准并回报差异。",
+  ].join("\n");
+}
+
 function errorTextOf(info) {
   const cause = info?.error ?? info?.cause;
   if (!cause) return void 0;
@@ -387,27 +461,36 @@ export default {
     // 父会话在 source.header.parentSession）。
     const childSnapshot = async (childId, scope) => {
       const agent = agentsOf(scope)?.get?.(childId);
-      const parent = agent?.session?.header?.parentSession;
+      const header = agent?.session?.header;
+      const parent = header?.parentSession;
+      const cwd = headerCwdOf(header);
       let events = snapshotOf(agent);
-      if (events.length > 0) return { events, parent };
+      if (events.length > 0) return { events, parent, cwd };
       // end 时子 Agent 已摘出注册表，会话对象通常还在 sessions 服务里。
       try {
         const session = serviceOf(scope, "sessions")?.get?.(childId);
         events = ownEvents(session, session?.snapshotEvents?.() ?? []);
-        if (events.length > 0) return { events, parent: session?.header?.parentSession ?? parent };
+        if (events.length > 0) {
+          return {
+            events,
+            parent: session?.header?.parentSession ?? parent,
+            cwd: headerCwdOf(session?.header) ?? cwd,
+          };
+        }
       } catch {}
       const query = serviceOf(scope, "sessionQuery");
-      if (!query?.observeSession) return { events, parent };
+      if (!query?.observeSession) return { events, parent, cwd };
       let observation;
       try {
         observation = await query.observeSession(childId);
       } catch {
-        return { events, parent };
+        return { events, parent, cwd };
       }
       try {
         return {
           events: ownEvents(observation, [...(observation?.events ?? [])]),
           parent: observation?.header?.parentSession ?? parent,
+          cwd: headerCwdOf(observation?.header) ?? cwd,
         };
       } finally {
         try {
@@ -589,7 +672,7 @@ export default {
 
     // ---- P4 + P5：子代理收尾事实 ----------------------------------------
 
-    const forwardStructureDelta = async (childId, leaderId, text) => {
+    const forwardStructureDelta = async (childId, leaderId, text, childCwd) => {
       const delta = extractStructureDelta(text);
       if (delta === void 0) return;
       const scoutId = reachableScoutId(stateDir, leaderId);
@@ -603,17 +686,44 @@ export default {
         monitorEvent(dshHome, { kind: "structure-forward", child: childId, scout: scoutId, chars: delta.length, result: "leader-not-live" });
         return;
       }
+      // 工作区目录与 dispatch-gate.js:1188 同源（会话头 cwd），领导优先，退回子代理会话头；
+      // 两处都取不到时事实段写占位、转交照发，不中断转交链路。
+      const cwd = headerCwdOf(headerOf(leader)) ?? childCwd;
+      const facts = relayFacts(cwd);
+      if (facts.attached === false) {
+        monitorEvent(dshHome, {
+          kind: "relay-facts-unavailable",
+          child: childId,
+          scout: scoutId,
+          reason: facts.reason,
+        });
+      }
       try {
         await subagents.sendMessage(
           leader,
           scoutId,
           [{
             type: "text",
-            text: `【结构增量自动转交 · 执行者 ${childId}】请 git status --short 自校后核实坐标，并入入口表，回报最新全表。\n${delta}`,
+            text: [
+              `【结构增量自动转交 · 执行者 ${childId}】`,
+              delta,
+              "【插件实测事实（转交前由插件执行，照抄，勿凭记忆改写）】",
+              facts.text,
+              relayDiscipline(facts.branch ?? "<默认分支>"),
+            ].join("\n"),
           }],
           { signal: NO_SIGNAL },
         );
-        monitorEvent(dshHome, { kind: "structure-forward", child: childId, scout: scoutId, chars: delta.length, result: "forwarded" });
+        monitorEvent(dshHome, {
+          kind: "structure-forward",
+          child: childId,
+          scout: scoutId,
+          chars: delta.length,
+          result: "forwarded",
+          factsAttached: facts.attached,
+          fetchOk: facts.fetchOk === true,
+          ...(facts.originSha7 === void 0 ? {} : { originSha7: facts.originSha7 }),
+        });
       } catch (error) {
         monitorEvent(dshHome, {
           kind: "structure-forward",
@@ -661,11 +771,11 @@ export default {
       if (!childId) return;
       // 测绘自己的 end 归 dispatch-gate 管（可达性判定）：不转交、不落检查点。
       if (childRole(stateDir, childId) === "scout") return;
-      const { events, parent } = await childSnapshot(childId);
+      const { events, parent, cwd } = await childSnapshot(childId);
       const leaderId = parent ?? scoutOwnerOf(stateDir, childId);
       if (leaderId && reachableScoutId(stateDir, leaderId) === childId) return;
       const lastText = blocksText(info?.lastAssistantMessage).trim() || lastAssistantText(events);
-      if (leaderId && lastText) await forwardStructureDelta(childId, leaderId, lastText);
+      if (leaderId && lastText) await forwardStructureDelta(childId, leaderId, lastText, cwd);
       if (FAILED_STOP_REASONS.has(info?.stopReason)) saveCheckpoint(childId, leaderId, info, lastText, events);
       // 这次收尾没落检查点也必须清掉错误草稿：同一个 id 可能被续接后再次报错。
       agentErrors.delete(childId);
