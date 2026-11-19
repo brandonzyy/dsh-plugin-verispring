@@ -17,10 +17,13 @@
 // 3 地图前置 + 新鲜度：非测绘派遣要求 <会话工作区>/.project-map.md 存在——cwd 取会话
 //   header 的 cwd（桌面宿主进程目录不是项目根），且 .git 或 .manon 在场才认定项目根，否则
 //   放行（fail-open）。没有地图先派测绘（建图 + 入口表），由领导 write 落盘后重派；
-//   write/edit 该文件时把当前 HEAD 登记为新鲜度基准（caseos/map-baselines.json，目标路径
-//   resolve 后比较），此后 main 再前进就拒绝执行派遣，指路测绘增量校对 + 重写地图登记新
-//   基准；地图已在却没有基准同样拒绝（不再 fail-open）。git 读不到 HEAD 与 CASEOS_SCOUT=0
-//   时放行。
+//   write/edit 该文件时登记新鲜度基准（caseos/map-baselines.json，目标路径 resolve 后比较）：
+//   有 origin/默认分支的仓登记 origin/默认分支 sha（并行会话仓主树恒停默认分支且不拉取，
+//   本地 HEAD 闸不住落后），无 origin 仓登记本地 HEAD；此后 origin 默认分支再前进就拒绝
+//   执行派遣，指路测绘增量校对 + 重写地图登记新基准。旧版存量基准（本地 HEAD 口径）迁移：
+//   不落后 origin 静默升级，落后进宽限（CASEOS_MAP_GRACE_HOURS，默认 24h，0=无宽限），
+//   过期按 origin 口径拦；fetch 失败 fail-open 放行并记监控。地图已在却没有基准同样拒绝
+//   （不再 fail-open）。git 读不到 HEAD 与 CASEOS_SCOUT=0 时放行。
 // 4 模型路由：测绘与执行分别读取面板配置（verispring.json），运行时按角色强制注入，
 //   调用里显式写的 provider/model 一律忽略。fork 拒绝（三智能体架构唯一入口是 spawn）。
 // 5 子代理 preset：spawn 通过 agentPreset 显式选择 verispring-subagent；创建事件只负责
@@ -88,6 +91,7 @@ import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { SLIM_DESC } from "./leader-scope.js";
 import { monitorEvent } from "./monitor-log.js";
+import { fetchOrigin, originHead } from "./repo-facts.js";
 import { installSessionSurface, registerSurfaceTool } from "./tool-surface.js";
 
 // 全局工作规范的唯一正文源：生产只读这一份，不复制正文、无备选源、无旧值回退。
@@ -323,6 +327,9 @@ function mapDrift(cwd, baseline, head) {
 }
 
 const MAP_BASELINES_FILE = "caseos/map-baselines.json";
+// 旧口径（本地 HEAD）基准迁到 origin 口径的宽限时长：CASEOS_MAP_GRACE_HOURS 是唯一来源，
+// 缺省 24 小时；0 或负数=无宽限（迁移时落后直接按过期拦）。
+const MAP_GRACE_HOURS_DEFAULT = 24;
 
 // 地图目标路径归一：展开 ~、按会话工作区解析相对路径，再与工作区地图比较（write 与 edit
 // 都可能拿到相对路径或 ~ 路径）。
@@ -338,19 +345,28 @@ function mapFileOf(cwd) {
   return resolve(cwd ?? process.cwd(), MAP_FILE);
 }
 
+// 基准条目：新口径 { commit, at, basis:"origin", branch }（commit=origin/默认分支 sha）或
+// { commit, at, basis:"head" }（无 origin 仓的本地 HEAD）；没有 basis 字段的条目是旧版存量
+// （本地 HEAD 口径），迁移时与 head 口径同路（静默升级或宽限）。
 function loadMapBaseline(dshHome, cwd) {
   try {
-    const commit = JSON.parse(readFileSync(`${dshHome}/${MAP_BASELINES_FILE}`, "utf8"))[resolve(cwd)]?.commit;
-    return typeof commit === "string" && commit ? commit : void 0;
+    const entry = JSON.parse(readFileSync(`${dshHome}/${MAP_BASELINES_FILE}`, "utf8"))[resolve(cwd)];
+    if (!entry || typeof entry.commit !== "string" || !entry.commit) return void 0;
+    return {
+      commit: entry.commit,
+      basis: entry.basis === "origin" || entry.basis === "head" ? entry.basis : void 0,
+      branch: typeof entry.branch === "string" && entry.branch ? entry.branch : void 0,
+      graceUntil: typeof entry.graceUntil === "string" && entry.graceUntil ? entry.graceUntil : void 0,
+    };
   } catch {}
   return void 0;
 }
 
-function saveMapBaseline(dshHome, cwd, commit) {
+function saveMapBaseline(dshHome, cwd, commit, extra = {}) {
   if (!cwd || !commit) return;
   let all = {};
   try { all = JSON.parse(readFileSync(`${dshHome}/${MAP_BASELINES_FILE}`, "utf8")); } catch {}
-  all[resolve(cwd)] = { commit, at: new Date().toISOString() };
+  all[resolve(cwd)] = { commit, at: new Date().toISOString(), ...extra };
   try {
     mkdirSync(`${dshHome}/caseos`, { recursive: true });
     const temp = `${dshHome}/${MAP_BASELINES_FILE}.tmp-${process.pid}`;
@@ -359,6 +375,103 @@ function saveMapBaseline(dshHome, cwd, commit) {
   } catch (error) {
     process.stderr.write(`caseos-dispatch-gate: 地图基准落盘失败: ${String(error)}\n`);
   }
+}
+
+// 地图基准登记：领导 write/edit .project-map.md 成功后登记新鲜度基准。有 origin/默认分支的
+// 仓登记 origin/默认分支 sha——并行会话仓的主树恒停默认分支且不拉取，本地 HEAD 闸不住真相；
+// fetch 尽力而为，失败不拦登记、只记监控（reason 用枚举，不含路径/URL）。无 origin 的仓
+// 登记本地 HEAD（原口径）。
+function registerMapBaseline(dshHome, cwd) {
+  const fetched = fetchOrigin(cwd);
+  if (!fetched.ok && fetched.reason !== "no-remote") {
+    monitorEvent(dshHome, { kind: "map-fresh-fetch-failed", reason: fetched.reason });
+  }
+  const origin = originHead(cwd);
+  if (origin) {
+    saveMapBaseline(dshHome, cwd, origin.sha, { basis: "origin", branch: origin.branch });
+    return;
+  }
+  const head = gitHead(cwd);
+  if (head) saveMapBaseline(dshHome, cwd, head, { basis: "head" });
+}
+
+function mapGraceHours() {
+  const raw = process.env.CASEOS_MAP_GRACE_HOURS;
+  const hours = raw === void 0 || raw.trim() === "" ? Number.NaN : Number(raw);
+  return Number.isFinite(hours) ? Math.max(0, hours) : MAP_GRACE_HOURS_DEFAULT;
+}
+
+// 无 origin 仓的过期文案（原行为）：基准 vs 本地 HEAD。
+function headStaleReason(cwd, baseline, head) {
+  if (baseline.commit === head) return void 0;
+  const drift = mapDrift(cwd, baseline.commit, head);
+  const behind = drift.commits === void 0 ? "" : `落后 ${drift.commits} 个提交`;
+  const files = drift.files === void 0 ? "" : `，区间改动 ${drift.files} 个文件`;
+  const readout = behind ? `（${behind}${files}）` : "";
+  process.stderr.write(`caseos-dispatch-gate: 地图过期拦截（HEAD 前进于登记基准）${readout}\n`);
+  return `项目地图已过期：main 自上次地图登记后又前进了${readout}（登记基准 ${baseline.commit.slice(0, 8)} → 当前 HEAD ${head.slice(0, 8)}）。`
+    + `先 send_message 常驻测绘智能体做增量校对（manon-kg sync + 结构增量回报）；收到回报后用 write 更新 ${cwd}/${MAP_FILE}（即使结构无变化也原样落盘一次以登记新基准），然后重新派遣。`;
+}
+
+// origin 仓的过期文案：明确「落后 origin/<默认分支>」，带落后提交数、区间改动文件数与
+// 登记基准、origin 两侧的 7 位 sha。
+function originStaleReason(cwd, baseline, target) {
+  const drift = mapDrift(cwd, baseline.commit, target.sha);
+  const behind = drift.commits === void 0 ? "" : `落后 origin/${target.branch} ${drift.commits} 个提交`;
+  const files = drift.files === void 0 ? "" : `，区间改动 ${drift.files} 个文件`;
+  const readout = behind ? `${behind}${files}` : "";
+  const range = `登记基准 ${baseline.commit.slice(0, 8)} → origin/${target.branch} ${target.sha.slice(0, 8)}`;
+  process.stderr.write(`caseos-dispatch-gate: 地图过期拦截（origin/${target.branch} 前进于登记基准）${readout}\n`);
+  return `项目地图已过期：origin/${target.branch} 自上次地图登记后又前进了（${readout ? `${readout}；${range}` : range}）。`
+    + `先 send_message 常驻测绘智能体做增量校对（manon-kg sync + 结构增量回报）；收到回报后用 write 更新 ${cwd}/${MAP_FILE}（即使结构无变化也原样落盘一次以登记新基准），然后重新派遣。`;
+}
+
+// 地图新鲜度判定：返回拒绝文案（rule=map-stale）或 undefined（放行）。有 origin/默认分支的
+// 仓先 fetch 再比 origin/默认分支 sha（登记基准停在旧 origin sha 就拦得住）；fetch 失败按
+// fail-open 放行本次闸并记监控。旧口径条目（无 basis 或 head 口径）迁移：基准不落后 origin
+// 时静默升级为 origin 口径；落后则写 graceUntil 放行（已存在不重置，过期后按 origin 口径拦）；
+// CASEOS_MAP_GRACE_HOURS=0 无宽限直接拦。无 origin 仓沿用基准 vs 本地 HEAD 原行为。
+function mapStaleReason(dshHome, cwd, baseline, head) {
+  const origin = originHead(cwd);
+  if (!origin) return headStaleReason(cwd, baseline, head);
+  const fetched = fetchOrigin(cwd);
+  if (!fetched.ok) {
+    if (fetched.reason !== "no-remote") {
+      monitorEvent(dshHome, { kind: "map-fresh-fetch-failed", reason: fetched.reason });
+      return void 0;
+    }
+    return headStaleReason(cwd, baseline, head);
+  }
+  const target = originHead(cwd) ?? origin;
+  if (baseline.basis === "origin") {
+    return baseline.commit === target.sha ? void 0 : originStaleReason(cwd, baseline, target);
+  }
+  const drift = mapDrift(cwd, baseline.commit, target.sha);
+  if (drift.commits === 0) {
+    saveMapBaseline(dshHome, cwd, baseline.commit, { basis: "origin", branch: target.branch });
+    return void 0;
+  }
+  const hours = mapGraceHours();
+  if (hours <= 0) return originStaleReason(cwd, baseline, target);
+  const graceEvent = (until) => monitorEvent(dshHome, {
+    kind: "map-baseline-migrate-grace",
+    commits: drift.commits,
+    files: drift.files,
+    graceUntil: until,
+    branch: target.branch,
+  });
+  // graceUntil 已存在就不再写回（不能每次派遣都续命）：仍在期内放行，过期/非法即拦。
+  if (baseline.graceUntil) {
+    if (new Date(baseline.graceUntil).getTime() > Date.now()) {
+      graceEvent(baseline.graceUntil);
+      return void 0;
+    }
+    return originStaleReason(cwd, baseline, target);
+  }
+  const graceUntil = new Date(Date.now() + hours * 3600 * 1000).toISOString();
+  saveMapBaseline(dshHome, cwd, baseline.commit, { graceUntil });
+  graceEvent(graceUntil);
+  return void 0;
 }
 
 // 作用域已不可用的两种形态：宿主的 agents 服务只在活跃 fiber 上解析（inactive context），
@@ -1095,17 +1208,15 @@ const plugin = {
           }
         }
       }
-      // 地图基准登记：领导 write/edit .project-map.md 成功即把当前 HEAD 记为该工作区的新鲜度
-      // 基准。write 走绝对路径，edit 可能拿到相对路径或 ~ 路径：先归一再与工作区地图比较。
+      // 地图基准登记：领导 write/edit .project-map.md 成功即登记该工作区的新鲜度基准
+      // （有 origin/默认分支的仓登记 origin sha，见 registerMapBaseline）。write 走绝对路径，
+      // edit 可能拿到相对路径或 ~ 路径：先归一再与工作区地图比较。
       if (MAP_WRITE_TOOLS.has(exec.name)) {
         let args = {};
         try { args = exec.arguments ?? {}; } catch {}
         const cwd = exec.agent?.session?.header?.cwd ?? process.cwd();
         const target = mapPathOf(cwd, args.file_path ?? args.path ?? args.file);
-        if (target && target === mapFileOf(cwd)) {
-          const head = gitHead(cwd);
-          if (head) saveMapBaseline(dshHome, cwd, head);
-        }
+        if (target && target === mapFileOf(cwd)) registerMapBaseline(dshHome, cwd);
       }
     });
 
@@ -1191,9 +1302,11 @@ const plugin = {
         process.stderr.write("caseos-dispatch-gate: 地图前置拦截（.project-map.md 不存在）\n");
         return deny(`派执行智能体前必须先有项目地图：${cwd}/${MAP_FILE} 不存在。先派测绘智能体（按系统提示的 manon-kg 调用前缀 sync 建图并回报入口表 ≤20 行），用 write 把入口表落盘为该文件，然后重新派遣。`);
       }
-      // 地图新鲜度：main 自上次地图登记后又前进过，先让常驻测绘增量校对并重新落盘地图。
-      // 基准在 write/edit .project-map.md 时登记（见 tools/result 监听）；地图在而基准缺失
-      // 是登记漏了，不再 fail-open——否则陈旧地图会永久放行。git 读不到 HEAD 时仍放行。
+      // 地图新鲜度：默认分支自上次地图登记后又前进过，先让常驻测绘增量校对并重新落盘地图。
+      // 基准在 write/edit .project-map.md 时登记（见 tools/result 监听）；比较对象是有
+      // origin/默认分支的仓取 origin/默认分支 sha（并行会话仓主树恒停默认分支且不拉取，
+      // 本地 HEAD 永远等于基准、闸不住落后），无 origin 的仓沿用本地 HEAD。地图在而基准
+      // 缺失是登记漏了，不再 fail-open——否则陈旧地图会永久放行。git 读不到 HEAD 时仍放行。
       if (isProjectRoot && process.env.CASEOS_SCOUT !== "0") {
         const head = gitHead(cwd);
         if (head) {
@@ -1205,18 +1318,8 @@ const plugin = {
               "map-baseline-missing",
             );
           }
-          if (baseline !== head) {
-            const drift = mapDrift(cwd, baseline, head);
-            const behind = drift.commits === void 0 ? "" : `落后 ${drift.commits} 个提交`;
-            const files = drift.files === void 0 ? "" : `，区间改动 ${drift.files} 个文件`;
-            const readout = behind ? `（${behind}${files}）` : "";
-            process.stderr.write(`caseos-dispatch-gate: 地图过期拦截（HEAD 前进于登记基准）${readout}\n`);
-            return deny(
-              `项目地图已过期：main 自上次地图登记后又前进了${readout}（登记基准 ${baseline.slice(0, 8)} → 当前 HEAD ${head.slice(0, 8)}）。`
-              + `先 send_message 常驻测绘智能体做增量校对（manon-kg sync + 结构增量回报）；收到回报后用 write 更新 ${cwd}/${MAP_FILE}（即使结构无变化也原样落盘一次以登记新基准），然后重新派遣。`,
-              "map-stale",
-            );
-          }
+          const stale = mapStaleReason(dshHome, cwd, baseline, head);
+          if (stale) return deny(stale, "map-stale");
         }
       }
       // 执行子代理并发上限：同一领导会话里运行中的执行子代理已达上限就拒绝，等回执再派。
