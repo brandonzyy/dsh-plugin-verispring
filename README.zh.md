@@ -16,6 +16,17 @@
 结果以结算回执返回——主会话不会被原始探索污染。manon 图谱是测绘专责工具，领导与执行都不直接调用，
 有图谱问题就问测绘。同一领导会话里同时运行的执行者默认上限 8 个，派遣不会摊成一堆并发。
 
+### 地图新鲜度与转交核实
+
+新鲜度闸先 `git fetch`，再比登记基准与 `origin/<默认分支>`；落后即拒，文案给落后提交数与改动文件数。
+基准登记同样取 origin sha；无 origin 的仓沿用本地 HEAD。fetch 失败放行并记 `map-fresh-fetch-failed`。
+**升级迁移**：旧基准（无 `basis` 字段，本地 HEAD 口径）首次比较时，不落后 origin 则静默升级；落后则
+写 `graceUntil` 放行 24 小时（`CASEOS_MAP_GRACE_HOURS` 调整，0=无宽限，事件 `map-baseline-migrate-grace`），
+期内重写一次 `.project-map.md` 即换成新基准，过期按 `map-stale` 拒绝。
+
+执行者回执转交测绘时，插件先 fetch 并附 origin sha、迁移目录最大编号、`git worktree list` 原文。合并状态只认
+`git merge-base --is-ancestor <sha> origin/<默认分支>` 的输出，没有输出写「未核实」；测绘只回报增量与已核对条目。
+
 ### 全局工作规范供给
 
 全局规范在生产环境只有一个正文源：`~/.claude/CLAUDE.md`。插件以根作用域动态系统段
