@@ -443,10 +443,11 @@ function mapStaleReason(dshHome, cwd, baseline, head) {
     return headStaleReason(cwd, baseline, head);
   }
   const target = originHead(cwd) ?? origin;
-  if (baseline.basis === "origin") {
-    return baseline.commit === target.sha ? void 0 : originStaleReason(cwd, baseline, target);
-  }
+  // 过期 = origin 比基准多出提交（基准..origin 非空）；基准领先 origin（本地提交未推送）不算过期。
   const drift = mapDrift(cwd, baseline.commit, target.sha);
+  if (baseline.basis === "origin") {
+    return drift.commits === 0 ? void 0 : originStaleReason(cwd, baseline, target);
+  }
   if (drift.commits === 0) {
     saveMapBaseline(dshHome, cwd, baseline.commit, { basis: "origin", branch: target.branch });
     return void 0;

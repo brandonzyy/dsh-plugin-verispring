@@ -1027,6 +1027,18 @@ test("缺口复现：基准与主树 HEAD 都停在旧 origin sha，origin 前�
   assert.equal(line.rule, "map-stale");
 });
 
+test("基准领先 origin（本地提交未推送）不算过期：旧口径升级后与 origin 口径都放行", () => {
+  const { harness } = makeOriginHarness();
+  harness.primeScout("scout-A");
+  // 本地比 origin 多一个未推送提交，基准登记在该提交上（旧口径存量）。
+  commitFile(harness.cwd, "local-only.md");
+  writeLegacyBaseline(harness, harness.head());
+
+  assert.equal(harness.guard({ description: "改代码", prompt: "把 a 改成 b" }), void 0, "旧口径领先 origin 应放行并升级");
+  assert.equal(baselineEntryOf(harness).basis, "origin");
+  assert.equal(harness.guard({ description: "改代码", prompt: "把 a 改成 b" }), void 0, "升级后的 origin 口径基准领先 origin 仍应放行");
+});
+
 test("fetch 失败 fail-open：放行并记 map-fresh-fetch-failed，事件不含远端路径", () => {
   const { harness, originPath } = makeOriginHarness();
   harness.primeScout("scout-A");
