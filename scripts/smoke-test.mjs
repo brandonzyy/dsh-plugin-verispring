@@ -3,6 +3,7 @@ import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
+import { checkComposition } from "./smoke-composition.mjs";
 
 const root = resolve(new URL("..", import.meta.url).pathname);
 const packageData = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
@@ -155,18 +156,7 @@ const profile = process.env.DSH_SMOKE_PROFILE;
 if (dsh && profile) {
   try {
     const output = run(dsh, ["--profile", profile, "--dump-config"]);
-    for (const failure of [
-      "failed to import",
-      "did not activate",
-      "persona is no longer supported",
-      "toolFilter is no longer supported",
-      'unknown prompt variable "{{cwd}}"',
-    ]) {
-      if (output.includes(failure)) fail(`组合配置包含失败诊断：${failure}`);
-    }
-    for (const marker of ["caseos-dispatch-gate", "caseos-idle-compact", "verispring-config", "preset-verispring-subagent", "id: verispring-subagent"]) {
-      if (!output.includes(marker)) fail(`组合配置缺少 ${marker}`);
-    }
+    for (const failure of checkComposition(output, root, { bin: dsh, profile })) fail(failure);
   } catch (error) {
     fail(String(error));
   }
