@@ -29,7 +29,8 @@
 
 ### 全局工作规范供给
 
-全局规范在生产环境只有一个正文源：`~/.claude/CLAUDE.md`。插件以根作用域动态系统段
+全局规范只有一个读取点：`$DSH_HOME/CLAUDE.md`（默认 `~/.dsh/CLAUDE.md`），与 `$DSH_HOME/specs/` 同根。
+规范作者的机器上它是指向 `~/.claude/CLAUDE.md` 的软链；团队成员机上放组织下发的规范包。插件以根作用域动态系统段
 `caseos:global-work-spec` 在每次提示词装配时读取完整正文，领导、测绘、执行三类会话都覆盖，
 `send_message` 续接与冷恢复同样生效；子代理任务书不能豁免。任务涉及正文引用的专项 specs 时，
 按源内路径完整读取对应规范。
@@ -93,7 +94,7 @@ spec。
 
 **前置条件** —— profile 需含 agent preset 注册表与 `preset-standard`（桌面版 / web 组合包自带）；
 `~/.dsh/specs/子代理派遣规范.md` 与 `~/.dsh/specs/代码写作规范.md` 需存在（缺规范时门禁会持续
-拦截并指路）；`~/.claude/CLAUDE.md` 需存在、可读且非空白（否则子代理派遣与子代理工具调用被拒）；
+拦截并指路）；`$DSH_HOME/CLAUDE.md` 需存在、可读且非空白（否则子代理派遣与子代理工具调用被拒）；
 `verispring` 渠道需同时服务领导模型与一条声明了 `reasoningEfforts` 和
 `compat.forceAdaptiveThinking` 的 `deepseek-flash` 条目。manon 随包分发、可选：首次运行自举
 Python venv（一次性联网，需 python3 ≥3.11），密钥放 `~/.dsh/manon.env` 与 `~/.dsh/verispring.env`。

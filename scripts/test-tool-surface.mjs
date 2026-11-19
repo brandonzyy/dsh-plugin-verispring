@@ -90,8 +90,8 @@ function createHost(options = {}) {
   const sessionId = options.sessionId ?? "session-surface-1";
   const cwd = options.cwd ?? home;
   mkdirSync(`${home}/caseos/session-state`, { recursive: true });
-  // 全局工作规范段读的是唯一源：测试用夹具文件隔离，不读取/改写用户真实 CLAUDE.md。
-  const specFile = `${home}/global-work-spec.md`;
+  // 全局工作规范段读 profile home 下的 CLAUDE.md：临时 home 隔离，不读取/改写用户真实规范。
+  const specFile = `${home}/CLAUDE.md`;
   writeFileSync(specFile, "# 全局工作规范（测试夹具）\n硬禁令：提交一律 `git commit -F msg -- <显式路径>`。\n");
   // 插件读 MANON_KG_BIN 判断图谱是否可用；给一个真实存在的文件让 manon 段真正注入。
   const kgPath = `${home}/manon-kg`;
@@ -231,7 +231,7 @@ function createHost(options = {}) {
   };
   const agent = makeAgent(sessionId);
 
-  for (const plugin of PLUGINS) plugin.apply(ctx, plugin === dispatchGate ? { specFile } : void 0);
+  for (const plugin of PLUGINS) plugin.apply(ctx);
 
   const emit = async (name, payload) => {
     for (const callback of listeners.get(name) ?? []) await callback(payload);

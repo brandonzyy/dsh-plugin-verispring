@@ -41,7 +41,8 @@
 //   本节的拒绝都记 kind=dispatch-deny 并带规则名，与既有 gate-deny 分开，便于审计哪条规则在
 //   拦。派遣回执保留 "started subagent <id>" 前缀原样（宿主与 client.js 的解析契约），追加
 //   路由、角色与测绘接替事实。
-// 8 全局工作规范供给：~/.claude/CLAUDE.md 是唯一正文源，root 作用域动态 systemPrompt 段
+// 8 全局工作规范供给：$DSH_HOME/CLAUDE.md 是唯一读取点（用户机软链到 ~/.claude/CLAUDE.md，研发员工机为
+//   CaseOS 下发的研发规范包），root 作用域动态 systemPrompt 段
 //   （caseos:global-work-spec）每次装配现读全文，供给 leader / scout / executor（send_message
 //   续接与冷恢复同样走 root 段）。源缺失/空白/读取失败即 fail closed：新 subagent 派遣与既有
 //   子代理的全部工具调用按 spec-source-missing 拒绝并落监控；领导普通工具不受影响。不复制
@@ -94,8 +95,10 @@ import { monitorEvent } from "./monitor-log.js";
 import { fetchOrigin, originHead } from "./repo-facts.js";
 import { installSessionSurface, registerSurfaceTool } from "./tool-surface.js";
 
-// 全局工作规范的唯一正文源：生产只读这一份，不复制正文、无备选源、无旧值回退。
-const GLOBAL_SPEC_FILE = `${homedir()}/.claude/CLAUDE.md`;
+// 全局工作规范的唯一读取点：$DSH_HOME/CLAUDE.md（与 $DSH_HOME/specs/ 同根，正文里的 specs/ 相对路径
+// 就地可解）。不复制正文、无备选源、无旧值回退。宿主只把 $DSH_HOME/AGENTS.md 当用户全局指令，
+// 本文件只经本插件进入会话。
+const GLOBAL_SPEC_NAME = "CLAUDE.md";
 // root 作用域动态段的 id：所有角色、所有会话（含续接与冷恢复）都从它取正文。
 const GLOBAL_SPEC_SECTION = "caseos:global-work-spec";
 // 源不可用时的拒绝规则名（fail closed）：新派遣与既有子代理的工具调用共用。
@@ -802,10 +805,9 @@ const plugin = {
   // 整个门禁在缺少该服务的宿主上永不激活。sessionController 同理——它只用于写子代理模型
   // 选择，缺了照常派遣（applyChildRoute 已容错），不该拖住派遣门禁本身。
   inject: ["tools", "agents", "sessionTitle", "profileContext", "systemPrompt"],
-  apply(ctx, options) {
+  apply(ctx) {
     const dshHome = ctx.profileContext?.home ?? process.env.DSH_HOME ?? `${homedir()}/.dsh`;
-    // 测试隔离：仅内部 apply 参数可指向测试源文件；生产唯一来源是 GLOBAL_SPEC_FILE。
-    const specFile = options?.specFile ?? GLOBAL_SPEC_FILE;
+    const specFile = `${dshHome}/${GLOBAL_SPEC_NAME}`;
     const configFile = `${dshHome}/verispring.json`;
     const stateDir = `${dshHome}/caseos/session-state`;
     const specPath = `${dshHome}/specs/子代理派遣规范.md`;
