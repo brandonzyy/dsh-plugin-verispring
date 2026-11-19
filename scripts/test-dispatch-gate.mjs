@@ -982,7 +982,7 @@ function baselineEntryOf(harness) {
   }
 }
 
-// 直接写一条旧口径基准（无 basis 字段），模拟升级前的存量登记。
+// 直接写一条旧口径基准（无 basis 字段），模拟旧版登记的存量条目。
 function writeLegacyBaseline(harness, commit) {
   const file = `${harness.home}/caseos/map-baselines.json`;
   let all = {};
@@ -1027,16 +1027,37 @@ test("缺口复现：基准与主树 HEAD 都停在旧 origin sha，origin 前�
   assert.equal(line.rule, "map-stale");
 });
 
-test("基准领先 origin（本地提交未推送）不算过期：旧口径升级后与 origin 口径都放行", () => {
+test("基准领先 origin（本地提交未推送）不算过期：旧口径条目放行且不被改动", () => {
   const { harness } = makeOriginHarness();
   harness.primeScout("scout-A");
   // 本地比 origin 多一个未推送提交，基准登记在该提交上（旧口径存量）。
   commitFile(harness.cwd, "local-only.md");
   writeLegacyBaseline(harness, harness.head());
+  const legacy = baselineEntryOf(harness);
 
-  assert.equal(harness.guard({ description: "改代码", prompt: "把 a 改成 b" }), void 0, "旧口径领先 origin 应放行并升级");
-  assert.equal(baselineEntryOf(harness).basis, "origin");
-  assert.equal(harness.guard({ description: "改代码", prompt: "把 a 改成 b" }), void 0, "升级后的 origin 口径基准领先 origin 仍应放行");
+  assert.equal(harness.guard({ description: "改代码", prompt: "把 a 改成 b" }), void 0, "旧口径领先 origin 应放行");
+  assert.deepEqual(baselineEntryOf(harness), legacy, "条目原样：没有升级写回与宽限");
+});
+
+test("旧口径条目落后 origin 直接按 map-stale 拦且条目不被改动：无迁移路径", () => {
+  const { harness, originSha, pushAhead } = makeOriginHarness();
+  harness.primeScout("scout-A");
+  writeLegacyBaseline(harness, harness.head());
+  pushAhead(["a.md", "b.md"]);
+  const legacy = baselineEntryOf(harness);
+
+  const reason = harness.guard({ description: "改代码", prompt: "把 a 改成 b" });
+  assert.match(reason, /项目地图已过期/);
+  assert.match(reason, /落后 origin\/main 2 个提交/);
+  const line = harness.monitor().find((event) => event.kind === "dispatch-deny");
+  assert.equal(line.rule, "map-stale");
+  assert.deepEqual(baselineEntryOf(harness), legacy, "条目原样：无升级写回与宽限字段");
+
+  // 同一刻把基准改成与 origin 相同 sha：放行，条目仍不被改动。
+  writeLegacyBaseline(harness, originSha());
+  const synced = baselineEntryOf(harness);
+  assert.equal(harness.guard({ description: "改代码", prompt: "把 a 改成 b" }), void 0, "基准=origin sha 应放行");
+  assert.deepEqual(baselineEntryOf(harness), synced, "放行路径同样不写回条目");
 });
 
 test("fetch 失败 fail-open：放行并记 map-fresh-fetch-failed，事件不含远端路径", () => {
@@ -1055,70 +1076,6 @@ test("fetch 失败 fail-open：放行并记 map-fresh-fetch-failed，事件不�
   try { monitorText = readFileSync(`${harness.home}/verispring-monitor.jsonl`, "utf8"); } catch {}
   assert.ok(!monitorText.includes(broken), "监控不得出现远端路径");
   assert.ok(!monitorText.includes(originPath), "监控不得出现任何远端路径");
-});
-
-test("旧口径基准不落后 origin 时静默升级为 origin 口径并放行", () => {
-  const { harness } = makeOriginHarness();
-  harness.primeScout("scout-A");
-  writeLegacyBaseline(harness, harness.head());
-
-  assert.equal(harness.guard({ description: "改代码", prompt: "把 a 改成 b" }), void 0);
-
-  const entry = baselineEntryOf(harness);
-  assert.equal(entry.basis, "origin");
-  assert.equal(entry.branch, "main");
-  assert.equal(entry.commit, harness.head(), "静默升级保留原 commit");
-});
-
-test("旧口径基准落后 origin 时进宽限：放行、写 graceUntil、再派不重置", () => {
-  const { harness, pushAhead } = makeOriginHarness();
-  harness.primeScout("scout-A");
-  writeLegacyBaseline(harness, harness.head());
-  pushAhead(["a.md", "b.md"]);
-
-  assert.equal(harness.guard({ description: "改代码", prompt: "把 a 改成 b" }), void 0, "宽限期内放行");
-
-  const first = baselineEntryOf(harness);
-  assert.equal(first.commit, harness.head(), "宽限不改写基准 commit");
-  assert.ok(first.graceUntil, "宽限要写 graceUntil");
-  assert.equal(new Date(first.graceUntil).getTime() > Date.now(), true);
-
-  const event = harness.monitor().find((entry) => entry.kind === "map-baseline-migrate-grace");
-  assert.ok(event, "宽限要落监控");
-  assert.equal(event.commits, 2);
-  assert.equal(event.files, 2);
-  assert.equal(event.branch, "main");
-  assert.equal(event.graceUntil, first.graceUntil);
-
-  assert.equal(harness.guard({ description: "改代码", prompt: "把 a 改成 b" }), void 0, "宽限期内再次派遣仍放行");
-  assert.equal(baselineEntryOf(harness).graceUntil, first.graceUntil, "graceUntil 不重置");
-});
-
-test("宽限过期或 CASEOS_MAP_GRACE_HOURS=0 时旧口径落后直接按 map-stale 拦", async () => {
-  const { harness, pushAhead } = makeOriginHarness();
-  harness.primeScout("scout-A");
-  writeLegacyBaseline(harness, harness.head());
-  pushAhead(["a.md"]);
-  const legacy = baselineEntryOf(harness);
-  writeFileSync(
-    `${harness.home}/caseos/map-baselines.json`,
-    `${JSON.stringify({ [harness.cwd]: { ...legacy, graceUntil: new Date(Date.now() - 1000).toISOString() } }, null, 2)}\n`,
-  );
-
-  const reason = harness.guard({ description: "改代码", prompt: "把 a 改成 b" });
-  assert.match(reason, /项目地图已过期/);
-  assert.match(reason, /落后 origin\/main 1 个提交/);
-  const line = harness.monitor().find((event) => event.kind === "dispatch-deny");
-  assert.equal(line.rule, "map-stale");
-
-  // CASEOS_MAP_GRACE_HOURS=0：无宽限，落后直接拦。
-  await withEnv({ CASEOS_MAP_GRACE_HOURS: "0" }, async () => {
-    const zero = makeOriginHarness();
-    zero.harness.primeScout("scout-A");
-    writeLegacyBaseline(zero.harness, zero.harness.head());
-    zero.pushAhead(["z.md"]);
-    assert.match(zero.harness.guard({ description: "改代码", prompt: "把 a 改成 b" }), /落后 origin\/main 1 个提交/);
-  });
 });
 
 test("运行中 8 个执行子代理时第 9 个被拒，测绘不计入上限", () => {

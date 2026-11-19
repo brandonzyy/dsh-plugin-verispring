@@ -26,11 +26,9 @@ capped (default 8), so a dispatch fan-out cannot turn into a crowd.
 The freshness gate runs `git fetch`, then compares the registered baseline with `origin/<default branch>`;
 if behind it refuses and reports the commit and changed-file counts. Baselines are registered as the
 origin sha too; repos without an origin keep using local HEAD. A failed fetch lets the dispatch through
-and logs `map-fresh-fetch-failed`. **Upgrade migration**: an old baseline (no `basis` field, local-HEAD
-basis) is upgraded silently on first comparison if it is not behind origin; if behind, it gets a
-`graceUntil` and is allowed for 24 hours (`CASEOS_MAP_GRACE_HOURS`, 0 = no grace, event
-`map-baseline-migrate-grace`). Rewriting `.project-map.md` once in that window installs the new baseline;
-after expiry the gate refuses with `map-stale`.
+and logs `map-fresh-fetch-failed`. An old baseline (no `basis` field, local-HEAD basis) has no migration
+path: it compares under the origin rule as-is and is refused with `map-stale` when behind, its entry
+left untouched.
 
 When an executor receipt is forwarded to the scout, the plugin first fetches and attaches the origin sha,
 the highest migration number and the raw `git worktree list`. Merge status counts only the output of

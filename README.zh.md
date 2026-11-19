@@ -20,9 +20,8 @@
 
 新鲜度闸先 `git fetch`，再比登记基准与 `origin/<默认分支>`；落后即拒，文案给落后提交数与改动文件数。
 基准登记同样取 origin sha；无 origin 的仓沿用本地 HEAD。fetch 失败放行并记 `map-fresh-fetch-failed`。
-**升级迁移**：旧基准（无 `basis` 字段，本地 HEAD 口径）首次比较时，不落后 origin 则静默升级；落后则
-写 `graceUntil` 放行 24 小时（`CASEOS_MAP_GRACE_HOURS` 调整，0=无宽限，事件 `map-baseline-migrate-grace`），
-期内重写一次 `.project-map.md` 即换成新基准，过期按 `map-stale` 拒绝。
+旧版基准（无 `basis` 字段，本地 HEAD 口径）没有迁移路径：等同 origin 口径直接比较，落后即按
+`map-stale` 拒绝，条目原样保留。
 
 执行者回执转交测绘时，插件先 fetch 并附 origin sha、迁移目录最大编号、`git worktree list` 原文。合并状态只认
 `git merge-base --is-ancestor <sha> origin/<默认分支>` 的输出，没有输出写「未核实」；测绘只回报增量与已核对条目。

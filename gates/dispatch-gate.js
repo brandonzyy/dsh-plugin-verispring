@@ -20,9 +20,9 @@
 //   write/edit 该文件时登记新鲜度基准（caseos/map-baselines.json，目标路径 resolve 后比较）：
 //   有 origin/默认分支的仓登记 origin/默认分支 sha（并行会话仓主树恒停默认分支且不拉取，
 //   本地 HEAD 闸不住落后），无 origin 仓登记本地 HEAD；此后 origin 默认分支再前进就拒绝
-//   执行派遣，指路测绘增量校对 + 重写地图登记新基准。旧版存量基准（本地 HEAD 口径）迁移：
-//   不落后 origin 静默升级，落后进宽限（CASEOS_MAP_GRACE_HOURS，默认 24h，0=无宽限），
-//   过期按 origin 口径拦；fetch 失败 fail-open 放行并记监控。地图已在却没有基准同样拒绝
+//   执行派遣，指路测绘增量校对 + 重写地图登记新基准。旧版存量基准（无 basis 字段）没有
+//   迁移路径：等同 origin 口径直接比较，落后即按 map-stale 拦；fetch 失败 fail-open 放行
+//   并记监控。地图已在却没有基准同样拒绝
 //   （不再 fail-open）。git 读不到 HEAD 与 CASEOS_SCOUT=0 时放行。
 // 4 模型路由：测绘与执行分别读取面板配置（verispring.json），运行时按角色强制注入，
 //   调用里显式写的 provider/model 一律忽略。fork 拒绝（三智能体架构唯一入口是 spawn）。
@@ -327,9 +327,6 @@ function mapDrift(cwd, baseline, head) {
 }
 
 const MAP_BASELINES_FILE = "caseos/map-baselines.json";
-// 旧口径（本地 HEAD）基准迁到 origin 口径的宽限时长：CASEOS_MAP_GRACE_HOURS 是唯一来源，
-// 缺省 24 小时；0 或负数=无宽限（迁移时落后直接按过期拦）。
-const MAP_GRACE_HOURS_DEFAULT = 24;
 
 // 地图目标路径归一：展开 ~、按会话工作区解析相对路径，再与工作区地图比较（write 与 edit
 // 都可能拿到相对路径或 ~ 路径）。
@@ -345,9 +342,9 @@ function mapFileOf(cwd) {
   return resolve(cwd ?? process.cwd(), MAP_FILE);
 }
 
-// 基准条目：新口径 { commit, at, basis:"origin", branch }（commit=origin/默认分支 sha）或
+// 基准条目：{ commit, at, basis:"origin", branch }（commit=origin/默认分支 sha）或
 // { commit, at, basis:"head" }（无 origin 仓的本地 HEAD）；没有 basis 字段的条目是旧版存量
-// （本地 HEAD 口径），迁移时与 head 口径同路（静默升级或宽限）。
+// （本地 HEAD 口径），等同 origin 口径参与比较，没有升级写回与宽限。
 function loadMapBaseline(dshHome, cwd) {
   try {
     const entry = JSON.parse(readFileSync(`${dshHome}/${MAP_BASELINES_FILE}`, "utf8"))[resolve(cwd)];
@@ -356,7 +353,6 @@ function loadMapBaseline(dshHome, cwd) {
       commit: entry.commit,
       basis: entry.basis === "origin" || entry.basis === "head" ? entry.basis : void 0,
       branch: typeof entry.branch === "string" && entry.branch ? entry.branch : void 0,
-      graceUntil: typeof entry.graceUntil === "string" && entry.graceUntil ? entry.graceUntil : void 0,
     };
   } catch {}
   return void 0;
@@ -395,12 +391,6 @@ function registerMapBaseline(dshHome, cwd) {
   if (head) saveMapBaseline(dshHome, cwd, head, { basis: "head" });
 }
 
-function mapGraceHours() {
-  const raw = process.env.CASEOS_MAP_GRACE_HOURS;
-  const hours = raw === void 0 || raw.trim() === "" ? Number.NaN : Number(raw);
-  return Number.isFinite(hours) ? Math.max(0, hours) : MAP_GRACE_HOURS_DEFAULT;
-}
-
 // 无 origin 仓的过期文案（原行为）：基准 vs 本地 HEAD。
 function headStaleReason(cwd, baseline, head) {
   if (baseline.commit === head) return void 0;
@@ -428,9 +418,8 @@ function originStaleReason(cwd, baseline, target) {
 
 // 地图新鲜度判定：返回拒绝文案（rule=map-stale）或 undefined（放行）。有 origin/默认分支的
 // 仓先 fetch 再比 origin/默认分支 sha（登记基准停在旧 origin sha 就拦得住）；fetch 失败按
-// fail-open 放行本次闸并记监控。旧口径条目（无 basis 或 head 口径）迁移：基准不落后 origin
-// 时静默升级为 origin 口径；落后则写 graceUntil 放行（已存在不重置，过期后按 origin 口径拦）；
-// CASEOS_MAP_GRACE_HOURS=0 无宽限直接拦。无 origin 仓沿用基准 vs 本地 HEAD 原行为。
+// fail-open 放行本次闸并记监控。旧口径条目（无 basis 字段）等同 origin 口径参与比较——
+// 基准落后 origin 即拦，没有升级写回与宽限。无 origin 仓沿用基准 vs 本地 HEAD 原行为。
 function mapStaleReason(dshHome, cwd, baseline, head) {
   const origin = originHead(cwd);
   if (!origin) return headStaleReason(cwd, baseline, head);
@@ -444,35 +433,9 @@ function mapStaleReason(dshHome, cwd, baseline, head) {
   }
   const target = originHead(cwd) ?? origin;
   // 过期 = origin 比基准多出提交（基准..origin 非空）；基准领先 origin（本地提交未推送）不算过期。
+  // 旧口径条目（无 basis 字段）同样按这条判。
   const drift = mapDrift(cwd, baseline.commit, target.sha);
-  if (baseline.basis === "origin") {
-    return drift.commits === 0 ? void 0 : originStaleReason(cwd, baseline, target);
-  }
-  if (drift.commits === 0) {
-    saveMapBaseline(dshHome, cwd, baseline.commit, { basis: "origin", branch: target.branch });
-    return void 0;
-  }
-  const hours = mapGraceHours();
-  if (hours <= 0) return originStaleReason(cwd, baseline, target);
-  const graceEvent = (until) => monitorEvent(dshHome, {
-    kind: "map-baseline-migrate-grace",
-    commits: drift.commits,
-    files: drift.files,
-    graceUntil: until,
-    branch: target.branch,
-  });
-  // graceUntil 已存在就不再写回（不能每次派遣都续命）：仍在期内放行，过期/非法即拦。
-  if (baseline.graceUntil) {
-    if (new Date(baseline.graceUntil).getTime() > Date.now()) {
-      graceEvent(baseline.graceUntil);
-      return void 0;
-    }
-    return originStaleReason(cwd, baseline, target);
-  }
-  const graceUntil = new Date(Date.now() + hours * 3600 * 1000).toISOString();
-  saveMapBaseline(dshHome, cwd, baseline.commit, { graceUntil });
-  graceEvent(graceUntil);
-  return void 0;
+  return drift.commits === 0 ? void 0 : originStaleReason(cwd, baseline, target);
 }
 
 // 作用域已不可用的两种形态：宿主的 agents 服务只在活跃 fiber 上解析（inactive context），
