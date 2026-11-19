@@ -104,7 +104,9 @@ Python venv（一次性联网，需 python3 ≥3.11），密钥放 `~/.dsh/manon
 
 `npm test` 依次跑各门禁行为测试与冒烟（`npm run smoke`）。mock 测试证明不了真实宿主装载门禁，
 所以升级 dsh 后单独跑一次 `npm run smoke`：检查版本声明、源码语法与插件入口；设置了 `DSH_BIN` 与
-`DSH_SMOKE_PROFILE` 时会追加官方 `--dump-config` 组合检查。
+`DSH_SMOKE_PROFILE` 时会追加官方 `--dump-config` 组合检查。`DSH_BIN` 指 dsh CLI（`@deepseek-ai/dsh` 的 bin），
+不是桌面版启动器；profile 须以 `link:` 指向被测这棵树（worktree 下另建隔离 `DSH_HOME` 的 profile），
+两者不对时冒烟直接报红并说明原因。
 
 ## License
 

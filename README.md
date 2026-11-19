@@ -121,7 +121,10 @@ Python venv on first run (one-time network, python3 ≥3.11), with keys in `~/.d
 `npm test` runs the gate behavior suites plus the smoke check (`npm run smoke`). Mock suites cannot
 prove the host really loads the gates, so after a dsh upgrade run `npm run smoke` on its own: it
 checks the manifest, the syntax and the plugin entry, and with `DSH_BIN` and `DSH_SMOKE_PROFILE` set
-it adds the official `--dump-config` composition check against an isolated profile.
+it adds the official `--dump-config` composition check against an isolated profile. `DSH_BIN` must be
+the dsh CLI (the `@deepseek-ai/dsh` bin), not the desktop launcher, and the profile must `link:` the tree
+under test (from a worktree, use a profile in an isolated `DSH_HOME`); the smoke fails with the reason
+when either is wrong.
 
 ## License
 
