@@ -15,8 +15,8 @@ import plugin from "../gates/dispatch-gate.js";
 
 const MAP_TEXT = "## 入口表\n- gates/dispatch-gate.js: 派遣门禁\n- scripts/smoke-test.mjs: 冒烟\n";
 const SPEC_TEXT = "# 子代理派遣规范\n";
-// 全局工作规范夹具：代表 ~/.claude/CLAUDE.md 的完整正文与硬禁令。门禁唯一源由 apply 参数
-// 指向本夹具，测试绝不读写用户真实 CLAUDE.md。
+// 全局工作规范夹具：代表 $DSH_HOME/CLAUDE.md 的完整正文与硬禁令。夹具写进临时 profile home，
+// 测试绝不读写用户真实 CLAUDE.md。
 const GLOBAL_SPEC_LINES = [
   "# 全局工作规范",
   "**这份文件每个会话都载入，只放不知道就会做错的东西：不变量、入口命令、硬禁令。**",
@@ -58,8 +58,8 @@ function makeHarness(options = {}) {
   harnessSeq += 1;
   const home = mkdtempSync(join(tmpdir(), "verispring-gate-home-"));
   const cwd = mkdtempSync(join(tmpdir(), "verispring-gate-cwd-"));
-  // 全局工作规范源的测试替身：apply 的仅内部参数指向它，生产默认值仍是唯一真实源。
-  const specFile = join(home, "global-work-spec.md");
+  // 全局工作规范源：profile home 下的 CLAUDE.md，与生产同一读取点。
+  const specFile = join(home, "CLAUDE.md");
   writeFileSync(specFile, options.specText ?? GLOBAL_SPEC_TEXT);
   if (options.git) {
     git(cwd, ["init", "-q", "."]);
@@ -201,7 +201,7 @@ function makeHarness(options = {}) {
     },
   };
 
-  plugin.apply(ctx, { specFile });
+  plugin.apply(ctx);
 
   // 领导作用域（agent.ctx）：注入链来自 agent-loop（没有 subagents / sessionController），
   // 属性直取 subagents 会抛 without inject；get() 照常可读——线上故障 1 就在这一层。
@@ -1251,7 +1251,7 @@ test("规范源缺失或空白时新派遣被拒：spec-source-missing 落监控
   assert.equal(denied.length, 1);
   assert.equal(denied[0].kind, "dispatch-deny");
   assert.equal(denied[0].tool, "subagent");
-  assert.match(denied[0].reason, /global-work-spec\.md/);
+  assert.ok(denied[0].reason.includes(`${harness.home}/CLAUDE.md`), "拒绝原因须指向 $DSH_HOME/CLAUDE.md");
   assert.match(denied[0].reason, /缺失/);
 
   const notice = harness.sectionText();

@@ -39,7 +39,9 @@ reports only the increment and the entries it re-checked.
 
 ### Global work-spec supply
 
-The global work spec has a single production source: `~/.claude/CLAUDE.md`. The plugin supplies it
+The global work spec has a single read point: `$DSH_HOME/CLAUDE.md` (default `~/.dsh/CLAUDE.md`), rooted
+alongside `$DSH_HOME/specs/`. On the spec author's machine it is a symlink to `~/.claude/CLAUDE.md`; on
+team members' machines it holds the bundle their organization distributes. The plugin supplies it
 through the root-scope dynamic system section `caseos:global-work-spec`, reading the full text at
 every prompt assembly for leader, scout and executor sessions alike — including `send_message`
 continuations and cold recovery; a subagent brief cannot opt out. When a task touches the specialized
@@ -106,7 +108,7 @@ and reinstall the same spec.
 **Prerequisites** — the profile needs the agent preset registry and a `preset-standard` entry
 (desktop and web bundles ship them); `~/.dsh/specs/子代理派遣规范.md` and
 `~/.dsh/specs/代码写作规范.md` must exist (the gates keep denying with directions otherwise);
-`~/.claude/CLAUDE.md` must exist, be readable and non-blank (subagent dispatches and subagent tool
+`$DSH_HOME/CLAUDE.md` must exist, be readable and non-blank (subagent dispatches and subagent tool
 calls are refused otherwise); the `verispring` channel must serve the leader model and a
 `deepseek-flash` entry that declares
 `reasoningEfforts` and `compat.forceAdaptiveThinking`. manon is bundled and optional: it bootstraps a
